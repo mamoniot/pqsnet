@@ -1,0 +1,18 @@
+[package]
+name = "transport"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "transport"
+path = "src/lib.rs"
+
+
+[dependencies]
+
+[lints.clippy]
+type_complexity = "allow"
+large_enum_variant = "allow"
+absurd_extreme_comparisons = "allow"
+unusual_byte_groupings = "allow"
+needless_range_loop = "allow"

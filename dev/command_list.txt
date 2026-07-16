@@ -1,0 +1,2 @@
+cargo locate-project --workspace
+

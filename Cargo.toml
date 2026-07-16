@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "transport",
+]
+
+[profile.release]
+opt-level = 3
+strip = true
+debug = false
+lto = true
+
+[profile.bench]
+opt-level = 3
+strip = true
+debug = true
+lto = true
