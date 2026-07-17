@@ -11,6 +11,8 @@ path = "src/lib.rs"
 [dependencies]
 rand_core = "*"
 bytemuck = "*"
+dashmap = "*"
+zeroize = "*"
 
 [lints.clippy]
 type_complexity = "allow"

@@ -2,7 +2,7 @@ use crate::crypto;
 
 pub const NULL_KEY_ID: u32 = 0;
 
-pub const RESUMPTION_TOKEN_START: usize = super::MESSAGE_CRYPTO_START;
+pub const RESUMPTION_TOKEN_START: usize = super::EXCHANGE_MESSAGE_START;
 pub const RESUMPTION_TOKEN_LEN: usize = 32;
 pub const RESUMPTION_TOKEN_END: usize = RESUMPTION_TOKEN_START + RESUMPTION_TOKEN_LEN;
 
@@ -21,3 +21,5 @@ pub const NEW_KEY_ID_END: usize = NEW_KEY_ID_START + NEW_KEY_ID_LEN;
 pub const PAYLOAD_TAG_START: usize = NEW_KEY_ID_END;
 pub const PAYLOAD_TAG_LEN: usize = crypto::aes::AES_GCM_TAG_LEN;
 pub const PAYLOAD_TAG_END: usize = PAYLOAD_TAG_START + PAYLOAD_TAG_LEN;
+
+pub const RESUMPTION_KEY_LEN: usize = 32;

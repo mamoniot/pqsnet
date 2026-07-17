@@ -6,8 +6,7 @@ pub const KEY_ID_END: usize = KEY_ID_START + KEY_ID_LEN;
 pub const SEGMENT_NO_IDX: usize = 4;
 pub const SEGMENT_TOTAL_IDX: usize = 5;
 pub const SEGMENT_REMAINDER_IDX: usize = 6;
-pub const MESSAGE_CRYPTO_START: usize = 8;
-
+pub const EXCHANGE_MESSAGE_START: usize = 8;
 
 /// struct Initialize {
 ///     pub null: u32,
