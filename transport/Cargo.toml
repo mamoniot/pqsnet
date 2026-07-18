@@ -13,6 +13,7 @@ rand_core = "*"
 bytemuck = "*"
 dashmap = "*"
 zeroize = "*"
+hex-literal = "*"
 
 [lints.clippy]
 type_complexity = "allow"

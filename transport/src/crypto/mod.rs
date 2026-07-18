@@ -1,7 +1,7 @@
-pub mod mlkem768;
-
-pub mod mldsa65;
+pub mod aes256;
 
 pub mod shake256;
 
-pub mod aes;
+pub mod mldsa87;
+
+pub mod mlkem1024;

@@ -3,5 +3,5 @@ pub trait Shake256 {
 
     fn update(&mut self, data: &[u8]);
 
-    fn finish_and_reset(&mut self, output: &mut [u8]);
+    fn finish(self, output: &mut [u8]);
 }

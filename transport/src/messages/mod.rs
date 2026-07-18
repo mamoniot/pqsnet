@@ -1,12 +1,8 @@
 // TODO: segmentation, version, payload
-pub const KEY_ID_START: usize = 0;
-pub const KEY_ID_LEN: usize = 4;
-pub const KEY_ID_END: usize = KEY_ID_START + KEY_ID_LEN;
 
-pub const SEGMENT_NO_IDX: usize = 4;
-pub const SEGMENT_TOTAL_IDX: usize = 5;
-pub const SEGMENT_REMAINDER_IDX: usize = 6;
-pub const EXCHANGE_MESSAGE_START: usize = 8;
+pub mod key_bundle;
+
+pub mod shared;
 
 /// struct Initialize {
 ///     pub null: u32,
@@ -14,6 +10,7 @@ pub const EXCHANGE_MESSAGE_START: usize = 8;
 ///     pub segment_total: u8,
 ///     pub segment_remainder: u8,
 ///     pub reserved: u8,
+///     pub initialize_id: u64,
 ///     pub resumption_token: [u8; 32],
 ///     pub ephemeral_encapsulation_key: [u8; 1088],
 ///     pub ephemeral_encapsulation_key_tag: [u8; 16],

@@ -1,6 +1,6 @@
-use crate::messages::*;
+use crate::messages::shared::*;
 
-pub struct Desegmentation {
+pub struct Desegmentation<const H_LEN: usize> {
     message: Box<[u8]>,
     seg_completed: [u32; 8],
     seg_count: u32,
@@ -9,8 +9,8 @@ pub struct Desegmentation {
     seg_len: usize,
 }
 
-pub enum FirstRecvResult {
-    Segmented(Desegmentation),
+pub enum FirstRecvResult<const H_LEN: usize> {
+    Segmented(Desegmentation<H_LEN>),
     NotSegmented,
     Invalid,
 }
@@ -22,17 +22,30 @@ pub enum RecvResult {
     Complete,
 }
 
-impl Desegmentation {
-    pub fn first_recv(packet: &[u8]) -> FirstRecvResult {
+impl<const H_LEN: usize> Desegmentation<H_LEN> {
+    pub fn is_single_segment(packet: &[u8]) -> bool {
+        if packet.len() <= H_LEN {
+            return false;
+        }
+        let seg_no = packet[SEGMENT_NO_IDX] as u32;
+        let seg_total = packet[SEGMENT_TOTAL_IDX] as u32;
+        let seg_rem = packet[SEGMENT_REMAINDER_IDX] as u32;
+
+        if seg_no >= seg_total || seg_rem >= seg_total {
+            return false;
+        }
+
+        seg_total <= 1
+    }
+    pub fn first_recv(packet: &[u8], maximum_len: usize) -> FirstRecvResult<H_LEN> {
         use FirstRecvResult::*;
 
-        if packet.len() <= EXCHANGE_MESSAGE_START {
+        if packet.len() <= H_LEN {
             return Invalid;
         }
         let seg_no = packet[SEGMENT_NO_IDX] as u32;
         let seg_total = packet[SEGMENT_TOTAL_IDX] as u32;
         let seg_rem = packet[SEGMENT_REMAINDER_IDX] as u32;
-        let seg_len = packet.len() - EXCHANGE_MESSAGE_START - (seg_no < seg_rem) as usize;
 
         if seg_no >= seg_total || seg_rem >= seg_total {
             return Invalid;
@@ -41,11 +54,15 @@ impl Desegmentation {
         if seg_total <= 1 {
             return NotSegmented;
         }
+        let seg_len = packet.len() - H_LEN - (seg_no < seg_rem) as usize;
 
-        let message_len = seg_len * seg_total as usize + seg_rem as usize + EXCHANGE_MESSAGE_START;
+        let message_len = seg_len * seg_total as usize + seg_rem as usize + H_LEN;
+        if message_len > maximum_len {
+            return Invalid;
+        }
 
         let mut message = Vec::with_capacity(message_len);
-        message.extend_from_slice(&packet[..EXCHANGE_MESSAGE_START]);
+        message.extend_from_slice(&packet[..H_LEN]);
         message[SEGMENT_NO_IDX] = 0;
         message.resize(message_len, 0);
 
@@ -69,13 +86,13 @@ impl Desegmentation {
     pub fn recv(&mut self, packet: &[u8]) -> RecvResult {
         use RecvResult::*;
 
-        if packet.len() <= EXCHANGE_MESSAGE_START {
+        if packet.len() <= H_LEN {
             return Invalid;
         }
         let seg_no = packet[SEGMENT_NO_IDX] as u32;
         let seg_total = packet[SEGMENT_TOTAL_IDX] as u32;
         let seg_rem = packet[SEGMENT_REMAINDER_IDX] as u32;
-        let seg_len = packet.len() - EXCHANGE_MESSAGE_START - (seg_no < seg_rem) as usize;
+        let seg_len = packet.len() - H_LEN - (seg_no < seg_rem) as usize;
 
         if seg_total != self.seg_total || seg_rem != self.seg_rem || seg_len != self.seg_len || seg_no >= seg_total {
             return Invalid;
@@ -99,10 +116,10 @@ impl Desegmentation {
     }
 
     fn write_to(&mut self, seg_no: u32, packet: &[u8]) {
-        let i = self.seg_len * seg_no as usize + self.seg_rem.min(seg_no) as usize + EXCHANGE_MESSAGE_START;
-        let j = i + packet.len() - EXCHANGE_MESSAGE_START;
+        let i = self.seg_len * seg_no as usize + self.seg_rem.min(seg_no) as usize + H_LEN;
+        let j = i + packet.len() - H_LEN;
 
-        self.message[i..j].copy_from_slice(&packet[EXCHANGE_MESSAGE_START..]);
+        self.message[i..j].copy_from_slice(&packet[H_LEN..]);
     }
 
     pub fn complete(self) -> Box<[u8]> {
