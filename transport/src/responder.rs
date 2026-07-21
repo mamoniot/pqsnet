@@ -3,17 +3,11 @@ use std::sync::{Arc, atomic::AtomicU64};
 use zeroize::Zeroizing;
 
 use crate::{
-    context::{Context, HandshakeState, RecvOk, Socket, SocketGuard, SocketState},
-    crypto::prelude::*,
-    desegmentation::precalc_segments,
-    error::Error,
-    messages::{shared::*, *},
-    session_layer::{ResumptionAction, SessionLayer},
-    symmetric_state::SymmetricState,
+    context::{Context, HandshakeState, RecvOk, Socket, SocketGuard, SocketState}, crypto::prelude::*, desegmentation::{Mtu, Segmenter}, error::Error, messages::{shared::*, *}, session_layer::{ResumptionAction, SessionLayer}, symmetric_state::SymmetricState,
 };
 
 pub struct ReplyState<S: SessionLayer> {
-    reply_message: Arc<[u8]>,
+    segmenter: Segmenter,
     symmetric: SymmetricState<S>,
     send_socket_id: u32,
 }
@@ -23,7 +17,7 @@ impl<S: SessionLayer> Context<S> {
         &self,
         mut sl: S,
         init_message: &mut [u8],
-        mtu: usize,
+        mtu: Mtu,
     ) -> Result<RecvOk<S>, Error> {
         let mut symmetric = SymmetricState::<S>::default();
 
@@ -78,19 +72,26 @@ impl<S: SessionLayer> Context<S> {
 
             /* START OF SEND SOCKET ID HANDLING */
 
-            symmetric.mix_and_decrypt(&mut init_message[NEW_SOCKET_ID_START..PAYLOAD_TAG_END], false)?;
+            let payload_tag_end = init_message.len() - PAYLOAD_TAG_REV_START;
+
+            symmetric.mix_and_decrypt(&mut init_message[NEW_SOCKET_ID_START..payload_tag_end], false)?;
 
             send_socket_id =
                 u32::from_be_bytes(init_message[NEW_SOCKET_ID_START..NEW_SOCKET_ID_END].try_into().unwrap());
         }
 
-        let mut reply_message = Vec::new();
+        let seg_rem;
+        let seg_total;
+        let max_len;
         if do_resume {
             symmetric.start_resume();
-            reply_message.resize(resume::MESSAGE_LEN, 0);
+
+            (seg_rem, seg_total, max_len) = Segmenter::precalc(resume::MESSAGE_LEN, resume::HEADER_LEN, mtu);
         } else {
-            reply_message.resize(reply::MESSAGE_LEN, 0);
+            (seg_rem, seg_total, max_len) = Segmenter::precalc(reply::MESSAGE_LEN, reply::HEADER_LEN, mtu);
         }
+        let mut reply_message = vec![0; max_len];
+
         {
             /* START OF REPLY MESSAGE AND RESUME MESSAGE SHARED SECTION */
 
@@ -99,9 +100,8 @@ impl<S: SessionLayer> Context<S> {
             /* START OF HEADER ENCODING AND MIXING */
 
             reply_message[SOCKET_ID_START..SOCKET_ID_END].copy_from_slice(&send_socket_id.to_be_bytes());
-
-            (reply_message[SEGMENT_TOTAL_IDX], reply_message[SEGMENT_REMAINDER_IDX]) =
-                precalc_segments(reply::HEADER_LEN, reply_message.len(), mtu);
+            reply_message[SEGMENT_TOTAL_IDX] = seg_total;
+            reply_message[SEGMENT_REMAINDER_IDX] = seg_rem;
 
             symmetric.mix(&reply_message[..HEADER_LEN]);
 
@@ -129,20 +129,24 @@ impl<S: SessionLayer> Context<S> {
 
             /* START OF PAYLOAD ENCRYPTION */
 
-            symmetric.encrypt_and_mix(&mut reply_message[NEW_SOCKET_ID_START..PAYLOAD_TAG_END], true);
+            let payload_tag_end =  reply_message.len() - PAYLOAD_TAG_REV_START;
+
+            symmetric.encrypt_and_mix(&mut reply_message[NEW_SOCKET_ID_START..payload_tag_end], true);
 
             /* START OF STATE MANAGEMENT */
 
             // TODO: Add resumption token and key handling.
             let (cipher, resumption_token, resupmtion_key) = symmetric.split();
 
+            let segmenter = Segmenter::new(reply_message, HEADER_LEN, mtu);
+
             recv_socket.insert(SocketState::AwaitingData {
-                resend_until_recv: reply_message.into(),
+                segmenter: segmenter.clone(),
                 cipher,
                 send_socket_id,
             });
 
-            Ok(RecvOk::ResumeSent)
+            Ok(RecvOk::SendResume(segmenter))
         } else {
             use reply::*;
 
@@ -159,33 +163,41 @@ impl<S: SessionLayer> Context<S> {
 
             /* START OF PAYLOAD ENCRYPTION */
 
-            symmetric.encrypt_and_mix(&mut reply_message[STATIC_OFFLINE_PUBKEY_START..PAYLOAD_TAG_END], false);
+            let payload_tag_end = reply_message.len() - PAYLOAD_TAG_REV_START;
+
+            symmetric.encrypt_and_mix(&mut reply_message[STATIC_OFFLINE_PUBKEY_START..payload_tag_end], false);
 
             /* START OF MLDSA87 SIGNING AND ENCRYPTION */
+
+            let static_online_sign_start = reply_message.len() - STATIC_ONLINE_SIGN_REV_END;
+            let static_online_sign_end = reply_message.len() - STATIC_ONLINE_SIGN_REV_START;
+            let static_online_sign_tag_end = reply_message.len() - STATIC_ONLINE_SIGN_TAG_REV_START;
 
             let signature = sl
                 .static_public_keys()
                 .sign_with_online(REPLY_BINDING_DOMAIN_NAME, symmetric.channel_binding());
 
-            reply_message[STATIC_ONLINE_SIGN_START..STATIC_ONLINE_SIGN_END].copy_from_slice(&signature);
+            reply_message[static_online_sign_start..static_online_sign_end].copy_from_slice(&signature);
 
             symmetric.encrypt_and_mix(
-                &mut reply_message[STATIC_ONLINE_SIGN_START..STATIC_ONLINE_SIGN_TAG_END],
+                &mut reply_message[static_online_sign_start..static_online_sign_tag_end],
                 false,
             );
 
             /* START OF STATE MANAGEMENT */
 
+            let segmenter = Segmenter::new(reply_message, HEADER_LEN, mtu);
+
             recv_socket.insert(SocketState::Handshake {
                 state: HandshakeState::SendingReply(ReplyState {
-                    reply_message: reply_message.into(),
+                    segmenter: segmenter.clone(),
                     symmetric,
                     send_socket_id,
                 }),
                 desegmenter: Default::default(),
             });
 
-            Ok(RecvOk::ReplySent)
+            Ok(RecvOk::SendReply(segmenter))
         }
     }
 
@@ -195,7 +207,6 @@ impl<S: SessionLayer> Context<S> {
         state: ReplyState<S>,
         guard: SocketGuard<S>,
         confirm_message: &mut [u8],
-        mtu: usize,
     ) -> Result<RecvOk<S>, Error> {
         let mut symmetric = state.symmetric;
         let send_socket_id = state.send_socket_id;
@@ -213,8 +224,10 @@ impl<S: SessionLayer> Context<S> {
 
             /* START OF PAYLOAD DECRYPTION */
 
+            let payload_tag_end = confirm_message.len() - PAYLOAD_TAG_REV_START;
+
             symmetric.mix_and_decrypt(
-                &mut confirm_message[STATIC_OFFLINE_PUBKEY_START..PAYLOAD_TAG_END],
+                &mut confirm_message[STATIC_OFFLINE_PUBKEY_START..payload_tag_end],
                 false,
             )?;
 
@@ -236,8 +249,12 @@ impl<S: SessionLayer> Context<S> {
 
             /* START OF MLDSA87 HANDLING */
 
+            let static_online_sign_start = confirm_message.len() - STATIC_ONLINE_SIGN_REV_END;
+            let static_online_sign_end = confirm_message.len() - STATIC_ONLINE_SIGN_REV_START;
+            let static_online_sign_tag_end = confirm_message.len() - STATIC_ONLINE_SIGN_TAG_REV_START;
+
             symmetric.mix_and_decrypt(
-                &mut confirm_message[STATIC_ONLINE_SIGN_START..STATIC_ONLINE_SIGN_TAG_END],
+                &mut confirm_message[static_online_sign_start..static_online_sign_tag_end],
                 true,
             )?;
 
@@ -247,7 +264,7 @@ impl<S: SessionLayer> Context<S> {
                     .unwrap(),
                 CONFIRM_BINDING_DOMAIN_NAME,
                 symmetric.channel_binding(),
-                (&confirm_message[STATIC_ONLINE_SIGN_START..STATIC_ONLINE_SIGN_END])
+                (&confirm_message[static_online_sign_start..static_online_sign_end])
                     .try_into()
                     .unwrap(),
             );
@@ -263,14 +280,16 @@ impl<S: SessionLayer> Context<S> {
             // TODO: Add resumption token and key handling.
             let (cipher, resumption_token, resupmtion_key) = symmetric.split();
 
+
             guard.insert(SocketState::Active(Arc::new(Socket {
+                segmenter: None,
                 cipher,
                 antireplay: Default::default(),
                 send_socket_id,
                 counter: AtomicU64::new(AES_GCM_INIT_COUNTER as u64),
             })));
 
-            Ok(RecvOk::ReplySent)
+            Ok(RecvOk::Confirm)
         }
     }
 }

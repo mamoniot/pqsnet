@@ -24,5 +24,6 @@ pub mod crypto_impl;
 pub(crate) mod symmetric_state;
 
 pub mod exports {
+    pub use rand_core;
     pub use zeroize;
 }

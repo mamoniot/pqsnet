@@ -1,34 +1,31 @@
 use std::sync::{Arc, atomic::AtomicU64};
 
+use rand_core::Rng;
 use zeroize::Zeroizing;
 
 use crate::{
-    context::{Context, HandshakeState, RecvOk, Socket, SocketGuard, SocketState},
-    crypto::prelude::*,
-    desegmentation::precalc_segments,
-    error::Error,
-    messages::{shared::AES_GCM_INIT_COUNTER, *},
-    session_layer::SessionLayer,
-    symmetric_state::SymmetricState,
+    context::{Context, HandshakeState, RecvOk, Socket, SocketGuard, SocketState}, crypto::prelude::*, desegmentation::{Mtu, Segmenter}, error::Error, messages::{shared::AES_GCM_INIT_COUNTER, *}, session_layer::SessionLayer, symmetric_state::SymmetricState,
 };
 
 pub struct InitializeState<S: SessionLayer> {
-    message: Arc<[u8]>,
+    segmenter: Segmenter,
     symmetric: SymmetricState<S>,
     decapsulation_key: S::DecapsulationKeyImpl,
 }
 
 impl<S: SessionLayer> Context<S> {
-    pub fn initialize(&self, mut sl: S, resumption_token: &[u8], resumption_key: &[u8], mtu: usize) {
+    pub fn initialize(&self, mut sl: S, resumption_token: &[u8], resumption_key: &[u8], mtu: Mtu) {
         use {initialize::*, shared::*};
         let mut symmetric = SymmetricState::<S>::default();
 
-        let mut init_message = vec![0; PAYLOAD_TAG_END];
-
         /* START OF HEADER ENCODING */
 
-        (init_message[SEGMENT_TOTAL_IDX], init_message[SEGMENT_REMAINDER_IDX]) =
-            precalc_segments(HEADER_LEN, init_message.len(), mtu);
+        let (seg_rem, seg_total, max_len) = Segmenter::precalc(MESSAGE_LEN, HEADER_LEN, mtu);
+        let mut init_message = vec![0; max_len];
+
+        init_message[SEGMENT_REMAINDER_IDX] = seg_rem;
+        init_message[SEGMENT_TOTAL_IDX] = seg_total;
+        init_message[INITIALIZE_ID_START..INITIALIZE_ID_END].copy_from_slice(&sl.rng().next_u64().to_be_bytes());
 
         /* START OF RESUMPTION TOKEN HANDLING */
 
@@ -49,17 +46,22 @@ impl<S: SessionLayer> Context<S> {
         );
 
         /* START OF SEND SOCKET ID HANDLING */
+
+        let payload_tag_end = init_message.len() - PAYLOAD_TAG_REV_START;
+
         let socket_guard = self.reserve_socket(&mut sl);
 
         init_message[NEW_SOCKET_ID_START..NEW_SOCKET_ID_END].copy_from_slice(&socket_guard.id().to_be_bytes());
 
-        symmetric.encrypt_and_mix(&mut init_message[NEW_SOCKET_ID_START..PAYLOAD_TAG_END], false);
+        symmetric.encrypt_and_mix(&mut init_message[NEW_SOCKET_ID_START..payload_tag_end], false);
 
         /* START OF STATE MANAGEMENT */
 
+        let segmenter = Segmenter::new(init_message, HEADER_LEN, mtu);
+
         socket_guard.insert(SocketState::Handshake {
             state: HandshakeState::SendingInitialize(InitializeState {
-                message: init_message.into(),
+                segmenter,
                 symmetric,
                 decapsulation_key,
             }),
@@ -73,7 +75,7 @@ impl<S: SessionLayer> Context<S> {
         state: InitializeState<S>,
         guard: SocketGuard<S>,
         reply_message: &mut [u8],
-        mtu: usize,
+        mtu: Mtu,
     ) -> Result<RecvOk<S>, Error> {
         use shared::*;
 
@@ -112,7 +114,9 @@ impl<S: SessionLayer> Context<S> {
 
             /* START OF PAYLOAD DECRYPTION */
 
-            symmetric.mix_and_decrypt(&mut reply_message[STATIC_OFFLINE_PUBKEY_START..PAYLOAD_TAG_END], false)?;
+            let payload_tag_end = reply_message.len() - PAYLOAD_TAG_REV_START;
+
+            symmetric.mix_and_decrypt(&mut reply_message[STATIC_OFFLINE_PUBKEY_START..payload_tag_end], false)?;
 
             /* START OF MLDSA87 KEY BUNDLE HANDLING */
 
@@ -140,8 +144,12 @@ impl<S: SessionLayer> Context<S> {
 
             /* START OF MLDSA87 SIGNING AND ENCRYPTION */
 
+            let static_online_sign_start = reply_message.len() - STATIC_ONLINE_SIGN_REV_END;
+            let static_online_sign_end = reply_message.len() - STATIC_ONLINE_SIGN_REV_START;
+            let static_online_sign_tag_end = reply_message.len() - STATIC_ONLINE_SIGN_TAG_REV_START;
+
             symmetric.mix_and_decrypt(
-                &mut reply_message[STATIC_ONLINE_SIGN_START..STATIC_ONLINE_SIGN_TAG_END],
+                &mut reply_message[static_online_sign_start..static_online_sign_tag_end],
                 false,
             )?;
 
@@ -151,7 +159,7 @@ impl<S: SessionLayer> Context<S> {
                     .unwrap(),
                 REPLY_BINDING_DOMAIN_NAME,
                 symmetric.channel_binding(),
-                (&reply_message[STATIC_ONLINE_SIGN_START..STATIC_ONLINE_SIGN_END])
+                (&reply_message[static_online_sign_start..static_online_sign_end])
                     .try_into()
                     .unwrap(),
             );
@@ -164,16 +172,15 @@ impl<S: SessionLayer> Context<S> {
         }
         {
             use confirm::*;
-            let mut confirm_message = vec![0; MESSAGE_LEN];
 
             /* START OF HEADER ENCODING AND MIXING */
 
-            confirm_message[SOCKET_ID_START..SOCKET_ID_END].copy_from_slice(&send_socket_id.to_be_bytes());
+            let (seg_rem, seg_total, max_len) = Segmenter::precalc(MESSAGE_LEN, HEADER_LEN, mtu);
+            let mut confirm_message = vec![0; max_len];
 
-            (
-                confirm_message[SEGMENT_TOTAL_IDX],
-                confirm_message[SEGMENT_REMAINDER_IDX],
-            ) = precalc_segments(HEADER_LEN, confirm_message.len(), mtu);
+            confirm_message[SOCKET_ID_START..SOCKET_ID_END].copy_from_slice(&send_socket_id.to_be_bytes());
+            confirm_message[SEGMENT_REMAINDER_IDX] = seg_rem;
+            confirm_message[SEGMENT_TOTAL_IDX] = seg_total;
 
             symmetric.mix(&confirm_message[..HEADER_LEN]);
 
@@ -184,21 +191,27 @@ impl<S: SessionLayer> Context<S> {
 
             /* START OF PAYLOAD ENCRYPTION */
 
+            let payload_tag_end = confirm_message.len() - PAYLOAD_TAG_REV_START;
+
             symmetric.encrypt_and_mix(
-                &mut confirm_message[STATIC_OFFLINE_PUBKEY_START..PAYLOAD_TAG_END],
+                &mut confirm_message[STATIC_OFFLINE_PUBKEY_START..payload_tag_end],
                 false,
             );
 
             /* START OF MLDSA87 SIGNING AND ENCRYPTION */
 
+            let static_online_sign_start = confirm_message.len() - STATIC_ONLINE_SIGN_REV_END;
+            let static_online_sign_end = confirm_message.len() - STATIC_ONLINE_SIGN_REV_START;
+            let static_online_sign_tag_end = confirm_message.len() - STATIC_ONLINE_SIGN_TAG_REV_START;
+
             let signature = sl
                 .static_public_keys()
                 .sign_with_online(CONFIRM_BINDING_DOMAIN_NAME, symmetric.channel_binding());
 
-            confirm_message[STATIC_ONLINE_SIGN_START..STATIC_ONLINE_SIGN_END].copy_from_slice(&signature);
+            confirm_message[static_online_sign_start..static_online_sign_end].copy_from_slice(&signature);
 
             symmetric.encrypt_and_mix(
-                &mut confirm_message[STATIC_ONLINE_SIGN_START..STATIC_ONLINE_SIGN_TAG_END],
+                &mut confirm_message[static_online_sign_start..static_online_sign_tag_end],
                 true,
             );
 
@@ -207,14 +220,17 @@ impl<S: SessionLayer> Context<S> {
 
             /* START OF STATE MANAGEMENT */
 
+            let segmenter = Segmenter::new(confirm_message, HEADER_LEN, mtu);
+
             guard.insert(SocketState::Active(Arc::new(Socket {
                 cipher,
+                segmenter: Some(segmenter.clone()),
                 antireplay: Default::default(),
                 send_socket_id,
                 counter: AtomicU64::new(AES_GCM_INIT_COUNTER as u64),
             })));
 
-            Ok(RecvOk::ReplySent)
+            Ok(RecvOk::SendReply(segmenter))
         }
     }
 
@@ -262,7 +278,9 @@ impl<S: SessionLayer> Context<S> {
 
             /* START OF PAYLOAD DECRYPTION */
 
-            symmetric.mix_and_decrypt(&mut resume_message[NEW_SOCKET_ID_START..PAYLOAD_TAG_END], true)?;
+            let payload_tag_end = resume_message.len() - PAYLOAD_TAG_REV_START;
+
+            symmetric.mix_and_decrypt(&mut resume_message[NEW_SOCKET_ID_START..payload_tag_end], true)?;
 
             /* START OF RECV SOCKET ID HANDLING */
 
@@ -281,13 +299,14 @@ impl<S: SessionLayer> Context<S> {
             let (cipher, resumption_token, resupmtion_key) = symmetric.split();
 
             guard.insert(SocketState::Active(Arc::new(Socket {
+                segmenter: None,
                 cipher,
                 antireplay: Default::default(),
                 send_socket_id,
                 counter: AtomicU64::new(AES_GCM_INIT_COUNTER as u64),
             })));
 
-            Ok(RecvOk::ReplySent)
+            Ok(RecvOk::Resume)
         }
     }
 }

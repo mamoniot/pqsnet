@@ -1,14 +1,14 @@
 use crate::crypto::*;
 
-/* START OF SEGMENTATION DEFINITION */
+/* START OF SEGMENTATION HEADER DEFINITION */
 
 pub const SOCKET_ID_START: usize = 0;
 pub const SOCKET_ID_LEN: usize = 4;
 pub const SOCKET_ID_END: usize = SOCKET_ID_START + SOCKET_ID_LEN;
 
 pub const SEGMENT_NO_IDX: usize = 4;
-pub const SEGMENT_TOTAL_IDX: usize = 5;
-pub const SEGMENT_REMAINDER_IDX: usize = 6;
+pub const SEGMENT_REMAINDER_IDX: usize = 5;
+pub const SEGMENT_TOTAL_IDX: usize = 6;
 pub const SEGMENT_HEADER_END: usize = 8;
 
 /* START OF SHAKE256 OUTPUT DEFINITION */

@@ -22,9 +22,9 @@ pub const NEW_SOCKET_ID_START: usize = EPHEMERAL_ENC_KEY_TAG_END;
 pub const NEW_SOCKET_ID_LEN: usize = 4;
 pub const NEW_SOCKET_ID_END: usize = NEW_SOCKET_ID_START + NEW_SOCKET_ID_LEN;
 
-pub const PAYLOAD_TAG_START: usize = NEW_SOCKET_ID_END;
+pub const PAYLOAD_TAG_REV_END: usize = PAYLOAD_TAG_REV_START + PAYLOAD_TAG_LEN;
 pub const PAYLOAD_TAG_LEN: usize = aes256::TAG_LEN;
-pub const PAYLOAD_TAG_END: usize = PAYLOAD_TAG_START + PAYLOAD_TAG_LEN;
+pub const PAYLOAD_TAG_REV_START: usize = 0;
 
 /* START OF GENERAL CONSTANTS */
 
@@ -33,7 +33,10 @@ pub const NULL_KEY_ID: u32 = 0;
 pub const RESUMPTION_KEY_LEN: usize = 64;
 
 pub const HEADER_LEN: usize = INITIALIZE_ID_END;
-pub const MESSAGE_MAX_LEN: usize = PAYLOAD_TAG_END;
+pub const MESSAGE_LEN: usize = NEW_SOCKET_ID_END + PAYLOAD_TAG_REV_END;
+
+pub const MESSAGE_MIN_LEN: usize = MESSAGE_LEN;
+pub const MESSAGE_MAX_LEN: usize = 2 * MESSAGE_LEN.next_power_of_two();
 
 #[allow(unused)]
 pub const MESSAGE_GCM_TOTAL: u32 = 2;

@@ -7,15 +7,7 @@ use dashmap::DashMap;
 use rand_core::*;
 
 use crate::{
-    antireplay::Antireplay,
-    crypto::{aes256::to_data_nonce, prelude::*},
-    desegmentation::{self, Desegmenter},
-    error::Error,
-    init_table::{Entry, InitTable},
-    initiator::InitializeState,
-    messages::*,
-    responder::ReplyState,
-    session_layer::SessionLayer,
+    antireplay::Antireplay, crypto::{aes256::to_data_nonce, prelude::*}, desegmentation::{self, Desegmenter, Mtu, Segmenter}, error::Error, init_table::{Entry, InitTable}, initiator::InitializeState, messages::*, responder::ReplyState, session_layer::SessionLayer,
 };
 
 pub struct Context<S: SessionLayer> {
@@ -41,7 +33,7 @@ pub(crate) enum SocketState<S: SessionLayer> {
         desegmenter: Mutex<Desegmenter>,
     },
     AwaitingData {
-        resend_until_recv: Box<[u8]>,
+        segmenter: Segmenter,
         cipher: S::HotPathDuplexCipherImpl,
         send_socket_id: u32,
     },
@@ -49,6 +41,7 @@ pub(crate) enum SocketState<S: SessionLayer> {
 }
 
 pub struct Socket<S: SessionLayer> {
+    pub(crate) segmenter: Option<Segmenter>,
     pub(crate) cipher: S::HotPathDuplexCipherImpl,
     pub(crate) antireplay: Antireplay<128>,
     pub(crate) send_socket_id: u32,
@@ -59,38 +52,32 @@ pub enum RecvOk<S: SessionLayer> {
     /// The packet received was dropped for being a duplicate of a previous packet.
     Duplicate,
     Incomplete,
-    ReplySent,
-    ResumeSent,
-    ConfirmSent,
+    SendReply(Segmenter),
+    SendResume(Segmenter),
+    SendConfirm(Segmenter),
+    Resume,
+    Confirm,
     Data,
     NewSocket(Socket<S>),
 }
 
 impl<S: SessionLayer> Context<S> {
-    pub fn recv(&self, sl: S, packet: &mut [u8], recv_mtu: usize) -> Result<RecvOk<S>, Error> {
-        let recv_socket_id = u32::from_be_bytes(
-            packet[shared::SOCKET_ID_START..shared::SOCKET_ID_END]
-                .try_into()
-                .unwrap(),
-        );
+    pub fn recv<F: FnMut(&mut [u8])>(&self, sl: S, packet: &mut [u8], recv_mtu: Mtu) -> Result<RecvOk<S>, Error> {
+        use shared::*;
+
+        let recv_socket_id = u32::from_be_bytes(packet[SOCKET_ID_START..SOCKET_ID_END].try_into().unwrap());
 
         if recv_socket_id == initialize::NULL_KEY_ID {
+            use initialize::*;
             /* START OF INITIALIZE DESEGMENTATION */
 
-            let initialize_id = u64::from_be_bytes(
-                packet[initialize::INITIALIZE_ID_START..initialize::INITIALIZE_ID_END]
-                    .try_into()
-                    .unwrap(),
-            );
-            // The following line locks init_table.
-            // That lock is dropped before .` is called.
+            let initialize_id = u64::from_be_bytes(packet[INITIALIZE_ID_START..INITIALIZE_ID_END].try_into().unwrap());
+            // The following line locks `init_table`.
+            // That lock is dropped before `process_initialize` is called.
             let entry = self.init_table.entry(initialize_id);
             match entry {
                 Entry::Occupied(mut occupied_entry) => {
-                    match occupied_entry
-                        .get_mut()
-                        .recv(packet, initialize::HEADER_LEN, initialize::MESSAGE_MAX_LEN)
-                    {
+                    match occupied_entry.get_mut().recv(packet, HEADER_LEN, MESSAGE_MAX_LEN) {
                         desegmentation::RecvResult::Invalid => Err(Error::Invalid),
                         desegmentation::RecvResult::Duplicate => Ok(RecvOk::Duplicate),
                         desegmentation::RecvResult::Incomplete => Ok(RecvOk::Incomplete),
@@ -146,7 +133,7 @@ impl<S: SessionLayer> Context<S> {
                     drop(socket_state);
                     self.process_active(sl, socket_clone, packet)
                 }
-                SocketState::AwaitingData { resend_until_recv, cipher, send_socket_id } => todo!(),
+                SocketState::AwaitingData { segmenter, cipher, send_socket_id } => todo!(),
             }
         } else {
             todo!()
@@ -158,7 +145,7 @@ impl<S: SessionLayer> Context<S> {
     /// To make sure that `message` is processed with its corresponding handshake state, it must be
     /// the case that no handshake state can be modified in `socket_table` while its corresponding
     /// desegmenter is in the `is_complete` state.
-    fn process_handshake(&self, sl: S, socket_id: u32, message: &mut [u8], mtu: usize) -> Result<RecvOk<S>, Error> {
+    fn process_handshake(&self, sl: S, socket_id: u32, message: &mut [u8], mtu: Mtu) -> Result<RecvOk<S>, Error> {
         let state = match self.socket_table.entry(socket_id) {
             dashmap::Entry::Occupied(mut entry) => {
                 let socket_state = entry.insert(SocketState::Reserved);
@@ -181,7 +168,7 @@ impl<S: SessionLayer> Context<S> {
 
         match state {
             HandshakeState::SendingInitialize(state) => self.process_reply(sl, state, guard, message, mtu),
-            HandshakeState::SendingReply(state) => self.process_confirm(sl, state, guard, message, mtu),
+            HandshakeState::SendingReply(state) => self.process_confirm(sl, state, guard, message),
         }
     }
 
