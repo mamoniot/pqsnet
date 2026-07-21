@@ -121,20 +121,14 @@ pub struct SegmentIter<'a> {
 }
 
 impl Segmenter {
-    /// Computes the segment total, the segment remainder length and the final length of the message
-    /// when it is segmented into packets.
-    ///
-    /// It is assumed that `message_len` includes the length of a header conforming to the
+    /// Creates a zeroed byte array large enough to fit every packet of the final segmented message.
+    /// This byte array will start with a header conforming to the
     /// "SEGMENTATION HEADER DEFINITION" defined in module `shared`.
-    ///
-    /// This function will return `None` in the event that it is not possible to segment this message
-    /// into packets that fit within the given `mtu`.
-    /// This function will return `None` if `message.len() < header_len`.
     ///
     /// # Panics
     /// This function will panic if `header_len < shared::SEGMENT_HEADER_END`,
     /// or if `message.len() < header_len`.
-    pub fn precalc(message_len: usize, header_len: usize, mtu: Mtu) -> (u8, u8, usize) {
+    pub(crate) fn create_message(message_len: usize, header_len: usize, socket_id: u32, mtu: Mtu) -> Vec<u8> {
         assert!(header_len >= SEGMENT_HEADER_END, "nonconforming header length");
 
         let mtu = mtu.get() as usize;
@@ -149,7 +143,14 @@ impl Segmenter {
         let seg_rem_len = inner_message_len % seg_total;
 
         let message_final_len = inner_message_len + header_len * seg_total;
-        (seg_rem_len as u8, seg_total as u8, message_final_len)
+
+        let mut message = vec![0; message_final_len];
+
+        message[SOCKET_ID_START..SOCKET_ID_END].copy_from_slice(&socket_id.to_be_bytes());
+        message[SEGMENT_REMAINDER_IDX] = seg_rem_len as u8;
+        message[SEGMENT_TOTAL_IDX] = seg_total as u8;
+
+        message
     }
 
     /// Creates a `Segmenter` that iterates over the given `message` broken up into packets that at most
@@ -274,6 +275,9 @@ impl Mtu {
         (mtu >= Self::MIN_ALLOWED_MTU).then_some(Self(mtu))
     }
 
+    /// # Safety
+    /// `mtu` must be equal to or greater than `Mtu::MIN_ALLOWED_MTU`.
+    /// `Mtu::MIN_ALLOWED_MTU` may change in future versions of this protocol.
     pub unsafe fn new_unchecked(mtu: u32) -> Self {
         Self(mtu)
     }

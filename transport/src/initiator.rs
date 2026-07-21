@@ -15,16 +15,13 @@ pub struct InitializeState<S: SessionLayer> {
 
 impl<S: SessionLayer> Context<S> {
     pub fn initialize(&self, mut sl: S, resumption_token: &[u8], resumption_key: &[u8], mtu: Mtu) {
-        use {initialize::*, shared::*};
+        use initialize::*;
         let mut symmetric = SymmetricState::<S>::default();
 
         /* START OF HEADER ENCODING */
 
-        let (seg_rem, seg_total, max_len) = Segmenter::precalc(MESSAGE_LEN, HEADER_LEN, mtu);
-        let mut init_message = vec![0; max_len];
+        let mut init_message = Segmenter::create_message(MESSAGE_LEN, HEADER_LEN, 0, mtu);
 
-        init_message[SEGMENT_REMAINDER_IDX] = seg_rem;
-        init_message[SEGMENT_TOTAL_IDX] = seg_total;
         init_message[INITIALIZE_ID_START..INITIALIZE_ID_END].copy_from_slice(&sl.rng().next_u64().to_be_bytes());
 
         /* START OF RESUMPTION TOKEN HANDLING */
@@ -47,7 +44,7 @@ impl<S: SessionLayer> Context<S> {
 
         /* START OF SEND SOCKET ID HANDLING */
 
-        let payload_tag_end = init_message.len() - PAYLOAD_TAG_REV_START;
+        let payload_tag_end = MESSAGE_LEN - PAYLOAD_TAG_REV_START;
 
         let socket_guard = self.reserve_socket(&mut sl);
 
@@ -175,12 +172,7 @@ impl<S: SessionLayer> Context<S> {
 
             /* START OF HEADER ENCODING AND MIXING */
 
-            let (seg_rem, seg_total, max_len) = Segmenter::precalc(MESSAGE_LEN, HEADER_LEN, mtu);
-            let mut confirm_message = vec![0; max_len];
-
-            confirm_message[SOCKET_ID_START..SOCKET_ID_END].copy_from_slice(&send_socket_id.to_be_bytes());
-            confirm_message[SEGMENT_REMAINDER_IDX] = seg_rem;
-            confirm_message[SEGMENT_TOTAL_IDX] = seg_total;
+            let mut confirm_message = Segmenter::create_message(MESSAGE_LEN, HEADER_LEN, send_socket_id, mtu);
 
             symmetric.mix(&confirm_message[..HEADER_LEN]);
 
@@ -191,7 +183,7 @@ impl<S: SessionLayer> Context<S> {
 
             /* START OF PAYLOAD ENCRYPTION */
 
-            let payload_tag_end = confirm_message.len() - PAYLOAD_TAG_REV_START;
+            let payload_tag_end = MESSAGE_LEN - PAYLOAD_TAG_REV_START;
 
             symmetric.encrypt_and_mix(
                 &mut confirm_message[STATIC_OFFLINE_PUBKEY_START..payload_tag_end],
@@ -200,9 +192,9 @@ impl<S: SessionLayer> Context<S> {
 
             /* START OF MLDSA87 SIGNING AND ENCRYPTION */
 
-            let static_online_sign_start = confirm_message.len() - STATIC_ONLINE_SIGN_REV_END;
-            let static_online_sign_end = confirm_message.len() - STATIC_ONLINE_SIGN_REV_START;
-            let static_online_sign_tag_end = confirm_message.len() - STATIC_ONLINE_SIGN_TAG_REV_START;
+            let static_online_sign_start = MESSAGE_LEN - STATIC_ONLINE_SIGN_REV_END;
+            let static_online_sign_end = MESSAGE_LEN - STATIC_ONLINE_SIGN_REV_START;
+            let static_online_sign_tag_end = MESSAGE_LEN - STATIC_ONLINE_SIGN_TAG_REV_START;
 
             let signature = sl
                 .static_public_keys()
@@ -215,10 +207,10 @@ impl<S: SessionLayer> Context<S> {
                 true,
             );
 
+            /* START OF STATE MANAGEMENT */
+
             // TODO: Add resumption token and key handling.
             let (cipher, resumption_token, resupmtion_key) = symmetric.split();
-
-            /* START OF STATE MANAGEMENT */
 
             let segmenter = Segmenter::new(confirm_message, HEADER_LEN, mtu);
 
