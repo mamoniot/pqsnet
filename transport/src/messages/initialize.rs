@@ -26,11 +26,6 @@ pub const PAYLOAD_TAG_START: usize = NEW_SOCKET_ID_END;
 pub const PAYLOAD_TAG_LEN: usize = aes256::TAG_LEN;
 pub const PAYLOAD_TAG_END: usize = PAYLOAD_TAG_START + PAYLOAD_TAG_LEN;
 
-/* START OF AESGCM COUNTERS */
-
-pub const EPHEMERAL_ENC_KEY_AES_COUNTER: u64 = 1;
-pub const PAYLOAD_AES_COUNTER: u64 = 2;
-
 /* START OF GENERAL CONSTANTS */
 
 pub const NULL_KEY_ID: u32 = 0;
@@ -38,4 +33,7 @@ pub const NULL_KEY_ID: u32 = 0;
 pub const RESUMPTION_KEY_LEN: usize = 64;
 
 pub const HEADER_LEN: usize = INITIALIZE_ID_END;
-pub const MESSAGE_MIN_LEN: usize = PAYLOAD_TAG_END;
+pub const MESSAGE_MAX_LEN: usize = PAYLOAD_TAG_END;
+
+#[allow(unused)]
+pub const MESSAGE_GCM_TOTAL: u32 = 2;

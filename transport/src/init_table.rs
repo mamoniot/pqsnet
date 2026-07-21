@@ -54,7 +54,7 @@ impl<'a, T> OccupiedEntry<'a, T> {
         self.bucket.table[self.i].as_mut().unwrap()
     }
 
-    pub fn remove(&mut self) -> T {
+    pub fn remove(mut self) -> T {
         // "last_use" is the last use of the table index, not the entry.
         self.bucket.table[self.i].take().unwrap()
     }
@@ -71,7 +71,7 @@ impl<T> InitTable<T> {
         Self { table, mask: size - 1 }
     }
 
-    pub fn entry(&self, id: u64) -> Entry<T> {
+    pub fn entry<'a>(&'a self, id: u64) -> Entry<'a, T> {
         let idx = (id as u32 & self.mask) as usize;
         let mut bucket = self.table[idx].lock().unwrap();
 

@@ -23,5 +23,10 @@ pub trait PublicKeyBundle {
     fn encode_key_bundle(&mut self) -> [u8; STATIC_KEY_BUNDLE_LEN];
 
     #[must_use]
-    fn verify(public_key: &[u8; PUBLIC_KEY_LEN], ctx: &[u8], data: &[u8]) -> bool;
+    fn verify(
+        public_key: &[u8; PUBLIC_KEY_LEN],
+        ctx: &[u8],
+        data: &[u8],
+        signature: &[u8; STATIC_OFFLINE_SIGN_LEN],
+    ) -> bool;
 }

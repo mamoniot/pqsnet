@@ -1,251 +1,287 @@
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
+
 use dashmap::DashMap;
 use rand_core::*;
-use zeroize::Zeroizing;
 
 use crate::{
-    crypto::{mldsa87::*, mlkem1024::*},
-    desegmentation::{self, Desegmentation},
+    antireplay::Antireplay,
+    crypto::{aes256::to_data_nonce, prelude::*},
+    desegmentation::{self, Desegmenter},
+    error::Error,
     init_table::{Entry, InitTable},
+    initiator::InitializeState,
     messages::*,
+    responder::ReplyState,
     session_layer::SessionLayer,
-    symmetric_state::SymmetricState,
 };
 
 pub struct Context<S: SessionLayer> {
-    init_table: InitTable<Desegmentation<{ initialize::HEADER_LEN }>>,
+    init_table: InitTable<Desegmenter>,
+    /// It must be the case that no handshake state can be modified in `socket_table` while its
+    /// corresponding desegmenter is in the `is_complete` state.
+    /// A desegmenter only enters the `is_complete` state in the brief window after a message has
+    /// been fully desegmented, in which case the desegmenting thread must have mutually exclusive
+    /// access to the corresponding handshake state.
     socket_table: DashMap<u32, SocketState<S>>,
 }
 
-enum SocketState<S: SessionLayer> {
+pub(crate) enum HandshakeState<S: SessionLayer> {
+    SendingInitialize(InitializeState<S>),
+    SendingReply(ReplyState<S>),
+    // SendingConfirm(ConfirmState<S>),
+}
+
+pub(crate) enum SocketState<S: SessionLayer> {
     Reserved,
-    SentInitialize {
-        symmetric: SymmetricState<S>,
-        decapsulation_key: S::DecapsulationKeyImpl,
+    Handshake {
+        state: HandshakeState<S>,
+        desegmenter: Mutex<Desegmenter>,
     },
-    SentReply {
-        symmetric: SymmetricState<S>,
+    AwaitingData {
+        resend_until_recv: Box<[u8]>,
+        cipher: S::HotPathDuplexCipherImpl,
         send_socket_id: u32,
     },
-    Active(Socket<S>),
+    Active(Arc<Socket<S>>),
 }
 
 pub struct Socket<S: SessionLayer> {
-    todo: S,
+    pub(crate) cipher: S::HotPathDuplexCipherImpl,
+    pub(crate) antireplay: Antireplay<128>,
+    pub(crate) send_socket_id: u32,
+    pub(crate) counter: AtomicU64,
 }
 
-pub enum RecvResult<S: SessionLayer> {
+pub enum RecvOk<S: SessionLayer> {
+    /// The packet received was dropped for being a duplicate of a previous packet.
+    Duplicate,
+    Incomplete,
+    ReplySent,
+    ResumeSent,
+    ConfirmSent,
+    Data,
     NewSocket(Socket<S>),
 }
 
 impl<S: SessionLayer> Context<S> {
-    pub fn recv(&self, sl: S, packet: &mut [u8]) -> RecvResult<S> {
-        let key_id = u32::from_be_bytes(
+    pub fn recv(&self, sl: S, packet: &mut [u8], recv_mtu: usize) -> Result<RecvOk<S>, Error> {
+        let recv_socket_id = u32::from_be_bytes(
             packet[shared::SOCKET_ID_START..shared::SOCKET_ID_END]
                 .try_into()
                 .unwrap(),
         );
 
-        if key_id == initialize::NULL_KEY_ID {
+        if recv_socket_id == initialize::NULL_KEY_ID {
+            /* START OF INITIALIZE DESEGMENTATION */
+
             let initialize_id = u64::from_be_bytes(
                 packet[initialize::INITIALIZE_ID_START..initialize::INITIALIZE_ID_END]
                     .try_into()
                     .unwrap(),
             );
-            if Desegmentation::<{ initialize::HEADER_LEN }>::is_single_segment(packet) {
-                self.process_initialize(sl, packet);
-            } else {
-                // The following line locks init_table.
-                // That lock is dropped before `process_initialize` is called.
-                match self.init_table.entry(initialize_id) {
-                    Entry::Vacant(entry) => match Desegmentation::first_recv(packet, initialize::PAYLOAD_TAG_END) {
-                        desegmentation::FirstRecvResult::Segmented(desegmentation) => {
-                            entry.insert(desegmentation);
+            // The following line locks init_table.
+            // That lock is dropped before .` is called.
+            let entry = self.init_table.entry(initialize_id);
+            match entry {
+                Entry::Occupied(mut occupied_entry) => {
+                    match occupied_entry
+                        .get_mut()
+                        .recv(packet, initialize::HEADER_LEN, initialize::MESSAGE_MAX_LEN)
+                    {
+                        desegmentation::RecvResult::Invalid => Err(Error::Invalid),
+                        desegmentation::RecvResult::Duplicate => Ok(RecvOk::Duplicate),
+                        desegmentation::RecvResult::Incomplete => Ok(RecvOk::Incomplete),
+                        desegmentation::RecvResult::NotSegmented => {
+                            occupied_entry.remove();
+                            self.process_initialize(sl, packet, recv_mtu)
                         }
-                        desegmentation::FirstRecvResult::NotSegmented => {
-                            drop(entry);
-
-                            self.process_initialize(sl, packet);
+                        desegmentation::RecvResult::Complete(mut message) => {
+                            occupied_entry.remove();
+                            self.process_initialize(sl, &mut message, recv_mtu)
                         }
-                        desegmentation::FirstRecvResult::Invalid => todo!(),
-                    },
-                    Entry::Occupied(mut entry) => match entry.get_mut().recv(packet) {
-                        desegmentation::RecvResult::Complete => {
-                            let mut message = entry.remove().complete();
-
-                            self.process_initialize(sl, message.as_mut());
+                    }
+                }
+                Entry::Vacant(vacant_entry) => {
+                    let mut desegmenter = Desegmenter::default();
+                    match desegmenter.recv(packet, initialize::HEADER_LEN, initialize::MESSAGE_MAX_LEN) {
+                        desegmentation::RecvResult::Invalid => Err(Error::Invalid),
+                        desegmentation::RecvResult::Duplicate => Ok(RecvOk::Duplicate),
+                        desegmentation::RecvResult::Incomplete => {
+                            vacant_entry.insert(desegmenter);
+                            Ok(RecvOk::Incomplete)
                         }
-                        desegmentation::RecvResult::Invalid => todo!(),
-                        desegmentation::RecvResult::Duplicate => todo!(),
-                        desegmentation::RecvResult::Incomplete => todo!(),
-                    },
+                        desegmentation::RecvResult::NotSegmented => self.process_initialize(sl, packet, recv_mtu),
+                        desegmentation::RecvResult::Complete(mut message) => {
+                            self.process_initialize(sl, &mut message, recv_mtu)
+                        }
+                    }
                 }
             }
+        } else if let Some(socket_state) = self.socket_table.get(&recv_socket_id) {
+            match socket_state.value() {
+                SocketState::Reserved => todo!(),
+                SocketState::Handshake { state: _, desegmenter } => {
+                    let mut desegmenter = desegmenter.lock().unwrap();
+                    match desegmenter.recv(packet, shared::SEGMENT_HEADER_END, todo!()) {
+                        desegmentation::RecvResult::Invalid => Err(Error::Invalid),
+                        desegmentation::RecvResult::Duplicate => Ok(RecvOk::Duplicate),
+                        desegmentation::RecvResult::Incomplete => Ok(RecvOk::Incomplete),
+                        desegmentation::RecvResult::NotSegmented => {
+                            drop(desegmenter);
+                            drop(socket_state);
+                            self.process_handshake(sl, recv_socket_id, packet, recv_mtu)
+                        }
+                        desegmentation::RecvResult::Complete(mut message) => {
+                            drop(desegmenter);
+                            drop(socket_state);
+                            self.process_handshake(sl, recv_socket_id, &mut message, recv_mtu)
+                        }
+                    }
+                }
+                SocketState::Active(socket) => {
+                    let socket_clone = socket.clone();
+                    drop(socket_state);
+                    self.process_active(sl, socket_clone, packet)
+                }
+                SocketState::AwaitingData { resend_until_recv, cipher, send_socket_id } => todo!(),
+            }
+        } else {
+            todo!()
         }
-
-        todo!()
     }
-
-    fn initialize(&self, mut sl: S, resumption_token: &[u8], resumption_key: &[u8]) {
-        use initialize::*;
-        let mut symmetric = SymmetricState::<S>::default();
-
-        let mut send_message = vec![0; PAYLOAD_TAG_END];
-
-        /* START OF HEADER ENCODING */
-        // TODO: Partially handle segmentation to fill seg_total and seg_rem.
-
-        /* START OF RESUMPTION TOKEN HANDLING */
-
-        send_message[RESUMPTION_TOKEN_START..RESUMPTION_TOKEN_END].copy_from_slice(resumption_token);
-
-        symmetric.mix(&send_message[..RESUMPTION_TOKEN_END]);
-
-        symmetric.mix(resumption_key);
-
-        /* START OF MLKEM1024 EPHEMERAL ENCAPSULATION KEY HANDLING */
-
-        let (encapsulation_key, decapsulation_key) = S::DecapsulationKeyImpl::generate();
-        send_message[EPHEMERAL_ENC_KEY_START..EPHEMERAL_ENC_KEY_END].copy_from_slice(&encapsulation_key);
-
-        symmetric.encrypt_and_mix(
-            &mut send_message[EPHEMERAL_ENC_KEY_START..EPHEMERAL_ENC_KEY_TAG_END],
-            false,
-        );
-
-        /* START OF SEND SOCKET ID HANDLING */
-        let recv_socket_id = self.generate_socket_id(&mut sl);
-
-        send_message[NEW_SOCKET_ID_START..NEW_SOCKET_ID_END].copy_from_slice(&recv_socket_id.to_be_bytes());
-
-        symmetric.encrypt_and_mix(&mut send_message[NEW_SOCKET_ID_START..PAYLOAD_TAG_END], false);
-
-        /* START OF STATE MANAGEMENT */
-
-        self.socket_table.insert(recv_socket_id, SocketState::SentInitialize { symmetric, decapsulation_key });
-    }
-
-    fn process_initialize(&self, mut sl: S, recv_message: &mut [u8]) -> bool {
-        use shared::*;
-        let mut symmetric = SymmetricState::<S>::default();
-
-        let shared_secret;
-        let ciphertext;
-        let send_socket_id;
-        {
-            use initialize::*;
-
-            /* START OF RESUMPTION TOKEN HANDLING */
-
-            symmetric.mix(&recv_message[..RESUMPTION_TOKEN_END]);
-
-            let resumption_token = (&recv_message[RESUMPTION_TOKEN_START..RESUMPTION_TOKEN_END])
-                .try_into()
-                .unwrap();
-
-            if let Some(resumption_key) = sl.lookup_resumption_key(resumption_token) {
-                symmetric.mix(&resumption_key);
-            } else {
-                symmetric.mix(&[0; RESUMPTION_KEY_LEN]);
+    /// A full handshake message was just desegmented, so its corresponding `SocketState` must be
+    /// temporarily swapped for a `SocketState::Reserved` state while it is processed.
+    /// However, since the read lock on `socket_table` was dropped, race conditions are possible.
+    /// To make sure that `message` is processed with its corresponding handshake state, it must be
+    /// the case that no handshake state can be modified in `socket_table` while its corresponding
+    /// desegmenter is in the `is_complete` state.
+    fn process_handshake(&self, sl: S, socket_id: u32, message: &mut [u8], mtu: usize) -> Result<RecvOk<S>, Error> {
+        let state = match self.socket_table.entry(socket_id) {
+            dashmap::Entry::Occupied(mut entry) => {
+                let socket_state = entry.insert(SocketState::Reserved);
+                match socket_state {
+                    SocketState::Handshake { state, .. } => state,
+                    _ => {
+                        debug_assert!(false, "unreachable: race condition in socket table");
+                        entry.insert(socket_state);
+                        return Ok(RecvOk::Incomplete);
+                    }
+                }
             }
-
-            /* START OF MLKEM1024 EPHEMERAL ENCAPSULATION KEY HANDLING */
-
-            let auth = symmetric.mix_and_decrypt(
-                &mut recv_message[EPHEMERAL_ENC_KEY_START..EPHEMERAL_ENC_KEY_TAG_END],
-                false,
-            );
-            if !auth {
-                return false;
+            dashmap::Entry::Vacant(_) => {
+                debug_assert!(false, "unreachable: race condition in socket table");
+                return Ok(RecvOk::Incomplete);
             }
+        };
 
-            let result = S::DecapsulationKeyImpl::encapsulate(
-                (&recv_message[EPHEMERAL_ENC_KEY_START..EPHEMERAL_ENC_KEY_END])
-                    .try_into()
-                    .unwrap(),
-            );
-            if let Some((ss, c)) = result {
-                ciphertext = c;
-                shared_secret = Zeroizing::new(ss);
-            } else {
-                return false;
-            }
+        let guard = SocketGuard { ctx: self, id: socket_id };
 
-            /* START OF SEND SOCKET ID HANDLING */
-
-            let auth = symmetric.mix_and_decrypt(&mut recv_message[NEW_SOCKET_ID_START..PAYLOAD_TAG_END], false);
-            if !auth {
-                return false;
-            }
-
-            send_socket_id =
-                u32::from_be_bytes(recv_message[NEW_SOCKET_ID_START..NEW_SOCKET_ID_END].try_into().unwrap());
-        }
-        {
-            use reply::*;
-            let mut send_message = vec![0; STATIC_ONLINE_SIGN_TAG_END];
-
-            /* START OF HEADER ENCODING */
-            // TODO: Partially handle segmentation to fill seg_total and seg_rem.
-
-            send_message[SOCKET_ID_START..SOCKET_ID_END].copy_from_slice(&send_socket_id.to_be_bytes());
-
-            /* START OF MLKEM1024 CIPHERTEXT ENCRYPTION */
-
-            send_message[EPHEMERAL_CIPHERTEXT_START..EPHEMERAL_CIPHERTEXT_END].copy_from_slice(&ciphertext);
-
-            symmetric.encrypt_and_mix(
-                &mut send_message[EPHEMERAL_CIPHERTEXT_START..EPHEMERAL_CIPHERTEXT_TAG_END],
-                false,
-            );
-
-            /* START OF MLKEM1024 SHARED SECRET MIXING */
-
-            symmetric.mix(shared_secret.as_ref());
-
-            /* START OF MLDSA87 KEY BUNDLE ENCODING */
-
-            send_message[STATIC_OFFLINE_PUBKEY_START..STATIC_OFFLINE_SIGN_END]
-                .copy_from_slice(&sl.static_public_keys().encode_key_bundle());
-
-            /* START OF RECV SOCKET ID HANDLING */
-
-            let recv_socket_id = self.generate_socket_id(&mut sl);
-
-            send_message[NEW_SOCKET_ID_START..NEW_SOCKET_ID_END].copy_from_slice(&recv_socket_id.to_be_bytes());
-
-            /* START OF MLDSA87 KEY BUNDLE AND RECV SOCKET ID ENCRYPTION */
-
-            symmetric.encrypt_and_mix(&mut send_message[STATIC_OFFLINE_PUBKEY_START..PAYLOAD_TAG_END], false);
-
-            /* START OF MLDSA87 SIGNING AND ENCRYPTION */
-
-            let signature = sl
-                .static_public_keys()
-                .sign_with_online(REPLY_BINDING_DOMAIN_NAME, symmetric.channel_binding());
-
-            send_message[STATIC_ONLINE_SIGN_START..STATIC_ONLINE_SIGN_END].copy_from_slice(&signature);
-
-            symmetric.encrypt_and_mix(
-                &mut send_message[STATIC_ONLINE_SIGN_START..STATIC_ONLINE_SIGN_TAG_END],
-                false,
-            );
-
-            self.socket_table.insert(recv_socket_id, SocketState::SentReply { symmetric, send_socket_id });
-
-            true
+        match state {
+            HandshakeState::SendingInitialize(state) => self.process_reply(sl, state, guard, message, mtu),
+            HandshakeState::SendingReply(state) => self.process_confirm(sl, state, guard, message, mtu),
         }
     }
 
-    fn generate_socket_id(&self, sl: &mut S) -> u32 {
+    fn process_active(&self, sl: S, socket: Arc<Socket<S>>, packet: &mut [u8]) -> Result<RecvOk<S>, Error> {
+        use data::*;
+        let counter = u32::from_be_bytes(packet[GCM_COUNTER_START..GCM_COUNTER_END].try_into().unwrap());
+
+        if !socket.antireplay.check(counter) {
+            return Ok(RecvOk::Duplicate);
+        }
+
+        let tag_start = packet.len() - TAG_LEN;
+        let (data, tag) = packet[DATA_START..].split_at_mut(tag_start);
+        let auth = socket
+            .cipher
+            .decrypt_in_place(to_data_nonce(counter), data, tag.try_into().unwrap());
+        if !auth {
+            return Err(Error::Inauthentic);
+        }
+
+        if !socket.antireplay.update(counter) {
+            return Ok(RecvOk::Duplicate);
+        }
+
+        Ok(RecvOk::Data)
+    }
+
+    /// Reserves a socket id in the socket table for use in the form of a guard.
+    /// Reserved socket ids cannot receive packets and cannot be reserved twice simultaneously.
+    /// If this guard is dropped, the socket id is un-reserved, preventing a memory leak.
+    /// This guard does not hold any locks and cannot cause a deadlock.
+    pub(crate) fn reserve_socket<'a>(&'a self, sl: &mut S) -> SocketGuard<'a, S> {
         loop {
             // Rejection sample a unique socket id.
-            let candidate = sl.rng().next_u32();
-            if let dashmap::Entry::Vacant(entry) = self.socket_table.entry(candidate) {
+            let id = sl.rng().next_u32();
+            if let dashmap::Entry::Vacant(entry) = self.socket_table.entry(id) {
                 entry.insert(SocketState::Reserved);
-                return candidate;
+                return SocketGuard { ctx: self, id };
             }
         }
     }
 
     pub fn send() {}
+}
+
+impl<S: SessionLayer> Socket<S> {
+    // TODO: Improve `packet` field.
+    pub fn send(&self, packet: &mut [u8]) -> bool {
+        use {data::*, shared::*};
+
+        let counter = self.counter.fetch_add(1, Ordering::Relaxed);
+        // This packet is encrypted with nonce value `counter`,
+        // returned by atomically incrementing `self.counter` by 1.
+        // Since `self.counter` is initialized to 1, the only way for `counter` to not be a unique
+        // integer is for `self.counter` to overflow from u64::MAX to 0.
+        // When `counter > MAXIMUM_AES_GCM_COUNTER`, `self.counter` is atomically decremented and
+        // the counter is rejected.
+        // Therefore, for `self.counter` to overflow, `2^64 - MAXIMUM_AES_GCM_COUNTER` threads must
+        // execute the above increment but still be waiting to execute the below decrement.
+        // That is absurd and is not physically possible.
+        if counter > MAXIMUM_AES_GCM_COUNTER as u64 {
+            self.counter.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        let counter = counter as u32;
+
+        packet[SOCKET_ID_START..SOCKET_ID_END].copy_from_slice(&self.send_socket_id.to_be_bytes());
+        packet[GCM_COUNTER_START..GCM_COUNTER_END].copy_from_slice(&counter.to_be_bytes());
+
+        let tag_start = packet.len() - TAG_LEN;
+        let (data, pad) = packet[DATA_START..].split_at_mut(tag_start);
+        let tag = self.cipher.encrypt_in_place(to_data_nonce(counter), data);
+        pad.copy_from_slice(&tag);
+        true
+    }
+}
+
+/// A guard for a reserved socket id.
+/// Reserved socket ids cannot receive packets and cannot be reserved twice simultaneously.
+/// If this is dropped, the socket id is un-reserved, preventing a memory leak.
+/// This does not hold any locks and cannot cause a deadlock.
+pub(crate) struct SocketGuard<'a, S: SessionLayer> {
+    ctx: &'a Context<S>,
+    id: u32,
+}
+
+impl<'a, S: SessionLayer> SocketGuard<'a, S> {
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    pub fn insert(self, state: SocketState<S>) {
+        self.ctx.socket_table.insert(self.id, state);
+
+        std::mem::forget(self);
+    }
+}
+
+impl<'a, S: SessionLayer> Drop for SocketGuard<'a, S> {
+    fn drop(&mut self) {
+        self.ctx.socket_table.remove(&self.id);
+    }
 }

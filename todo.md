@@ -5,3 +5,12 @@
 - Update protocol full name with new name
 - Structure init_table as a cache with strict upper limits
 - Zeroize stack
+- Input sanitize mtu
+- Improve desegmentation API
+- Send handshake messages
+- Add more context to offline key certificate
+- Add session-level approval or rejection of offline key
+- Allow for dynamic length payloads
+- Handshake resends
+- Resumption API
+- Socket coherency after resumption
