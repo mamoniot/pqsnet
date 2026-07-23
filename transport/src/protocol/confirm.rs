@@ -1,0 +1,33 @@
+use std::ops::Range;
+
+use crate::crypto::*;
+
+/* START OF MESSAGE DEFINITION */
+
+pub const KEY_BUNDLE_START: usize = super::shared::SEGMENT_HEADER_END;
+pub const KEY_BUNDLE_LEN: usize = super::key_bundle::KEY_BUNDLE_LEN;
+pub const KEY_BUNDLE_END: usize = KEY_BUNDLE_START + KEY_BUNDLE_LEN;
+pub const KEY_BUNDLE_RANGE: Range<usize> = KEY_BUNDLE_START..KEY_BUNDLE_END;
+
+/* START OF MESSAGE TAIL DEFINITION */
+
+pub const PAYLOAD_TAG_REV_END: usize = PAYLOAD_TAG_REV_START + PAYLOAD_TAG_LEN;
+pub const PAYLOAD_TAG_LEN: usize = aes256::TAG_LEN;
+pub const PAYLOAD_TAG_REV_START: usize = STATIC_ONLINE_SIGN_REV_END;
+
+pub const STATIC_ONLINE_SIGN_REV_END: usize = STATIC_ONLINE_SIGN_REV_START + STATIC_ONLINE_SIGN_LEN;
+pub const STATIC_ONLINE_SIGN_LEN: usize = mldsa87::SIGNATURE_LEN;
+pub const STATIC_ONLINE_SIGN_REV_START: usize = STATIC_ONLINE_SIGN_TAG_REV_END;
+
+pub const STATIC_ONLINE_SIGN_TAG_REV_END: usize = STATIC_ONLINE_SIGN_TAG_REV_START + STATIC_ONLINE_SIGN_TAG_LEN;
+pub const STATIC_ONLINE_SIGN_TAG_LEN: usize = aes256::TAG_LEN;
+pub const STATIC_ONLINE_SIGN_TAG_REV_START: usize = 0;
+
+/* START OF LENGTH CONSTANTS */
+
+pub const HEADER_LEN: usize = super::shared::SEGMENT_HEADER_END;
+
+// pub const MESSAGE_MIN_LEN: usize = MESSAKEY_BUNDLE_STARTGE_LEN;
+// pub const MESSAGE_MAX_LEN: usize = 2 * MESSAGE_LEN.next_power_of_two();
+
+pub const MESSAGE_GCM_TOTAL: u32 = 2;

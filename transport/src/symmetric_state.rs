@@ -2,22 +2,23 @@ use zeroize::Zeroizing;
 
 use crate::{
     crypto::{
-        aes256::{ColdPathCipher, TAG_LEN, to_handshake_nonce},
+        aes256::{ColdPathCipher, TAG_LEN},
         shake256::Shake256,
-    },
-    error::Error,
-    messages::{
-        initialize::{RESUMPTION_KEY_LEN, RESUMPTION_TOKEN_LEN},
-        resume::COUNTER_SKIP,
-        shared::*,
-    },
-    session_layer::SessionLayer,
+    }, error::Error, protocol::{
+        domains::{PROTOCOL_DOMAIN_NAME_SHAKE256, to_handshake_nonce}, resume::COUNTER_SKIP, shared::*,
+    }, session_layer::{ResumptionKey, ResumptionToken, SessionLayer},
 };
 
 pub struct SymmetricState<S: SessionLayer> {
     key_buffer: Zeroizing<[u8; SHAKE256_MAX_OUTPUT_LEN]>,
     counter: u32,
     _s: std::marker::PhantomData<S>,
+}
+
+impl<S: SessionLayer> Clone for SymmetricState<S> {
+    fn clone(&self) -> Self {
+        Self { key_buffer: self.key_buffer.clone(), counter: self.counter, _s: Default::default() }
+    }
 }
 
 impl<S: SessionLayer> Default for SymmetricState<S> {
@@ -42,7 +43,7 @@ impl<S: SessionLayer> SymmetricState<S> {
         hasher.update(&self.key_buffer[CHAINING_KEY_START..CHAINING_KEY_END]);
         hasher.update(shared_data);
 
-        hasher.finish(&mut self.key_buffer[..]);
+        hasher.finish(&mut self.key_buffer[..CHANNEL_BINDING_END]);
     }
 
     pub fn encrypt_and_mix(&mut self, plaintext_and_pad: &mut [u8], finished: bool) {
@@ -103,8 +104,8 @@ impl<S: SessionLayer> SymmetricState<S> {
         self,
     ) -> (
         S::HotPathDuplexCipherImpl,
-        [u8; RESUMPTION_TOKEN_LEN],
-        Zeroizing<[u8; RESUMPTION_KEY_LEN]>,
+        ResumptionToken,
+        ResumptionKey,
     ) {
         todo!()
     }

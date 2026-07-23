@@ -3,7 +3,7 @@ use std::sync::{Arc, atomic::AtomicU64};
 use zeroize::Zeroizing;
 
 use crate::{
-    context::{Context, HandshakeState, RecvOk, Socket, SocketGuard, SocketState}, crypto::prelude::*, desegmentation::{Mtu, Segmenter}, error::Error, messages::{shared::*, *}, session_layer::{ResumptionAction, SessionLayer}, symmetric_state::SymmetricState,
+    context::{Context, HandshakeState, RecvOk, Socket, SocketGuard, SocketState}, crypto::prelude::*, desegmentation::{Mtu, Segmenter}, error::Error, protocol::{shared::*, *}, session_layer::{ResumptionAction, SessionLayer}, symmetric_state::SymmetricState,
 };
 
 pub struct ReplyState<S: SessionLayer> {
@@ -24,39 +24,75 @@ impl<S: SessionLayer> Context<S> {
         let shared_secret;
         let ciphertext;
         let send_socket_id;
-        let mut do_resume = false;
+        let mut fallback = false;
         {
             use initialize::*;
+
+            /* START OF SEND SOCKET ID HANDLING */
+
+            send_socket_id =
+                u32::from_be_bytes(init_message[NEW_SOCKET_ID_START..NEW_SOCKET_ID_END].try_into().unwrap());
+
             /* START OF RESUMPTION TOKEN HANDLING */
 
-            symmetric.mix(&init_message[..RESUMPTION_TOKEN_END]);
+            // TODO: Check message length.
+            let handshake_variant = init_message[HANDSHAKE_VARIANT_IDX];
+            if (handshake_variant & RESUMPTION_RESUME_FLAG) > 0 {
 
-            let resumption_token = (&init_message[RESUMPTION_TOKEN_START..RESUMPTION_TOKEN_END])
-                .try_into()
-                .unwrap();
+                symmetric.mix(&init_message[..RESUMPTION_TOKEN_END]);
 
-            match sl.lookup_resumption_key(resumption_token) {
-                ResumptionAction::ResumeKnownWithKey { key } => {
-                    symmetric.mix(&key[..]);
-                    do_resume = true;
+                let resumption_token = (&init_message[RESUMPTION_TOKEN_START..RESUMPTION_TOKEN_END])
+                    .try_into()
+                    .unwrap();
+
+                let resumption_key = None;
+                if let Some(v) = self.resumption_table.get(resumption_token) {
+                    let v = v.value();
+                    if let Some(s) = v.socket.upgrade() {
+                        let guard = s.lock.read().unwrap();
+                        if let Some(c) = &guard[v.cipher_idx as usize] {
+                            resumption_key = Some((c.resumption_key.clone(), v.socket.clone()));
+                        }
+                    }
                 }
-                ResumptionAction::AuthWithKey { key } => {
-                    symmetric.mix(&key[..]);
+
+                if let Some((resumption_key, pre_socket)) = &resumption_key {
+                    symmetric.mix(&resumption_key[..]);
+                } else {
+                    match sl.lookup_resumption_key(resumption_token) {
+                        ResumptionAction::ResumeWithKey { key } => {
+                            symmetric.mix(&key[..]);
+                        }
+                        ResumptionAction::ReplyUnknown => {
+                        }
+                        ResumptionAction::Reject => {
+                            return Err(Error::Inauthentic);
+                        }
+                    }
                 }
-                ResumptionAction::AuthUnknown => {
-                    symmetric.mix(&[0; RESUMPTION_KEY_LEN]);
-                }
-                ResumptionAction::Reject => {
-                    return Err(Error::Inauthentic);
-                }
+            } else {
+                symmetric.mix(&init_message[..RESUMPTION_TAG_END]);
+            }
+
+
+
+            /* START OF MLDSA87 KEY BUNDLE HANDLING */
+
+            let auth = S::PublicKeyBundleImpl::verify(
+                (&reply_message[STATIC_OFFLINE_PUBKEY_START..STATIC_OFFLINE_PUBKEY_END])
+                    .try_into()
+                    .unwrap(),
+                OFFLINE_KEY_CERTIFICATION_DOMAIN_NAME,
+                &reply_message[STATIC_ONLINE_PUBKEY_START..STATIC_ONLINE_PUBKEY_END],
+                (&reply_message[STATIC_OFFLINE_SIGN_START..STATIC_OFFLINE_SIGN_END])
+                    .try_into()
+                    .unwrap(),
+            );
+            if !auth {
+                return Err(Error::Inauthentic);
             }
 
             /* START OF MLKEM1024 EPHEMERAL ENCAPSULATION KEY HANDLING */
-
-            symmetric.mix_and_decrypt(
-                &mut init_message[EPHEMERAL_ENC_KEY_START..EPHEMERAL_ENC_KEY_TAG_END],
-                false,
-            )?;
 
             let result = S::DecapsulationKeyImpl::encapsulate(
                 (&init_message[EPHEMERAL_ENC_KEY_START..EPHEMERAL_ENC_KEY_END])
@@ -69,15 +105,6 @@ impl<S: SessionLayer> Context<S> {
             } else {
                 return Err(Error::Inauthentic);
             }
-
-            /* START OF SEND SOCKET ID HANDLING */
-
-            let payload_tag_end = init_message.len() - PAYLOAD_TAG_REV_START;
-
-            symmetric.mix_and_decrypt(&mut init_message[NEW_SOCKET_ID_START..payload_tag_end], false)?;
-
-            send_socket_id =
-                u32::from_be_bytes(init_message[NEW_SOCKET_ID_START..NEW_SOCKET_ID_END].try_into().unwrap());
         }
 
         let mut reply_message = if do_resume {

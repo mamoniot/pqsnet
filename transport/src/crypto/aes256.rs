@@ -1,10 +1,8 @@
-use crate::messages::shared::{AES_GCM_FIXED_FIELD_DATA, AES_GCM_FIXED_FIELD_HANDSHAKE};
-
-/// The size of an AES-256 key.
+/// The size in bytes of an AES-256 key.
 pub const KEY_LEN: usize = 32;
-/// The size of an AES-GCM authentication tag.
+/// The size in bytes of an AES-GCM authentication tag.
 pub const TAG_LEN: usize = 16;
-/// The size of an AES-GCM nonce.
+/// The size in bytes of an AES-GCM nonce.
 pub const NONCE_LEN: usize = 12;
 
 pub trait HotPathDuplexCipher: Send + Sync {
@@ -29,16 +27,4 @@ pub trait ColdPathCipher: Send + Sync {
 
     #[must_use]
     fn decrypt_in_place(key: &[u8; KEY_LEN], nonce: [u8; NONCE_LEN], data: &mut [u8], tag: [u8; TAG_LEN]) -> bool;
-}
-
-pub(crate) fn to_handshake_nonce(counter: u32) -> [u8; NONCE_LEN] {
-    let mut nonce = *AES_GCM_FIXED_FIELD_HANDSHAKE;
-    nonce[NONCE_LEN - 4..].copy_from_slice(&counter.to_be_bytes());
-    nonce
-}
-
-pub(crate) fn to_data_nonce(counter: u32) -> [u8; NONCE_LEN] {
-    let mut nonce = *AES_GCM_FIXED_FIELD_DATA;
-    nonce[NONCE_LEN - 4..].copy_from_slice(&counter.to_be_bytes());
-    nonce
 }

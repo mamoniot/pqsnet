@@ -1,56 +1,89 @@
-use std::sync::{Arc, atomic::AtomicU64};
+use std::sync::{Arc, Weak, atomic::AtomicU64};
 
 use rand_core::Rng;
 use zeroize::Zeroizing;
 
 use crate::{
-    context::{Context, HandshakeState, RecvOk, Socket, SocketGuard, SocketState}, crypto::prelude::*, desegmentation::{Mtu, Segmenter}, error::Error, messages::{shared::AES_GCM_INIT_COUNTER, *}, session_layer::SessionLayer, symmetric_state::SymmetricState,
+    context::{Context, HandshakeState, RecvOk, Socket, SocketGuard, SocketState}, crypto::prelude::*, desegmentation::{Mtu, Segmenter}, error::Error, protocol::{shared::AES_GCM_INIT_COUNTER, *}, session_layer::{ResumptionKey, ResumptionToken, SessionLayer}, symmetric_state::SymmetricState,
 };
 
 pub struct InitializeState<S: SessionLayer> {
-    segmenter: Segmenter,
     symmetric: SymmetricState<S>,
+    fallback: Option<SymmetricState<S>>,
     decapsulation_key: S::DecapsulationKeyImpl,
 }
 
 impl<S: SessionLayer> Context<S> {
-    pub fn initialize(&self, mut sl: S, resumption_token: &[u8], resumption_key: &[u8], mtu: Mtu) {
+    pub fn initialize(&self, mut sl: S, resumption: Option<(&ResumptionToken, &ResumptionKey, Option<Weak<Socket<S>>>, bool, bool)>, mtu: Mtu) {
         use initialize::*;
         let mut symmetric = SymmetricState::<S>::default();
 
         /* START OF HEADER ENCODING */
 
-        let mut init_message = Segmenter::create_message(MESSAGE_LEN, HEADER_LEN, 0, mtu);
+        let message_len = if let Some((_, _, _, _, do_full_exchange)) = resumption {
+            if do_full_exchange {
+                MESSAGE_LEN_WITH_FULL
+            } else {
+                MESSAGE_LEN_WITH_SIGN
+            }
+        } else {
+            MESSAGE_LEN_WITHOUT_SIGN
+        };
 
-        init_message[INITIALIZE_ID_START..INITIALIZE_ID_END].copy_from_slice(&sl.rng().next_u64().to_be_bytes());
+        let mut init_message = Segmenter::create_message(message_len, HEADER_LEN, 0, mtu);
 
-        /* START OF RESUMPTION TOKEN HANDLING */
-
-        init_message[RESUMPTION_TOKEN_START..RESUMPTION_TOKEN_END].copy_from_slice(resumption_token);
-
-        symmetric.mix(&init_message[..RESUMPTION_TOKEN_END]);
-
-        symmetric.mix(resumption_key);
+        init_message[INITIALIZE_UID_EXT_START..INITIALIZE_UID_EXT_END].copy_from_slice(&sl.rng().next_u64().to_be_bytes());
 
         /* START OF MLKEM1024 EPHEMERAL ENCAPSULATION KEY HANDLING */
 
         let (encapsulation_key, decapsulation_key) = S::DecapsulationKeyImpl::generate();
         init_message[EPHEMERAL_ENC_KEY_START..EPHEMERAL_ENC_KEY_END].copy_from_slice(&encapsulation_key);
 
-        symmetric.encrypt_and_mix(
-            &mut init_message[EPHEMERAL_ENC_KEY_START..EPHEMERAL_ENC_KEY_TAG_END],
-            false,
-        );
-
         /* START OF SEND SOCKET ID HANDLING */
-
-        let payload_tag_end = MESSAGE_LEN - PAYLOAD_TAG_REV_START;
 
         let socket_guard = self.reserve_socket(&mut sl);
 
         init_message[NEW_SOCKET_ID_START..NEW_SOCKET_ID_END].copy_from_slice(&socket_guard.id().to_be_bytes());
 
-        symmetric.encrypt_and_mix(&mut init_message[NEW_SOCKET_ID_START..payload_tag_end], false);
+        /* START OF RESUMPTION TOKEN HANDLING */
+
+        let mut fallback = None;
+        let mut pre_socket = None;
+
+        if let Some((token, key, s, allow_fallback, do_full_exchange)) = resumption {
+            pre_socket = s;
+
+            init_message[RESUMPTION_TOKEN_RANGE].copy_from_slice(token);
+            init_message[RESUMPTION_TAG_IDX] = ((do_full_exchange as u8) * RESUMPTION_FULL_EXCHANGE_FLAG) | ((allow_fallback as u8) * RESUMPTION_ALLOW_FALLBACK_FLAG) | RESUMPTION_RESUME_FLAG;
+
+            symmetric.mix(&init_message[..RESUMPTION_TOKEN_END]);
+
+            if allow_fallback {
+                fallback = Some(symmetric.clone())
+            }
+
+            symmetric.mix(&key[..]);
+
+            if do_full_exchange {
+                let resumption_tag_start = MESSAGE_LEN_WITH_FULL - RESUMPTION_TAG_REV_END;
+                let resumption_tag_end = MESSAGE_LEN_WITH_FULL - RESUMPTION_TAG_REV_END;
+
+                symmetric.encrypt_and_mix(&mut init_message[resumption_tag_start..resumption_tag_end], false);
+            } else {
+                let static_online_sign_start = MESSAGE_LEN_WITH_SIGN - STATIC_ONLINE_SIGN_REV_END;
+                let static_online_sign_end = MESSAGE_LEN_WITH_SIGN - STATIC_ONLINE_SIGN_REV_START;
+                let static_online_sign_tag_end = MESSAGE_LEN_WITH_SIGN - RESUMPTION_TAG_REV_START;
+
+                let sign = sl.static_public_keys().sign_with_online(shared::INITIALIZE_BINDING_DOMAIN_NAME, symmetric.channel_binding());
+                init_message[static_online_sign_start..static_online_sign_end].copy_from_slice(&sign);
+
+                symmetric.encrypt_and_mix(&mut init_message[static_online_sign_start..static_online_sign_tag_end], false);
+            }
+        } else {
+            init_message[RESUMPTION_TAG_IDX] = 0;
+
+            symmetric.mix(&init_message[..RESUMPTION_TAG_END]);
+        }
 
         /* START OF STATE MANAGEMENT */
 
@@ -58,10 +91,13 @@ impl<S: SessionLayer> Context<S> {
 
         socket_guard.insert(SocketState::Handshake {
             state: HandshakeState::SendingInitialize(InitializeState {
-                segmenter,
                 symmetric,
+                fallback,
                 decapsulation_key,
             }),
+            segmenter,
+            pre_socket,
+            expiry_ts: todo!(),
             desegmenter: Default::default(),
         })
     }
@@ -214,13 +250,17 @@ impl<S: SessionLayer> Context<S> {
 
             let segmenter = Segmenter::new(confirm_message, HEADER_LEN, mtu);
 
-            guard.insert(SocketState::Active(Arc::new(Socket {
-                cipher,
-                segmenter: Some(segmenter.clone()),
-                antireplay: Default::default(),
-                send_socket_id,
-                counter: AtomicU64::new(AES_GCM_INIT_COUNTER as u64),
-            })));
+            guard.insert(SocketState::AwaitingData {
+                socket: Arc::new(Socket {
+                    cipher,
+                    antireplay: Default::default(),
+                    send_socket_id,
+                    counter: AtomicU64::new(AES_GCM_INIT_COUNTER as u64),
+                }),
+                segmenter,
+                expiry_ts: u64,
+                idx: 0,
+            });
 
             Ok(RecvOk::SendReply(segmenter))
         }

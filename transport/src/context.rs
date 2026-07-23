@@ -1,13 +1,12 @@
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    Arc, Mutex, Weak, atomic::Ordering,
 };
 
 use dashmap::DashMap;
 use rand_core::*;
 
 use crate::{
-    antireplay::Antireplay, crypto::{aes256::to_data_nonce, prelude::*}, desegmentation::{self, Desegmenter, Mtu, Segmenter}, error::Error, init_table::{Entry, InitTable}, initiator::InitializeState, messages::*, responder::ReplyState, session_layer::SessionLayer,
+    crypto::prelude::*, desegmentation::{self, Desegmenter, Mtu, Segmenter}, error::Error, init_table::{Entry, InitTable}, initiator::InitializeState, protocol::*, responder::ReplyState, session_layer::{ResumptionToken, SessionLayer}, socket::Socket,
 };
 
 pub struct Context<S: SessionLayer> {
@@ -17,7 +16,13 @@ pub struct Context<S: SessionLayer> {
     /// A desegmenter only enters the `is_complete` state in the brief window after a message has
     /// been fully desegmented, in which case the desegmenting thread must have mutually exclusive
     /// access to the corresponding handshake state.
-    socket_table: DashMap<u32, SocketState<S>>,
+    pub(crate) socket_table: DashMap<u32, SocketState<S>>,
+    pub(crate) resumption_table: DashMap<ResumptionToken, ResumptionState<S>>,
+}
+
+pub(crate) struct ResumptionState<S: SessionLayer> {
+    pub(crate) socket: Weak<Socket<S>>,
+    pub(crate) cipher_idx: bool,
 }
 
 pub(crate) enum HandshakeState<S: SessionLayer> {
@@ -30,22 +35,21 @@ pub(crate) enum SocketState<S: SessionLayer> {
     Reserved,
     Handshake {
         state: HandshakeState<S>,
+        segmenter: Segmenter,
+        pre_socket: Option<Weak<Socket<S>>>,
+        expiry_ts: u64,
         desegmenter: Mutex<Desegmenter>,
     },
     AwaitingData {
+        socket: Arc<Socket<S>>,
         segmenter: Segmenter,
-        cipher: S::HotPathDuplexCipherImpl,
-        send_socket_id: u32,
+        expiry_ts: u64,
+        idx: u32
     },
-    Active(Arc<Socket<S>>),
-}
-
-pub struct Socket<S: SessionLayer> {
-    pub(crate) segmenter: Option<Segmenter>,
-    pub(crate) cipher: S::HotPathDuplexCipherImpl,
-    pub(crate) antireplay: Antireplay<128>,
-    pub(crate) send_socket_id: u32,
-    pub(crate) counter: AtomicU64,
+    Active {
+        socket: Weak<Socket<S>>,
+        cipher_idx: bool,
+    },
 }
 
 pub enum RecvOk<S: SessionLayer> {
@@ -71,7 +75,7 @@ impl<S: SessionLayer> Context<S> {
             use initialize::*;
             /* START OF INITIALIZE DESEGMENTATION */
 
-            let initialize_id = u64::from_be_bytes(packet[INITIALIZE_ID_START..INITIALIZE_ID_END].try_into().unwrap());
+            let initialize_id = u64::from_be_bytes(packet[INITIALIZE_UID_RANGE].try_into().unwrap());
             // The following line locks `init_table`.
             // That lock is dropped before `process_initialize` is called.
             let entry = self.init_table.entry(initialize_id);
@@ -204,9 +208,11 @@ impl<S: SessionLayer> Context<S> {
         loop {
             // Rejection sample a unique socket id.
             let id = sl.rng().next_u32();
-            if let dashmap::Entry::Vacant(entry) = self.socket_table.entry(id) {
-                entry.insert(SocketState::Reserved);
-                return SocketGuard { ctx: self, id };
+            if id != 0 {
+                if let dashmap::Entry::Vacant(entry) = self.socket_table.entry(id) {
+                    entry.insert(SocketState::Reserved);
+                    return SocketGuard { ctx: self, id };
+                }
             }
         }
     }

@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU32, Ordering::*};
 
-use crate::messages::shared::AES_GCM_INIT_COUNTER;
+use crate::protocol::shared::AES_GCM_INIT_COUNTER;
 
 pub struct Antireplay<const L: usize>([AtomicU32; L]);
 

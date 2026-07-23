@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::messages::{*, shared::*};
+use crate::protocol::{*, shared::*};
 
 #[derive(Default)]
 pub struct Desegmenter {

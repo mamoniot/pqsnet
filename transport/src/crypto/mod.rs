@@ -16,5 +16,7 @@ pub mod prelude {
 
     pub use mlkem1024::DecapsulationKey;
 
-    pub use mldsa87::PublicKeyBundle;
+    pub use mldsa87::PublicSigningKey;
+
+    pub use mldsa87::PrivateSigningKey;
 }

@@ -2,8 +2,7 @@ pub mod session_layer;
 
 pub mod crypto;
 
-pub(crate) mod messages;
-pub use messages::key_bundle;
+pub(crate) mod protocol;
 
 pub mod desegmentation;
 
@@ -15,9 +14,13 @@ pub mod responder;
 
 pub mod error;
 
+pub mod socket;
+
 pub mod context;
 
 pub mod init_table;
+
+pub mod key_bundle;
 
 pub mod crypto_impl;
 

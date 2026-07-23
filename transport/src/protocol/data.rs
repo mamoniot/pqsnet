@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use crate::crypto::*;
 
 /* START OF MESSAGE DEFINITION */
@@ -5,6 +7,7 @@ use crate::crypto::*;
 pub const GCM_COUNTER_START: usize = super::shared::SOCKET_ID_END;
 pub const GCM_COUNTER_LEN: usize = 4;
 pub const GCM_COUNTER_END: usize = GCM_COUNTER_START + GCM_COUNTER_LEN;
+pub const GCM_COUNTER_RANGE: Range<usize> = GCM_COUNTER_START..GCM_COUNTER_END;
 
 pub const DATA_START: usize = GCM_COUNTER_END;
 
