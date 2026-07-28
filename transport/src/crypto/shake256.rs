@@ -1,3 +1,5 @@
+pub const HASH384_LEN: usize = 48;
+
 pub trait Shake256 {
     fn new() -> Self;
 

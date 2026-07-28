@@ -13,10 +13,5 @@ pub trait PublicSigningKey {
     fn encode(&self) -> [u8; PUBLIC_KEY_LEN];
 
     #[must_use]
-    fn verify(
-        &self,
-        ctx: &[u8],
-        data: &[u8],
-        signature: &[u8; SIGNATURE_LEN],
-    ) -> bool;
+    fn verify(&self, ctx: &[u8], data: &[u8], signature: &[u8; SIGNATURE_LEN]) -> bool;
 }

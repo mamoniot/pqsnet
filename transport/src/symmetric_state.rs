@@ -1,30 +1,32 @@
 use zeroize::Zeroizing;
 
 use crate::{
-    crypto::{
-        aes256::{ColdPathCipher, TAG_LEN},
-        shake256::Shake256,
-    }, error::Error, protocol::{
-        domains::{PROTOCOL_DOMAIN_NAME_SHAKE256, to_handshake_nonce}, resume::COUNTER_SKIP, shared::*,
-    }, session_layer::{ResumptionKey, ResumptionToken, SessionLayer},
+    crypto::{aes256::TAG_LEN, prelude::*},
+    error::Error,
+    protocol::{domain, resume::COUNTER_SKIP, shared::*},
+    session_layer::{ResumptionKey, ResumptionToken, SessionLayer},
 };
 
 pub struct SymmetricState<S: SessionLayer> {
-    key_buffer: Zeroizing<[u8; SHAKE256_MAX_OUTPUT_LEN]>,
+    key_buffer: Zeroizing<[u8; SHAKE256_NORMAL_OUTPUT_LEN]>,
     counter: u32,
     _s: std::marker::PhantomData<S>,
 }
 
 impl<S: SessionLayer> Clone for SymmetricState<S> {
     fn clone(&self) -> Self {
-        Self { key_buffer: self.key_buffer.clone(), counter: self.counter, _s: Default::default() }
+        Self {
+            key_buffer: self.key_buffer.clone(),
+            counter: self.counter,
+            _s: Default::default(),
+        }
     }
 }
 
 impl<S: SessionLayer> Default for SymmetricState<S> {
     fn default() -> Self {
-        let mut key_buffer = Zeroizing::new([0u8; SHAKE256_MAX_OUTPUT_LEN]);
-        key_buffer[CHAINING_KEY_START..CHAINING_KEY_END].copy_from_slice(&PROTOCOL_DOMAIN_NAME_SHAKE256);
+        let mut key_buffer = Zeroizing::new([0u8; SHAKE256_NORMAL_OUTPUT_LEN]);
+        key_buffer[CHAINING_KEY_START..CHAINING_KEY_END].copy_from_slice(&domain::TRANSPORT_PROTOCOL_SHAKE256);
         Self {
             key_buffer,
             counter: AES_GCM_INIT_COUNTER,
@@ -46,18 +48,12 @@ impl<S: SessionLayer> SymmetricState<S> {
         hasher.finish(&mut self.key_buffer[..CHANNEL_BINDING_END]);
     }
 
-    pub fn encrypt_and_mix(&mut self, plaintext_and_pad: &mut [u8], finished: bool) {
-        let key_len = if finished {
-            SHAKE256_MAX_OUTPUT_LEN
-        } else {
-            CHANNEL_BINDING_END
-        };
-
+    pub fn encrypt_and_mix(&mut self, plaintext_and_pad: &mut [u8]) {
         let (plaintext, pad) = plaintext_and_pad.split_at_mut(plaintext_and_pad.len() - TAG_LEN);
 
         let tag = S::ColdPathCipher::encrypt_in_place(
             (&self.key_buffer[AES_KEY_START..AES_KEY_END]).try_into().unwrap(),
-            to_handshake_nonce(self.counter),
+            domain::to_handshake_nonce(self.counter),
             plaintext,
         );
         self.counter += 1;
@@ -67,15 +63,10 @@ impl<S: SessionLayer> SymmetricState<S> {
         hasher.update(&self.key_buffer[CHAINING_KEY_START..CHAINING_KEY_END]);
         hasher.update(plaintext_and_pad);
 
-        hasher.finish(&mut self.key_buffer[..key_len]);
+        hasher.finish(&mut self.key_buffer[..]);
     }
 
-    pub fn mix_and_decrypt(&mut self, ciphertext_and_tag: &mut [u8], finished: bool) -> Result<(), Error> {
-        let key_len = if finished {
-            SHAKE256_MAX_OUTPUT_LEN
-        } else {
-            CHANNEL_BINDING_END
-        };
+    pub fn decrypt_and_mix(&mut self, ciphertext_and_tag: &mut [u8]) -> Result<(), Error> {
         let mut hasher = S::Shake256Impl::new();
 
         hasher.update(&self.key_buffer[CHAINING_KEY_START..CHAINING_KEY_END]);
@@ -85,13 +76,13 @@ impl<S: SessionLayer> SymmetricState<S> {
 
         let auth = S::ColdPathCipher::decrypt_in_place(
             (&self.key_buffer[AES_KEY_START..AES_KEY_END]).try_into().unwrap(),
-            to_handshake_nonce(self.counter),
+            domain::to_handshake_nonce(self.counter),
             ciphertext,
             tag.try_into().unwrap(),
         );
         self.counter += 1;
 
-        hasher.finish(&mut self.key_buffer[..key_len]);
+        hasher.finish(&mut self.key_buffer[..]);
 
         if auth { Ok(()) } else { Err(Error::Inauthentic) }
     }
@@ -102,11 +93,39 @@ impl<S: SessionLayer> SymmetricState<S> {
 
     pub fn split(
         self,
+        is_initiator: bool,
     ) -> (
         S::HotPathDuplexCipherImpl,
         ResumptionToken,
+        ResumptionToken,
         ResumptionKey,
     ) {
-        todo!()
+        let mut buffer = Zeroizing::new([0u8; SHAKE256_FINAL_OUTPUT_LEN]);
+        let mut hasher = S::Shake256Impl::new();
+
+        hasher.update(&self.key_buffer[CHAINING_KEY_START..CHAINING_KEY_END]);
+        hasher.finish(&mut buffer[..]);
+
+        let resumption_key = &buffer[RESPONDER_KEY_RANGE].try_into().unwrap();
+        let initiator_resumption_token = &buffer[INITIATOR_RESUMPTION_TOKEN_RANGE].try_into().unwrap();
+        let responder_resumption_token = &buffer[RESPONDER_RESUMPTION_TOKEN_RANGE].try_into().unwrap();
+        let initiator_key = &buffer[INITIATOR_KEY_RANGE].try_into().unwrap();
+        let responder_key = &buffer[RESPONDER_KEY_RANGE].try_into().unwrap();
+
+        if is_initiator {
+            (
+                S::HotPathDuplexCipherImpl::new(initiator_key, responder_key),
+                *initiator_resumption_token,
+                *responder_resumption_token,
+                Zeroizing::new(*resumption_key),
+            )
+        } else {
+            (
+                S::HotPathDuplexCipherImpl::new(responder_key, initiator_key),
+                *responder_resumption_token,
+                *initiator_resumption_token,
+                Zeroizing::new(*resumption_key),
+            )
+        }
     }
 }

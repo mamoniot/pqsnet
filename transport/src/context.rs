@@ -1,23 +1,31 @@
-use std::sync::{
-    Arc, Mutex, Weak, atomic::Ordering,
-};
+use std::sync::{Arc, Mutex, Weak, atomic::{AtomicUsize, Ordering}};
 
 use dashmap::DashMap;
 use rand_core::*;
 
 use crate::{
-    crypto::prelude::*, desegmentation::{self, Desegmenter, Mtu, Segmenter}, error::Error, init_table::{Entry, InitTable}, initiator::InitializeState, protocol::*, responder::ReplyState, session_layer::{ResumptionToken, SessionLayer}, socket::Socket,
+    crypto::prelude::*, desegmentation::{self, Desegmenter, Mtu, Segmenter}, error::Error, init_table::{Entry, InitTable}, initiator::InitializeState, protocol::{domain::to_data_nonce, *}, responder::ReplyState, session_layer::{ResumptionToken, SessionLayer}, socket::{Socket, SocketEntry},
 };
 
-pub struct Context<S: SessionLayer> {
+
+pub struct Context<S: SessionLayer>(pub Arc<InnerContext<S>>);
+
+impl<S: SessionLayer> std::ops::Deref for Context<S> {
+    type Target = Arc<InnerContext<S>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+pub struct InnerContext<S: SessionLayer> {
+    pub(crate) socket_count: AtomicUsize,
     init_table: InitTable<Desegmenter>,
     /// It must be the case that no handshake state can be modified in `socket_table` while its
     /// corresponding desegmenter is in the `is_complete` state.
     /// A desegmenter only enters the `is_complete` state in the brief window after a message has
     /// been fully desegmented, in which case the desegmenting thread must have mutually exclusive
     /// access to the corresponding handshake state.
-    pub(crate) socket_table: DashMap<u32, SocketState<S>>,
-    pub(crate) resumption_table: DashMap<ResumptionToken, ResumptionState<S>>,
+    pub(crate) socket_table: DashMap<u32, SocketEntry<S>>,
 }
 
 pub(crate) struct ResumptionState<S: SessionLayer> {
@@ -25,39 +33,12 @@ pub(crate) struct ResumptionState<S: SessionLayer> {
     pub(crate) cipher_idx: bool,
 }
 
-pub(crate) enum HandshakeState<S: SessionLayer> {
-    SendingInitialize(InitializeState<S>),
-    SendingReply(ReplyState<S>),
-    // SendingConfirm(ConfirmState<S>),
-}
-
-pub(crate) enum SocketState<S: SessionLayer> {
-    Reserved,
-    Handshake {
-        state: HandshakeState<S>,
-        segmenter: Segmenter,
-        pre_socket: Option<Weak<Socket<S>>>,
-        expiry_ts: u64,
-        desegmenter: Mutex<Desegmenter>,
-    },
-    AwaitingData {
-        socket: Arc<Socket<S>>,
-        segmenter: Segmenter,
-        expiry_ts: u64,
-        idx: u32
-    },
-    Active {
-        socket: Weak<Socket<S>>,
-        cipher_idx: bool,
-    },
-}
-
 pub enum RecvOk<S: SessionLayer> {
     /// The packet received was dropped for being a duplicate of a previous packet.
     Duplicate,
     Incomplete,
-    SendReply(Segmenter),
-    SendResume(Segmenter),
+    SendReply(Arc<Socket<S>>, Segmenter),
+    SendResume(Arc<Socket<S>>, Segmenter),
     SendConfirm(Segmenter),
     Resume,
     Confirm,
@@ -80,24 +61,22 @@ impl<S: SessionLayer> Context<S> {
             // That lock is dropped before `process_initialize` is called.
             let entry = self.init_table.entry(initialize_id);
             match entry {
-                Entry::Occupied(mut occupied_entry) => {
-                    match occupied_entry.get_mut().recv(packet, HEADER_LEN, MESSAGE_MAX_LEN) {
-                        desegmentation::RecvResult::Invalid => Err(Error::Invalid),
-                        desegmentation::RecvResult::Duplicate => Ok(RecvOk::Duplicate),
-                        desegmentation::RecvResult::Incomplete => Ok(RecvOk::Incomplete),
-                        desegmentation::RecvResult::NotSegmented => {
-                            occupied_entry.remove();
-                            self.process_initialize(sl, packet, recv_mtu)
-                        }
-                        desegmentation::RecvResult::Complete(mut message) => {
-                            occupied_entry.remove();
-                            self.process_initialize(sl, &mut message, recv_mtu)
-                        }
+                Entry::Occupied(mut occupied_entry) => match occupied_entry.get_mut().recv(packet, HEADER_LEN) {
+                    desegmentation::RecvResult::Invalid => Err(Error::Invalid),
+                    desegmentation::RecvResult::Duplicate => Ok(RecvOk::Duplicate),
+                    desegmentation::RecvResult::Incomplete => Ok(RecvOk::Incomplete),
+                    desegmentation::RecvResult::NotSegmented => {
+                        occupied_entry.remove();
+                        self.process_initialize(sl, packet, recv_mtu)
                     }
-                }
+                    desegmentation::RecvResult::Complete(mut message) => {
+                        occupied_entry.remove();
+                        self.process_initialize(sl, &mut message, recv_mtu)
+                    }
+                },
                 Entry::Vacant(vacant_entry) => {
                     let mut desegmenter = Desegmenter::default();
-                    match desegmenter.recv(packet, initialize::HEADER_LEN, initialize::MESSAGE_MAX_LEN) {
+                    match desegmenter.recv(packet, initialize::HEADER_LEN) {
                         desegmentation::RecvResult::Invalid => Err(Error::Invalid),
                         desegmentation::RecvResult::Duplicate => Ok(RecvOk::Duplicate),
                         desegmentation::RecvResult::Incomplete => {
@@ -137,19 +116,13 @@ impl<S: SessionLayer> Context<S> {
                     drop(socket_state);
                     self.process_active(sl, socket_clone, packet)
                 }
-                SocketState::AwaitingData { segmenter, cipher, send_socket_id } => todo!(),
             }
         } else {
             todo!()
         }
     }
-    /// A full handshake message was just desegmented, so its corresponding `SocketState` must be
-    /// temporarily swapped for a `SocketState::Reserved` state while it is processed.
-    /// However, since the read lock on `socket_table` was dropped, race conditions are possible.
-    /// To make sure that `message` is processed with its corresponding handshake state, it must be
-    /// the case that no handshake state can be modified in `socket_table` while its corresponding
-    /// desegmenter is in the `is_complete` state.
-    fn process_handshake(&self, sl: S, socket_id: u32, message: &mut [u8], mtu: Mtu) -> Result<RecvOk<S>, Error> {
+
+    fn process_handshake(&self, sl: S, socket_id: u32, message: &mut [u8], mtu: Mtu, generation: usize) -> Result<RecvOk<S>, Error> {
         let state = match self.socket_table.entry(socket_id) {
             dashmap::Entry::Occupied(mut entry) => {
                 let socket_state = entry.insert(SocketState::Reserved);
@@ -200,6 +173,7 @@ impl<S: SessionLayer> Context<S> {
         Ok(RecvOk::Data)
     }
 
+/*
     /// Reserves a socket id in the socket table for use in the form of a guard.
     /// Reserved socket ids cannot receive packets and cannot be reserved twice simultaneously.
     /// If this guard is dropped, the socket id is un-reserved, preventing a memory leak.
@@ -216,6 +190,7 @@ impl<S: SessionLayer> Context<S> {
             }
         }
     }
+*/
 
     pub fn send() {}
 }
@@ -252,6 +227,7 @@ impl<S: SessionLayer> Socket<S> {
     }
 }
 
+/*
 /// A guard for a reserved socket id.
 /// Reserved socket ids cannot receive packets and cannot be reserved twice simultaneously.
 /// If this is dropped, the socket id is un-reserved, preventing a memory leak.
@@ -278,3 +254,4 @@ impl<'a, S: SessionLayer> Drop for SocketGuard<'a, S> {
         self.ctx.socket_table.remove(&self.id);
     }
 }
+*/

@@ -4,102 +4,159 @@ use rand_core::Rng;
 use zeroize::Zeroizing;
 
 use crate::{
-    context::{Context, HandshakeState, RecvOk, Socket, SocketGuard, SocketState}, crypto::prelude::*, desegmentation::{Mtu, Segmenter}, error::Error, protocol::{shared::AES_GCM_INIT_COUNTER, *}, session_layer::{ResumptionKey, ResumptionToken, SessionLayer}, symmetric_state::SymmetricState,
+    context::{Context, RecvOk}, crypto::prelude::*, desegmentation::{Mtu, Segmenter}, error::Error, key_bundle::{AuthenticBundle, PrivateBundleSL, check_handshake_flags}, protocol::{
+        domain::{CONFIRM_BINDING, INITIALIZE_BINDING, REPLY_BINDING},
+        shared::*,
+        *,
+    }, session_layer::{ResumptionKey, ResumptionToken, SessionLayer}, socket::{HandshakeState, Socket}, symmetric_state::SymmetricState,
 };
 
 pub struct InitializeState<S: SessionLayer> {
     symmetric: SymmetricState<S>,
     fallback: Option<SymmetricState<S>>,
+    init_handshake_flags: u8,
     decapsulation_key: S::DecapsulationKeyImpl,
+    payload: Box<[u8]>,
+    private_key_bundle: Option<PrivateBundleSL<S>>,
+    key_bundle: Option<AuthenticBundle<S::PublicSigningKeyImpl>>,
 }
 
 impl<S: SessionLayer> Context<S> {
-    pub fn initialize(&self, mut sl: S, resumption: Option<(&ResumptionToken, &ResumptionKey, Option<Weak<Socket<S>>>, bool, bool)>, mtu: Mtu) {
+    pub fn initialize(
+        &self,
+        mut sl: S,
+        resumption: Option<(
+            &ResumptionToken,
+            &ResumptionKey,
+            AuthenticBundle<S::PublicSigningKeyImpl>,
+        )>,
+        combined_bundle_flags: u8,
+        mtu: Mtu,
+        payload: Box<[u8]>,
+    ) -> Result<Arc<Socket<S>>, Error> {
         use initialize::*;
-        let mut symmetric = SymmetricState::<S>::default();
+
+        /* START OF HANDSHAKE VERSION AND FLAGS HANDLING */
+
+        let (message_len, init_handshake_flags) = match (resumption.is_some(), combined_bundle_flags) {
+            // If we have a resumption token, we need to signal that to the responder.
+            (true, f) if f & HANDSHAKE_FLAGS_FULL_HANDSHAKE > 0 => {
+                (MESSAGE_LEN_WITH_FULL, f | HANDSHAKE_FLAGS_USE_RESUMPTION)
+            }
+            // If we are not doing a full handshake, we must send our signature in this message.
+            (true, f) => (
+                MESSAGE_MIN_LEN_WITH_SIGN + payload.len(),
+                f | HANDSHAKE_FLAGS_USE_RESUMPTION,
+            ),
+            // If the flags say to use resumption, but there is not resumption token, we must abort.
+            (false, f) if f & HANDSHAKE_FLAGS_USE_RESUMPTION > 0 => return Err(Error::Invalid),
+            // If there is not a resumption token then we must to do a full handshake.
+            (false, f) => (MESSAGE_LEN_WITHOUT_SIGN, f | HANDSHAKE_FLAGS_FULL_HANDSHAKE),
+        };
+        debug_assert!(check_handshake_flags(combined_bundle_flags, init_handshake_flags));
 
         /* START OF HEADER ENCODING */
 
-        let message_len = if let Some((_, _, _, _, do_full_exchange)) = resumption {
-            if do_full_exchange {
-                MESSAGE_LEN_WITH_FULL
-            } else {
-                MESSAGE_LEN_WITH_SIGN
-            }
-        } else {
-            MESSAGE_LEN_WITHOUT_SIGN
-        };
-
         let mut init_message = Segmenter::create_message(message_len, HEADER_LEN, 0, mtu);
 
-        init_message[INITIALIZE_UID_EXT_START..INITIALIZE_UID_EXT_END].copy_from_slice(&sl.rng().next_u64().to_be_bytes());
+        init_message[INITIALIZE_UID_RANGE].copy_from_slice(&sl.rng().next_u64().to_be_bytes());
+
+        /* START OF HANDSHAKE VERSION AND FLAGS ENCODING */
+
+        init_message[HANDSHAKE_VERSION_IDX] = HANDSHAKE_VERSION_VALUE;
+        init_message[HANDSHAKE_FLAGS_IDX] = init_handshake_flags;
 
         /* START OF MLKEM1024 EPHEMERAL ENCAPSULATION KEY HANDLING */
 
         let (encapsulation_key, decapsulation_key) = S::DecapsulationKeyImpl::generate();
-        init_message[EPHEMERAL_ENC_KEY_START..EPHEMERAL_ENC_KEY_END].copy_from_slice(&encapsulation_key);
+        init_message[EPHEMERAL_ENC_KEY_RANGE].copy_from_slice(&encapsulation_key);
 
         /* START OF SEND SOCKET ID HANDLING */
 
-        let socket_guard = self.reserve_socket(&mut sl);
+        let socket = self.reserve_socket(&mut sl);
 
-        init_message[NEW_SOCKET_ID_START..NEW_SOCKET_ID_END].copy_from_slice(&socket_guard.id().to_be_bytes());
+        init_message[NEW_SOCKET_ID_RANGE].copy_from_slice(&socket.recv_socket_id.to_be_bytes());
 
         /* START OF RESUMPTION TOKEN HANDLING */
 
+        let mut symmetric = SymmetricState::<S>::default();
         let mut fallback = None;
-        let mut pre_socket = None;
+        let mut key_bundle = None;
+        let mut private_key_bundle = None;
 
-        if let Some((token, key, s, allow_fallback, do_full_exchange)) = resumption {
-            pre_socket = s;
-
+        if let Some((token, key, bundle)) = resumption {
             init_message[RESUMPTION_TOKEN_RANGE].copy_from_slice(token);
-            init_message[RESUMPTION_TAG_IDX] = ((do_full_exchange as u8) * RESUMPTION_FULL_EXCHANGE_FLAG) | ((allow_fallback as u8) * RESUMPTION_ALLOW_FALLBACK_FLAG) | RESUMPTION_RESUME_FLAG;
 
-            symmetric.mix(&init_message[..RESUMPTION_TOKEN_END]);
+            symmetric.mix(&init_message[PREMESSAGE_RESUMPTION_RANGE]);
 
-            if allow_fallback {
+            if init_handshake_flags & HANDSHAKE_FLAGS_DENY_FALLBACK == 0 {
+                // If we are allowing fallback we need the symmetric state from before mixing the
+                // secret resumption key.
                 fallback = Some(symmetric.clone())
             }
 
             symmetric.mix(&key[..]);
 
-            if do_full_exchange {
-                let resumption_tag_start = MESSAGE_LEN_WITH_FULL - RESUMPTION_TAG_REV_END;
-                let resumption_tag_end = MESSAGE_LEN_WITH_FULL - RESUMPTION_TAG_REV_END;
+            if init_handshake_flags & HANDSHAKE_FLAGS_FULL_HANDSHAKE > 0 {
+                let resumption_tag_start = message_len - RESUMPTION_TAG_REV_END;
+                let resumption_tag_end = message_len - RESUMPTION_TAG_REV_START;
 
-                symmetric.encrypt_and_mix(&mut init_message[resumption_tag_start..resumption_tag_end], false);
+                /* START OF RESUMPTION TAG HANDLING */
+
+                symmetric.encrypt_and_mix(&mut init_message[resumption_tag_start..resumption_tag_end]);
             } else {
-                let static_online_sign_start = MESSAGE_LEN_WITH_SIGN - STATIC_ONLINE_SIGN_REV_END;
-                let static_online_sign_end = MESSAGE_LEN_WITH_SIGN - STATIC_ONLINE_SIGN_REV_START;
-                let static_online_sign_tag_end = MESSAGE_LEN_WITH_SIGN - RESUMPTION_TAG_REV_START;
+                let payload_end = message_len - PAYLOAD_REV_START;
+                let bundle_uid_xor_start = message_len - BUNDLE_UID_XOR_REV_END;
+                let bundle_uid_xor_end = message_len - BUNDLE_UID_XOR_REV_START;
+                let online_sign_start = message_len - ONLINE_SIGNATURE_REV_END;
+                let online_sign_end = message_len - ONLINE_SIGNATURE_REV_START;
+                let online_sign_tag_end = message_len - RESUMPTION_TAG_REV_START;
 
-                let sign = sl.static_public_keys().sign_with_online(shared::INITIALIZE_BINDING_DOMAIN_NAME, symmetric.channel_binding());
-                init_message[static_online_sign_start..static_online_sign_end].copy_from_slice(&sign);
+                /* START OF PAYLOAD ENCODING */
 
-                symmetric.encrypt_and_mix(&mut init_message[static_online_sign_start..static_online_sign_tag_end], false);
+                init_message[PAYLOAD_START..payload_end].copy_from_slice(&payload[..]);
+
+                /* START OF EXPECTED KEY UID HANDLING */
+
+                let local_private_key_bundle = sl.private_key_bundle();
+
+                let uid_xor = bundle.uid ^ local_private_key_bundle.uid;
+                init_message[bundle_uid_xor_start..bundle_uid_xor_end].copy_from_slice(&uid_xor.to_be_bytes());
+
+                /* START OF ONLINE SIGNATURE HANDLING */
+
+                let sign = local_private_key_bundle.sign(INITIALIZE_BINDING, symmetric.channel_binding());
+                init_message[online_sign_start..online_sign_end].copy_from_slice(&sign);
+
+                symmetric.encrypt_and_mix(&mut init_message[bundle_uid_xor_start..online_sign_tag_end]);
+
+                private_key_bundle = Some(local_private_key_bundle);
             }
-        } else {
-            init_message[RESUMPTION_TAG_IDX] = 0;
 
-            symmetric.mix(&init_message[..RESUMPTION_TAG_END]);
+            key_bundle = Some(bundle);
+        } else {
+            symmetric.mix(&init_message[PREMESSAGE_DEFAULT_HANDSHAKE_RANGE]);
         }
 
         /* START OF STATE MANAGEMENT */
 
         let segmenter = Segmenter::new(init_message, HEADER_LEN, mtu);
 
-        socket_guard.insert(SocketState::Handshake {
-            state: HandshakeState::SendingInitialize(InitializeState {
+        *socket.state.write().unwrap() = HandshakeState::SendingInitialize {
+            state: InitializeState {
                 symmetric,
                 fallback,
                 decapsulation_key,
-            }),
+                init_handshake_flags,
+                payload,
+                key_bundle,
+                private_key_bundle,
+            },
             segmenter,
-            pre_socket,
-            expiry_ts: todo!(),
             desegmenter: Default::default(),
-        })
+        };
+
+        Ok(socket)
     }
 
     pub(crate) fn process_reply(
@@ -112,141 +169,194 @@ impl<S: SessionLayer> Context<S> {
     ) -> Result<RecvOk<S>, Error> {
         use shared::*;
 
+        let mut fallback = state.fallback;
         let mut symmetric = state.symmetric;
         let mut decapsulation_key = state.decapsulation_key;
+        let mut init_handshake_flags = state.init_handshake_flags;
+        let mut expected_key_bundle = state.key_bundle;
+        let mut send_payload = state.payload;
+
+        /* START OF REPLY MESSAGE AND RESUME MESSAGE SHARED SECTION */
 
         let send_socket_id;
+        let handshake_flags;
         {
             use reply::*;
 
-            /* START OF HEADER MIXING */
+            /* START OF HANDSHAKE VERSION AND FLAGS HANDLING */
 
-            symmetric.mix(&reply_message[..HEADER_LEN]);
+            if reply_message[HANDSHAKE_VERSION_IDX] != HANDSHAKE_VERSION_VALUE {
+                return Err(Error::Invalid);
+            }
+
+            handshake_flags = reply_message[HANDSHAKE_FLAGS_IDX];
+            if !check_handshake_flags(init_handshake_flags, handshake_flags) {
+                return Err(Error::Inauthentic);
+            }
+
+            // If this message does not have the deny fallback flag we must fallback.
+            if handshake_flags & HANDSHAKE_FLAGS_DENY_FALLBACK == 0 {
+                symmetric = fallback.ok_or(Error::Inauthentic)?;
+            }
 
             /* START OF MLKEM1024 CIPHERTEXT HANDLING */
 
-            symmetric.mix_and_decrypt(
-                &mut reply_message[EPHEMERAL_CIPHERTEXT_START..EPHEMERAL_CIPHERTEXT_TAG_END],
-                false,
-            )?;
+            symmetric.mix(&reply_message[PREMESSAGE_RANGE]);
 
-            let result = decapsulation_key.decapsulate(
-                (&reply_message[EPHEMERAL_CIPHERTEXT_START..EPHEMERAL_CIPHERTEXT_END])
-                    .try_into()
-                    .unwrap(),
-            );
+            let result =
+                decapsulation_key.decapsulate((&reply_message[EPHEMERAL_CIPHERTEXT_RANGE]).try_into().unwrap());
             let shared_secret = if let Some(ss) = result {
                 Zeroizing::new(ss)
             } else {
                 return Err(Error::Inauthentic);
             };
 
-            /* START OF MLKEM1024 SHARED SECRET MIXING */
-
-            symmetric.mix(shared_secret.as_ref());
-
-            /* START OF PAYLOAD DECRYPTION */
-
-            let payload_tag_end = reply_message.len() - PAYLOAD_TAG_REV_START;
-
-            symmetric.mix_and_decrypt(&mut reply_message[STATIC_OFFLINE_PUBKEY_START..payload_tag_end], false)?;
-
-            /* START OF MLDSA87 KEY BUNDLE HANDLING */
-
-            let auth = S::PublicKeyBundleImpl::verify(
-                (&reply_message[STATIC_OFFLINE_PUBKEY_START..STATIC_OFFLINE_PUBKEY_END])
-                    .try_into()
-                    .unwrap(),
-                OFFLINE_KEY_CERTIFICATION_DOMAIN_NAME,
-                &reply_message[STATIC_ONLINE_PUBKEY_START..STATIC_ONLINE_PUBKEY_END],
-                (&reply_message[STATIC_OFFLINE_SIGN_START..STATIC_OFFLINE_SIGN_END])
-                    .try_into()
-                    .unwrap(),
-            );
-            if !auth {
-                return Err(Error::Inauthentic);
-            }
+            symmetric.mix(&shared_secret[..]);
 
             /* START OF RECV SOCKET ID HANDLING */
 
-            send_socket_id = u32::from_be_bytes(
-                reply_message[NEW_SOCKET_ID_START..NEW_SOCKET_ID_END]
-                    .try_into()
-                    .unwrap(),
-            );
+            send_socket_id = u32::from_be_bytes(reply_message[NEW_SOCKET_ID_RANGE].try_into().unwrap());
+        }
 
-            /* START OF MLDSA87 SIGNING AND ENCRYPTION */
+        let recv_payload;
+        let key_bundle;
+        if handshake_flags & HANDSHAKE_FLAGS_FULL_HANDSHAKE > 0 {
+            /* START OF REPLY DECODING */
 
-            let static_online_sign_start = reply_message.len() - STATIC_ONLINE_SIGN_REV_END;
-            let static_online_sign_end = reply_message.len() - STATIC_ONLINE_SIGN_REV_START;
-            let static_online_sign_tag_end = reply_message.len() - STATIC_ONLINE_SIGN_TAG_REV_START;
+            use reply::*;
+            let payload_end = reply_message.len() - PAYLOAD_REV_START;
+            let payload_tag_end = reply_message.len() - PAYLOAD_TAG_REV_START;
+            let online_signature_start = reply_message.len() - ONLINE_SIGNATURE_REV_END;
+            let online_signature_end = reply_message.len() - ONLINE_SIGNATURE_REV_START;
+            let online_signature_tag_end = reply_message.len() - ONLINE_SIGNATURE_TAG_REV_START;
 
-            symmetric.mix_and_decrypt(
-                &mut reply_message[static_online_sign_start..static_online_sign_tag_end],
-                false,
-            )?;
+            /* START OF KEY BUNDLE HANDLING */
 
-            let auth = S::PublicKeyBundleImpl::verify(
-                (&reply_message[STATIC_ONLINE_PUBKEY_START..STATIC_ONLINE_PUBKEY_END])
-                    .try_into()
-                    .unwrap(),
-                REPLY_BINDING_DOMAIN_NAME,
-                symmetric.channel_binding(),
-                (&reply_message[static_online_sign_start..static_online_sign_end])
-                    .try_into()
-                    .unwrap(),
-            );
-            if !auth {
+            symmetric.decrypt_and_mix(&mut reply_message[KEY_BUNDLE_START..payload_tag_end])?;
+
+            let key_bundle_len;
+            (key_bundle, key_bundle_len) =
+                AuthenticBundle::authenticate_and_get_end(&reply_message[KEY_BUNDLE_START..])
+                    .map_err(|_| Error::Inauthentic)?;
+
+            if !key_bundle.check_handshake_flags(handshake_flags) {
                 return Err(Error::Inauthentic);
             }
+
+            if let Some(expected_key_bundle) = expected_key_bundle {
+                /* If the offline hashes are not equal then we are not connecting with the party we
+                intended to connect to. A party's offline key is their id and it must never change. */
+                if expected_key_bundle.offline_hash != key_bundle.offline_hash {
+                    return Err(Error::Inauthentic);
+                }
+            }
+
+            let payload_start = KEY_BUNDLE_START + key_bundle_len;
+
+            /* START OF PAYLOAD HANDLING */
+
+            recv_payload = &reply_message[payload_start..payload_end];
+
+            /* START OF MLDSA87 HANDLING */
+
+            symmetric.decrypt_and_mix(&mut reply_message[online_signature_start..online_signature_tag_end])?;
+
+            let auth = key_bundle
+                .verify(
+                    REPLY_BINDING,
+                    symmetric.channel_binding(),
+                    (&reply_message[online_signature_start..online_signature_end])
+                        .try_into()
+                        .unwrap(),
+                )
+                .map_err(|_| Error::Inauthentic)?;
+        } else if let Some(key_bundle) = expected_key_bundle {
+            /* START OF RESUME DECODING */
+
+            use resume::*;
+            let payload_end = reply_message.len() - PAYLOAD_REV_START;
+            let payload_tag_end = reply_message.len() - PAYLOAD_TAG_REV_START;
+            let online_signature_start = reply_message.len() - ONLINE_SIGNATURE_REV_END;
+            let online_signature_end = reply_message.len() - ONLINE_SIGNATURE_REV_START;
+            let online_signature_tag_end = reply_message.len() - ONLINE_SIGNATURE_TAG_REV_START;
+
+            /* START OF PAYLOAD HANDLING */
+
+            recv_payload = &reply_message[PAYLOAD_START..payload_tag_end];
+
+            /* START OF MLDSA87 HANDLING */
+
+            symmetric.decrypt_and_mix(&mut reply_message[online_signature_start..online_signature_tag_end])?;
+
+            let auth = key_bundle
+                .verify(
+                    REPLY_BINDING,
+                    symmetric.channel_binding(),
+                    (&reply_message[online_signature_start..online_signature_end])
+                        .try_into()
+                        .unwrap(),
+                )
+                .map_err(|_| Error::Inauthentic)?;
+
+            {
+                // TODO: Add session layer authentication here.
+                // Consider how to authenticate with socket coherency.
+            }
+
+            /* START OF STATE MANAGEMENT */
+
+            let (cipher, send_resumption_token, recv_resumption_token, resupmtion_key) = symmetric.split(true);
+
+            guard.insert(SocketState::Active { socket: todo!(), cipher_idx: false });
+
+            return Ok(todo!());
+        } else {
+            // If we do not know the responder's key bundle we cannot accept a resume message.
+            return Err(Error::Inauthentic);
         }
         {
             // TODO: Add session layer authentication here.
+            // Consider how to authenticate with socket coherency.
         }
         {
             use confirm::*;
+            let key_bundle_end = KEY_BUNDLE_START + sl.bundle_len();
+            let payload_start = key_bundle_end;
+            let payload_end = payload_start + send_payload.len();
+            let payload_tag_end = payload_end + PAYLOAD_TAG_LEN;
+            let online_signature_start = payload_tag_end;
+            let online_signature_end = online_signature_start + ONLINE_SIGNATURE_LEN;
+            let online_signature_tag_end = online_signature_end + ONLINE_SIGNATURE_TAG_LEN;
+
+            let message_len = online_signature_tag_end;
 
             /* START OF HEADER ENCODING AND MIXING */
 
-            let mut confirm_message = Segmenter::create_message(MESSAGE_LEN, HEADER_LEN, send_socket_id, mtu);
+            let mut confirm_message = Segmenter::create_message(message_len, HEADER_LEN, send_socket_id, mtu);
 
-            symmetric.mix(&confirm_message[..HEADER_LEN]);
+            symmetric.mix(&confirm_message[PREMESSAGE_RANGE]);
 
-            /* START OF MLDSA87 KEY BUNDLE ENCODING */
+            /* START OF KEY BUNDLE HANDLING */
 
-            confirm_message[STATIC_OFFLINE_PUBKEY_START..STATIC_OFFLINE_SIGN_END]
-                .copy_from_slice(&sl.static_public_keys().encode_key_bundle());
+            confirm_message[KEY_BUNDLE_START..key_bundle_end].copy_from_slice(&sl.key_bundle());
 
-            /* START OF PAYLOAD ENCRYPTION */
+            /* START OF PAYLOAD HANDLING */
 
-            let payload_tag_end = MESSAGE_LEN - PAYLOAD_TAG_REV_START;
+            confirm_message[payload_start..payload_end].copy_from_slice(&send_payload[..]);
 
-            symmetric.encrypt_and_mix(
-                &mut confirm_message[STATIC_OFFLINE_PUBKEY_START..payload_tag_end],
-                false,
-            );
+            symmetric.encrypt_and_mix(&mut confirm_message[PAYLOAD_ENCRYPTION_START..payload_tag_end]);
 
             /* START OF MLDSA87 SIGNING AND ENCRYPTION */
 
-            let static_online_sign_start = MESSAGE_LEN - STATIC_ONLINE_SIGN_REV_END;
-            let static_online_sign_end = MESSAGE_LEN - STATIC_ONLINE_SIGN_REV_START;
-            let static_online_sign_tag_end = MESSAGE_LEN - STATIC_ONLINE_SIGN_TAG_REV_START;
+            let signature = sl.sign_with_online_key(CONFIRM_BINDING, symmetric.channel_binding());
+            confirm_message[online_signature_start..online_signature_end].copy_from_slice(&signature);
 
-            let signature = sl
-                .static_public_keys()
-                .sign_with_online(CONFIRM_BINDING_DOMAIN_NAME, symmetric.channel_binding());
-
-            confirm_message[static_online_sign_start..static_online_sign_end].copy_from_slice(&signature);
-
-            symmetric.encrypt_and_mix(
-                &mut confirm_message[static_online_sign_start..static_online_sign_tag_end],
-                true,
-            );
+            symmetric.encrypt_and_mix(&mut confirm_message[online_signature_start..online_signature_tag_end]);
 
             /* START OF STATE MANAGEMENT */
 
             // TODO: Add resumption token and key handling.
-            let (cipher, resumption_token, resupmtion_key) = symmetric.split();
+            let (cipher, send_resumption_token, recv_resumption_token, resupmtion_key) = symmetric.split(true);
 
             let segmenter = Segmenter::new(confirm_message, HEADER_LEN, mtu);
 
@@ -288,7 +398,7 @@ impl<S: SessionLayer> Context<S> {
 
             /* START OF MLKEM1024 CIPHERTEXT HANDLING */
 
-            symmetric.mix_and_decrypt(
+            symmetric.decrypt_and_mix(
                 &mut resume_message[EPHEMERAL_CIPHERTEXT_START..EPHEMERAL_CIPHERTEXT_TAG_END],
                 false,
             )?;
@@ -306,13 +416,13 @@ impl<S: SessionLayer> Context<S> {
 
             /* START OF MLKEM1024 SHARED SECRET MIXING */
 
-            symmetric.mix(shared_secret.as_ref());
+            symmetric.mix(&shared_secret[..]);
 
             /* START OF PAYLOAD DECRYPTION */
 
             let payload_tag_end = resume_message.len() - PAYLOAD_TAG_REV_START;
 
-            symmetric.mix_and_decrypt(&mut resume_message[NEW_SOCKET_ID_START..payload_tag_end], true)?;
+            symmetric.decrypt_and_mix(&mut resume_message[NEW_SOCKET_ID_START..payload_tag_end], true)?;
 
             /* START OF RECV SOCKET ID HANDLING */
 

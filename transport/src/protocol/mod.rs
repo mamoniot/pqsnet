@@ -1,8 +1,6 @@
 // TODO: segmentation, version, payload
 
-pub mod domains;
-
-pub mod key_bundle;
+pub mod domain;
 
 pub mod shared;
 

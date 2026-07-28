@@ -14,6 +14,10 @@ bytemuck = "*"
 dashmap = "*"
 zeroize = "*"
 hex-literal = "*"
+cbor4ii = { features = ["use_std", "serde1"], version = "*" }
+serde = { features = ["derive"], version = "*" }
+serde_bytes = "*"
+smallvec = { features = ["serde", "union"], version = "*" }
 
 [lints.clippy]
 type_complexity = "allow"

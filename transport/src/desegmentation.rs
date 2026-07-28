@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::protocol::{*, shared::*};
+use crate::protocol::{shared::*, *};
 
 #[derive(Default)]
 pub struct Desegmenter {
@@ -32,7 +32,7 @@ pub enum RecvResult {
 }
 
 impl Desegmenter {
-    pub fn recv(&mut self, packet: &[u8], header_len: usize, maximum_len: usize) -> RecvResult {
+    pub fn recv(&mut self, packet: &[u8], header_len: usize) -> RecvResult {
         if packet.len() <= header_len {
             return RecvResult::Invalid;
         }
@@ -60,7 +60,7 @@ impl Desegmenter {
             }
 
             let message_len = seg_min_len * seg_total as usize + seg_rem_len as usize + header_len;
-            if message_len > maximum_len {
+            if message_len > Mtu::MESSAGE_MAX_LEN {
                 return RecvResult::Invalid;
             }
 
@@ -112,7 +112,6 @@ pub struct Segmenter {
     message: Arc<[u8]>,
     packet_min_len: usize,
 }
-
 
 #[derive(Clone, Debug)]
 pub struct SegmentIter<'a> {
@@ -183,7 +182,11 @@ impl Segmenter {
 
         let packet_min_len = seg_min_len + header_len;
         let message_final_len = inner_message_len + header_len * seg_total;
-        debug_assert_eq!(message_final_len, packet_min_len * seg_total + seg_rem_len, "segmentation length incorrect");
+        debug_assert_eq!(
+            message_final_len,
+            packet_min_len * seg_total + seg_rem_len,
+            "segmentation length incorrect"
+        );
         debug_assert!(packet_min_len <= mtu, "segmentation length incorrect");
 
         message.resize(message_final_len, 0);
@@ -229,10 +232,7 @@ impl<'a> IntoIterator for &'a Segmenter {
     type IntoIter = SegmentIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        SegmentIter {
-            message: &self.message,
-            packet_min_len: self.packet_min_len,
-        }
+        SegmentIter { message: &self.message, packet_min_len: self.packet_min_len }
     }
 }
 
@@ -269,7 +269,8 @@ impl Mtu {
     // this constant must be changed.
     /// This constant is the minimum MTU that can be supported by this protocol.
     /// This constant may increase in future versions of this protocol.
-    pub const MIN_ALLOWED_MTU: u32 = ((reply::MESSAGE_LEN - reply::HEADER_LEN).div_ceil(u8::MAX as usize) + reply::HEADER_LEN) as u32;
+    pub const MIN_ALLOWED_MTU: u32 = 128;
+    const MESSAGE_MAX_LEN: usize = (Self::MIN_ALLOWED_MTU as usize - SEGMENT_HEADER_END) * u8::MAX as usize;
 
     pub fn new(mtu: u32) -> Option<Self> {
         (mtu >= Self::MIN_ALLOWED_MTU).then_some(Self(mtu))
