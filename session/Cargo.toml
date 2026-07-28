@@ -1,0 +1,29 @@
+[package]
+name = "session"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "session"
+path = "src/lib.rs"
+
+
+[dependencies]
+rand_core = "*"
+bytemuck = "*"
+dashmap = "*"
+zeroize = "*"
+hex-literal = "*"
+cbor4ii = { features = ["use_std", "serde1"], version = "*" }
+serde = { features = ["derive"], version = "*" }
+serde_bytes = "*"
+smallvec = { features = ["serde", "union"], version = "*" }
+bytes = "*"
+# rustqlite = "*"
+
+[lints.clippy]
+type_complexity = "allow"
+large_enum_variant = "allow"
+absurd_extreme_comparisons = "allow"
+unusual_byte_groupings = "allow"
+needless_range_loop = "allow"
