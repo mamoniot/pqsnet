@@ -23,6 +23,15 @@
 
 ## Session
 ### Core
-- Negotiate limits on the number of channels that can be opened before the next sync, so that the send limits and recv limits may never be exceeded.
+- Negotiate limits on the number of channels that can be opened before the next sync, so that the send limits and recv limits may never be exceeded
 - Add TTL options for channels and sessions
+- Implement PLPMTUD
+- Implement phi accural keep alives
+- Implement initial timeout negotiation
+- Eliminate overflow math
 ### Extraneous
+- Utalize received ICMP messages (Destination Unreachable, Time Exceeded, Parameter Problem)
+- Ensure correct handling of asymmetric routes (https://www.rfc-editor.org/info/rfc3449)
+- Implement the nagle algorithm or a variant (https://datatracker.ietf.org/doc/html/draft-minshall-nagle-01)
+- Implement delayed acks
+- Add support for efficient single segment documents (docs smaller than the mtu)

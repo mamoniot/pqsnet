@@ -19,6 +19,7 @@ serde = { features = ["derive"], version = "*" }
 serde_bytes = "*"
 smallvec = { features = ["serde", "union"], version = "*" }
 bytes = "*"
+tokio = { features = ["sync"], version = "*" }
 # rustqlite = "*"
 
 [lints.clippy]
