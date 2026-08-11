@@ -85,7 +85,6 @@ impl<R: Route> Session<R> {
 
     /// Returns the next time that `transmit_all` should be called.
     pub fn acknowledged(&self, socket_id: SocketId, variant: u8, packet: &[u8], i: &mut usize, now: f64) -> Result<Option<f64>, RecvError> {
-        // NOTE: To prevent issues with improperly encoded ack runs this lambda must be idempotent.
         // OPTIMIZATION: This can be made more efficient if we can acknowlegde packets in batches.
         let mut ack_packet = |packet_no: u32| {
             self.transmissions.payload_table.remove(&(packet_no as u64 | (socket_id as u64) << 32));
@@ -98,7 +97,6 @@ impl<R: Route> Session<R> {
         *i += 4;
 
         ack_packet(first_ack_no);
-
 
         if variant == VARIANT_ACK_RUN {
             let total_len = varusize_try_read(packet, i).ok_or(RecvError::Invalid)?;
