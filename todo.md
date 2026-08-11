@@ -35,3 +35,5 @@
 - Implement the nagle algorithm or a variant (https://datatracker.ietf.org/doc/html/draft-minshall-nagle-01)
 - Implement delayed acks
 - Add support for efficient single segment documents (docs smaller than the mtu)
+- Make sure that the protocol would be backwards compatible with the ability to ack packets instead of segments
+- Instrument `Instant` with the async runtime for testing

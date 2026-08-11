@@ -11,7 +11,7 @@ path = "src/lib.rs"
 [dependencies]
 rand_core = "*"
 bytemuck = "*"
-dashmap = "*"
+dashmap = { features = ["raw-api"], version = "*"}
 zeroize = "*"
 hex-literal = "*"
 cbor4ii = { features = ["use_std", "serde1"], version = "*" }

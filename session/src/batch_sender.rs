@@ -2,7 +2,7 @@ use std::{io, sync::Arc};
 
 use bytes::Buf;
 
-use crate::session::{DocReceiver, Route, DocSender, Session};
+use crate::session::{DocReceiver, DocSender, Route, Session};
 
 pub struct ExceedsChannelLimit;
 
@@ -12,7 +12,7 @@ pub struct BatchChannelSender<'a, R: Route> {
 }
 
 impl<'a, R: Route> BatchChannelSender<'a, R> {
-    pub fn try_append(&mut self, src: &[u8]) -> usize  {
+    pub fn try_append(&mut self, src: &[u8]) -> usize {
         self.try_append_buf(src)
     }
 

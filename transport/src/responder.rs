@@ -3,11 +3,19 @@ use std::sync::{Arc, atomic::AtomicU64};
 use zeroize::Zeroizing;
 
 use crate::{
-    context::{Context, RecvOk}, crypto::prelude::*, desegmentation::{Mtu, Segmenter}, error::Error, key_bundle::AuthenticBundle, protocol::{
+    context::{Context, RecvOk},
+    crypto::prelude::*,
+    desegmentation::{Mtu, Segmenter},
+    error::Error,
+    key_bundle::AuthenticBundle,
+    protocol::{
         domain::{INITIALIZE_BINDING, REPLY_BINDING, RESUME_BINDING},
         shared::*,
         *,
-    }, session_layer::SessionLayer, socket::{HandshakeState, Socket}, symmetric_state::SymmetricState,
+    },
+    session_layer::SessionLayer,
+    socket::{HandshakeState, Socket},
+    symmetric_state::SymmetricState,
 };
 
 pub struct ReplyState<S: SessionLayer> {
@@ -111,11 +119,13 @@ impl<S: SessionLayer> Context<S> {
 
                         /* START OF ONLINE SIGNATURE HANDLING */
 
-                        key_bundle.verify(
-                            INITIALIZE_BINDING,
-                            symmetric.channel_binding(),
-                            (&init_message[online_sign_start..online_sign_end]).try_into().unwrap(),
-                        ).map_err(|_| Error::Inauthentic)?;
+                        key_bundle
+                            .verify(
+                                INITIALIZE_BINDING,
+                                symmetric.channel_binding(),
+                                (&init_message[online_sign_start..online_sign_end]).try_into().unwrap(),
+                            )
+                            .map_err(|_| Error::Inauthentic)?;
                     }
 
                     if !private_key_bundle.check_handshake_flags(handshake_flags) {
@@ -202,18 +212,13 @@ impl<S: SessionLayer> Context<S> {
             let segmenter = Segmenter::new(reply_message, HEADER_LEN, mtu);
 
             *socket.state.write().unwrap() = HandshakeState::SendingReply {
-                state: ReplyState {
-                    symmetric,
-                    key_bundle,
-                    send_socket_id,
-                },
+                state: ReplyState { symmetric, key_bundle, send_socket_id },
                 segmenter: segmenter.clone(),
                 desegmenter: Default::default(),
             };
 
             Ok(RecvOk::SendReply(socket, segmenter))
         } else {
-
             /* START OF RESUME ENCODING */
 
             use resume::*;

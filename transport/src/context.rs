@@ -1,12 +1,22 @@
-use std::sync::{Arc, Mutex, Weak, atomic::{AtomicUsize, Ordering}};
+use std::sync::{
+    Arc, Mutex, Weak,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use dashmap::DashMap;
 use rand_core::*;
 
 use crate::{
-    crypto::prelude::*, desegmentation::{self, Desegmenter, Mtu, Segmenter}, error::Error, init_table::{Entry, InitTable}, initiator::InitializeState, protocol::{domain::to_data_nonce, *}, responder::ReplyState, session_layer::{ResumptionToken, SessionLayer}, socket::{Socket, SocketEntry},
+    crypto::prelude::*,
+    desegmentation::{self, Desegmenter, Mtu, Segmenter},
+    error::Error,
+    init_table::{Entry, InitTable},
+    initiator::InitializeState,
+    protocol::{domain::to_data_nonce, *},
+    responder::ReplyState,
+    session_layer::{ResumptionToken, SessionLayer},
+    socket::{Socket, SocketEntry},
 };
-
 
 pub struct Context<S: SessionLayer>(pub Arc<InnerContext<S>>);
 
@@ -122,7 +132,14 @@ impl<S: SessionLayer> Context<S> {
         }
     }
 
-    fn process_handshake(&self, sl: S, socket_id: u32, message: &mut [u8], mtu: Mtu, generation: usize) -> Result<RecvOk<S>, Error> {
+    fn process_handshake(
+        &self,
+        sl: S,
+        socket_id: u32,
+        message: &mut [u8],
+        mtu: Mtu,
+        generation: usize,
+    ) -> Result<RecvOk<S>, Error> {
         let state = match self.socket_table.entry(socket_id) {
             dashmap::Entry::Occupied(mut entry) => {
                 let socket_state = entry.insert(SocketState::Reserved);
@@ -173,24 +190,24 @@ impl<S: SessionLayer> Context<S> {
         Ok(RecvOk::Data)
     }
 
-/*
-    /// Reserves a socket id in the socket table for use in the form of a guard.
-    /// Reserved socket ids cannot receive packets and cannot be reserved twice simultaneously.
-    /// If this guard is dropped, the socket id is un-reserved, preventing a memory leak.
-    /// This guard does not hold any locks and cannot cause a deadlock.
-    pub(crate) fn reserve_socket<'a>(&'a self, sl: &mut S) -> SocketGuard<'a, S> {
-        loop {
-            // Rejection sample a unique socket id.
-            let id = sl.rng().next_u32();
-            if id != 0 {
-                if let dashmap::Entry::Vacant(entry) = self.socket_table.entry(id) {
-                    entry.insert(SocketState::Reserved);
-                    return SocketGuard { ctx: self, id };
+    /*
+        /// Reserves a socket id in the socket table for use in the form of a guard.
+        /// Reserved socket ids cannot receive packets and cannot be reserved twice simultaneously.
+        /// If this guard is dropped, the socket id is un-reserved, preventing a memory leak.
+        /// This guard does not hold any locks and cannot cause a deadlock.
+        pub(crate) fn reserve_socket<'a>(&'a self, sl: &mut S) -> SocketGuard<'a, S> {
+            loop {
+                // Rejection sample a unique socket id.
+                let id = sl.rng().next_u32();
+                if id != 0 {
+                    if let dashmap::Entry::Vacant(entry) = self.socket_table.entry(id) {
+                        entry.insert(SocketState::Reserved);
+                        return SocketGuard { ctx: self, id };
+                    }
                 }
             }
         }
-    }
-*/
+    */
 
     pub fn send() {}
 }

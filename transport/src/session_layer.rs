@@ -33,7 +33,10 @@ pub trait SessionLayer: Sized {
     fn rng(&mut self) -> &mut Self::RngImpl;
 
     // TODO: add return values for identifying the remote party.
-    fn lookup_resumption_key(&mut self, resumption_token: &ResumptionToken) -> Option<(ResumptionKey, AuthenticBundle<Self::PublicSigningKeyImpl>)>;
+    fn lookup_resumption_key(
+        &mut self,
+        resumption_token: &ResumptionToken,
+    ) -> Option<(ResumptionKey, AuthenticBundle<Self::PublicSigningKeyImpl>)>;
 
     fn private_key_bundle(&mut self) -> Arc<PrivateBundle<Self::PublicSigningKeyImpl, Self::PrivateSigningKeyImpl>>;
     // fn sign_with_online_key(&mut self, ctx: &[u8], data: &[u8]) -> [u8; mldsa87::SIGNATURE_LEN];

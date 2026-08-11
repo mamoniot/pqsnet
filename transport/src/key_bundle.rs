@@ -7,7 +7,9 @@ use rand_core::CryptoRng;
 use smallvec::SmallVec;
 
 use crate::{
-    crypto::{mldsa87::*, shake256::Shake256}, protocol::domain::OFFLINE_KEY_CERTIFICATION, session_layer::SessionLayer,
+    crypto::{mldsa87::*, shake256::Shake256},
+    protocol::domain::OFFLINE_KEY_CERTIFICATION,
+    session_layer::SessionLayer,
 };
 
 pub const OFFLINE_HASH_LEN: usize = 48;

@@ -1,9 +1,17 @@
-use std::sync::{Arc, Mutex, RwLock, Weak, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    Arc, Mutex, RwLock, Weak,
+    atomic::{AtomicU64, Ordering},
+};
 
 use rand_core::Rng;
 
 use crate::{
-    antireplay::Antireplay, context::{Context, InnerContext}, desegmentation::{Desegmenter, Segmenter}, initiator::InitializeState, responder::ReplyState, session_layer::SessionLayer,
+    antireplay::Antireplay,
+    context::{Context, InnerContext},
+    desegmentation::{Desegmenter, Segmenter},
+    initiator::InitializeState,
+    responder::ReplyState,
+    session_layer::SessionLayer,
 };
 
 pub(crate) struct SocketEntry<S: SessionLayer> {
@@ -76,7 +84,10 @@ impl<S: SessionLayer> Context<S> {
                 if let dashmap::Entry::Vacant(entry) = self.socket_table.entry(id) {
                     socket.recv_socket_id = id;
                     let socket = socket.into();
-                    entry.insert(SocketEntry { socket: Arc::downgrade(&socket), socket_uid: self.socket_count.fetch_add(1, Ordering::Relaxed) });
+                    entry.insert(SocketEntry {
+                        socket: Arc::downgrade(&socket),
+                        socket_uid: self.socket_count.fetch_add(1, Ordering::Relaxed),
+                    });
                     return socket;
                 }
             }

@@ -4,11 +4,19 @@ use rand_core::Rng;
 use zeroize::Zeroizing;
 
 use crate::{
-    context::{Context, RecvOk}, crypto::prelude::*, desegmentation::{Mtu, Segmenter}, error::Error, key_bundle::{AuthenticBundle, PrivateBundleSL, check_handshake_flags}, protocol::{
+    context::{Context, RecvOk},
+    crypto::prelude::*,
+    desegmentation::{Mtu, Segmenter},
+    error::Error,
+    key_bundle::{AuthenticBundle, PrivateBundleSL, check_handshake_flags},
+    protocol::{
         domain::{CONFIRM_BINDING, INITIALIZE_BINDING, REPLY_BINDING},
         shared::*,
         *,
-    }, session_layer::{ResumptionKey, ResumptionToken, SessionLayer}, socket::{HandshakeState, Socket}, symmetric_state::SymmetricState,
+    },
+    session_layer::{ResumptionKey, ResumptionToken, SessionLayer},
+    socket::{HandshakeState, Socket},
+    symmetric_state::SymmetricState,
 };
 
 pub struct InitializeState<S: SessionLayer> {
