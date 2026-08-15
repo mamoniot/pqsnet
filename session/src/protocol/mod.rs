@@ -1,15 +1,22 @@
-pub const VARIANT_NULL_TERMINATOR: u8 = 0;
-pub const VARIANT_PADDING: u8 = 1;
-pub const VARIANT_SEGMENT: u8 = 2;
-pub const VARIANT_SEGMENT_TERMINATOR: u8 = 3;
-pub const VARIANT_METADATA: u8 = 4;
-pub const VARIANT_METADATA_RECV: u8 = 5;
-pub const VARIANT_METADATA_SEND: u8 = 6;
-pub const VARIANT_ACK_SINGLE: u8 = 7;
-pub const VARIANT_ACK_RUN: u8 = 8;
-pub const VARIANT_DOC_FIN: u8 = 9;
-// pub const VARIANT_DOC_ACK: u8 = 6;
+use std::ops::Range;
 
-pub const MIN_VARIANT_APPEND_LEN: usize = 20;
-pub const MIN_DATA_APPEND_LEN: usize = 16;
+pub const VARIANT_NULL_TERMINATOR: u8 = 0x0;
+pub const VARIANT_PADDING: u8 = 0xFF;
+
+pub const VARIANT_SEGMENT: u8 = 0x01;
+pub const VARIANT_SEGMENT_IS_TERMINATOR: u8 = 0x02;
+pub const VARIANT_SEGMENT_HAS_TERMINATOR: u8 = 0x03;
+pub const VARIANT_SEGMENT_FLAG_CLOSE_SEND: u8 = 0x04;
+pub const VARIANT_SEGMENT_FLAG_CLOSE_RECV: u8 = 0x08;
+pub const VARIANT_SEGMENT_BASE_MASK: u8 = 0x0C;
+pub const VARIANT_SEGMENT_MAX: u8 = 0x10;
+
+pub const VARIANT_ACK_SINGLE: u8 = 0x10;
+pub const VARIANT_ACK_RUN: u8 = 0x11;
+
+// TODO: Keep alive, explicit congestion, data blocked, connection close.
+
+pub const MIN_FRAME_APPEND_LEN: usize = 20;
 pub const MIN_MTU: usize = 128;
+
+pub const MAX_DOC_HEADER_LEN: usize = 8 * 2;

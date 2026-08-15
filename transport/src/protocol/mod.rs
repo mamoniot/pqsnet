@@ -1,15 +1,19 @@
 // TODO: segmentation, version, payload
 
-pub mod domain;
+pub(crate) mod domain;
 
-pub mod shared;
+pub(crate) mod shared;
 
-pub mod initialize;
+pub(crate) mod initialize;
 
-pub mod reply;
+pub(crate) mod reply;
 
-pub mod resume;
+pub(crate) mod resume;
 
-pub mod confirm;
+pub(crate) mod confirm;
 
-pub mod data;
+pub(crate) mod data;
+
+pub const HEADER_LEN: usize = 8;
+pub const FOOTER_LEN: usize = 16;
+pub const OVERHEAD_LEN: usize = HEADER_LEN + FOOTER_LEN;

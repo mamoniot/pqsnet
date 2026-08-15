@@ -1,10 +1,10 @@
 [package]
-name = "transport"
+name = "psqnet_transport"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "transport"
+name = "psqnet_transport"
 path = "src/lib.rs"
 
 

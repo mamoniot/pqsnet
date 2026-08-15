@@ -37,3 +37,5 @@
 - Add support for efficient single segment documents (docs smaller than the mtu)
 - Make sure that the protocol would be backwards compatible with the ability to ack packets instead of segments
 - Instrument `Instant` with the async runtime for testing
+- Add the ability to change stream priorities, and priority fairness for non-prioritized streams.
+- Add a configuration option to always pad packets to the length of the plpmtu for enhanced privacy.

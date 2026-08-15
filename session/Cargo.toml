@@ -9,7 +9,10 @@ path = "src/lib.rs"
 
 
 [dependencies]
+# psqnet_transport = { path = "../transport" }
+tinyvec = { features = ["alloc", "serde"], version = "*"}
 rand_core = "*"
+rand = "*"
 bytemuck = "*"
 dashmap = { features = ["raw-api"], version = "*"}
 zeroize = "*"
@@ -17,7 +20,6 @@ hex-literal = "*"
 cbor4ii = { features = ["use_std", "serde1"], version = "*" }
 serde = { features = ["derive"], version = "*" }
 serde_bytes = "*"
-smallvec = { features = ["serde", "union"], version = "*" }
 bytes = "*"
 tokio = { features = ["sync"], version = "*" }
 # rustqlite = "*"

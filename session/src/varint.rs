@@ -18,10 +18,14 @@ pub fn varusize_len(value: usize) -> usize {
     todo!()
 }
 
-pub fn varusize_write(buf: &mut [u8], idx: &mut usize, value: usize) -> bool {
+pub fn varusize_write(buf: &mut Vec<u8>, value: usize) -> bool {
     todo!()
 }
 
 pub fn varusize_write_segment(buf: &mut [u8], idx: &mut usize, data: &[u8], jdx: &mut usize) -> bool {
+    todo!()
+}
+
+pub fn calc_buffer_data_curse(buf_len: usize) -> usize {
     todo!()
 }

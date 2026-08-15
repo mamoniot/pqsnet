@@ -6,61 +6,12 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use dashmap::{DashMap, Entry, OccupiedEntry};
-use smallvec::SmallVec;
+use tinyvec::TinyVec;
 
 use crate::{protocol::*, send_lossless::TransmissionQueue, varint::*};
 
 pub type DocNo = usize;
 pub type SocketId = u32;
-
-pub struct A {
-    ref_count: AtomicUsize,
-    mem: [u8],
-}
-
-pub struct PayloadBuffer {
-    ptr: NonNull<A>,
-}
-
-pub struct PayloadPart {
-    buf: PayloadBuffer,
-    i: usize,
-}
-
-pub struct asfgb {
-    unfinished_payloads: Vec<PayloadPart>,
-    empty_payloads: Vec<PayloadBuffer>,
-}
-
-pub fn sas(
-    a : Mutex<asfgb>,
-    required_len: usize,
-    flexible_len: usize,
-    plpmtu: usize
-) {
-    let mut a = a.lock().unwrap();
-    let (payload, i) = loop {
-        if let Some(v) = a.unfinished_payloads.last() {
-            if v.i > plpmtu {
-                a.unfinished_payloads.pop();
-                continue;
-            }
-            if v.i + required_len > plpmtu {
-
-            }
-            if i + required_len <= plpmtu {
-                if v.i + required_len <= v.capacity() {
-                    v.clone()
-                } else {
-
-                }
-            }
-        } else {
-            a.unfinished_payloads.push(dsc { payload: Arc::new(UnsafeCell::new([0; plpmtu])), i: () });
-        }
-    };
-}
-
 
 pub struct Payload {
     ref_count: AtomicUsize,
@@ -135,6 +86,11 @@ pub enum RecvData<R: Route> {
     SyncDoc(Vec<u8>),
     SyncDocRecv(Vec<u8>, DocReceiver<R>),
     SyncDocSend(Vec<u8>, DocSender<R>),
+}
+impl<R: Route> Default for RecvData<R> {
+    fn default() -> Self {
+        Self::LossyDoc(Vec::new())
+    }
 }
 
 pub enum RecvError {
@@ -362,9 +318,9 @@ impl<R: Route> Session<R> {
         }
     }
 
-    pub async fn recv(&self, packet: &mut [u8], route: R) -> Result<SmallVec<[RecvData<R>; 1]>, RecvError> {
+    pub async fn recv(&self, packet: &mut [u8], route: R) -> Result<TinyVec<[RecvData<R>; 1]>, RecvError> {
         // TODO: Decrypt packet.
-        let mut ret = SmallVec::new();
+        let mut ret = TinyVec::new();
 
         let mut i = 0;
         while i < packet.len() {
@@ -373,16 +329,20 @@ impl<R: Route> Session<R> {
             match variant {
                 VARIANT_PADDING => {}
                 VARIANT_NULL_TERMINATOR => break,
-                VARIANT_DOC_HEAD | VARIANT_DOC_HEAD_RECV | VARIANT_DOC_HEAD_SEND => {
-                    let doc_no = varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?;
-                    let parent_no = varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?;
-                    let doc_len = varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?;
-                    let res = self.recv_doc_header(doc_no, parent_no, doc_len, variant)?;
-                    if let Some(res) = res {
-                        ret.push(res);
-                    }
-                }
-                VARIANT_DOC_SEG | VARIANT_DOC_SEG_TERMINATOR => {
+                // VARIANT_DOC_HEAD | VARIANT_DOC_HEAD_RECV | VARIANT_DOC_HEAD_SEND => {
+                //     let doc_no = varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?;
+                //     let parent_no = varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?;
+                //     let doc_len = varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?;
+                //     let res = self.recv_doc_header(doc_no, parent_no, doc_len, variant)?;
+                //     if let Some(res) = res {
+                //         ret.push(res);
+                //     }
+                // }
+                VARIANT_SEGMENT..VARIANT_SEGMENT_MAX => {
+                    let close_send = variant & VARIANT_SEGMENT_FLAG_CLOSE_SEND > 0;
+                    let close_recv = variant & VARIANT_SEGMENT_FLAG_CLOSE_RECV > 0;
+                    let base_variant = variant & VARIANT_SEGMENT_BASE_MASK;
+
                     let doc_no = varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?;
                     let seg_no = varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?;
                     let seg_len = if variant == VARIANT_DOC_SEG_TERMINATOR {
@@ -392,7 +352,6 @@ impl<R: Route> Session<R> {
                     };
                     let start = i;
                     i += seg_len;
-                    Bytes::
                     if i > packet.len() {
                         return Err(RecvError::Invalid);
                     }
@@ -496,7 +455,7 @@ impl<R: Route> Session<R> {
             }
 
             while j < doc.data.len() {
-                if i + MIN_VARIANT_APPEND_LEN > plpmtu {
+                if i + MIN_FRAME_APPEND_LEN > plpmtu {
                     pad_and_send!(i);
                 }
 
