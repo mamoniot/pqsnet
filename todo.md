@@ -39,3 +39,4 @@
 - Instrument `Instant` with the async runtime for testing
 - Add the ability to change stream priorities, and priority fairness for non-prioritized streams.
 - Add a configuration option to always pad packets to the length of the plpmtu for enhanced privacy.
+- Add an API to make it easy to send inner-mtu sized documents.

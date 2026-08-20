@@ -1,10 +1,10 @@
 use std::{
-    cell::UnsafeCell, collections::{BTreeMap, BTreeSet, HashMap}, ptr::NonNull, sync::{
-        Arc, Mutex, RwLock, atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
-    }, time::Instant,
+    cell::UnsafeCell, sync::{
+        Arc, Mutex, atomic::{AtomicU64, AtomicUsize, Ordering},
+    }
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use dashmap::{DashMap, Entry, OccupiedEntry};
 use tinyvec::TinyVec;
 
@@ -50,6 +50,7 @@ impl<R: Route> Clone for Session<R> {
 }
 
 pub struct SessionInner<R: Route> {
+    min_unseen_recv_doc_no: usize,
     last_recv_time: AtomicU64,
     pub(crate) plpmtu: u32,
     pub(crate) doc_counter: AtomicUsize,
@@ -77,8 +78,13 @@ pub struct DocReceiver<R: Route> {
 
 pub enum RecvDocState {
     Active(RecvDoc),
-    Finished,
-    Closed { last_message_id: u64 },
+    /// If any segment of a document is severely delayed, it could arrive after the document is
+    /// already fully received and processed. In this case we must make sure that the delayed
+    /// segment does not reopen the document.
+    Completed,
+    ClosedRecv,
+    ClosedSend,
+    Closed,
 }
 
 pub enum RecvData<R: Route> {
@@ -327,21 +333,14 @@ impl<R: Route> Session<R> {
             let variant = packet[i];
             i += 1;
             match variant {
-                VARIANT_PADDING => {}
                 VARIANT_NULL_TERMINATOR => break,
-                // VARIANT_DOC_HEAD | VARIANT_DOC_HEAD_RECV | VARIANT_DOC_HEAD_SEND => {
-                //     let doc_no = varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?;
-                //     let parent_no = varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?;
-                //     let doc_len = varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?;
-                //     let res = self.recv_doc_header(doc_no, parent_no, doc_len, variant)?;
-                //     if let Some(res) = res {
-                //         ret.push(res);
-                //     }
-                // }
-                VARIANT_SEGMENT..VARIANT_SEGMENT_MAX => {
+                VARIANT_SEGMENT..=VARIANT_SEGMENT_MAX => {
+                    let base_variant = variant & VARIANT_SEGMENT_BASE_MASK;
+                    let has_offset = variant & VARIANT_SEGMENT_FLAG_HAS_OFFSET > 0;
+                    let has_metadata = variant & VARIANT_SEGMENT_FLAG_HAS_METADATA > 0;
+                    let has_memory_limit = variant & VARIANT_SEGMENT_FLAG_HAS_MEMORY_LIMIT > 0;
                     let close_send = variant & VARIANT_SEGMENT_FLAG_CLOSE_SEND > 0;
                     let close_recv = variant & VARIANT_SEGMENT_FLAG_CLOSE_RECV > 0;
-                    let base_variant = variant & VARIANT_SEGMENT_BASE_MASK;
 
                     let doc_no = varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?;
                     let seg_no = varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?;
@@ -360,6 +359,16 @@ impl<R: Route> Session<R> {
                         ret.push(res);
                     }
                 }
+                VARIANT_LIMIT_UPDATE_GENERAL | VARIANT_LIMIT_UPDATE_DOC => {
+
+                }
+                VARIANT_ACK_SINGLE | VARIANT_ACK_RUN => {
+
+                }
+                VARIANT_RESET_DOC => {
+
+                }
+                VARIANT_PADDING => {}
                 _ => return Err(RecvError::Invalid),
             }
         }
