@@ -1,37 +1,30 @@
 use std::{
-    cell::UnsafeCell, sync::{
-        Arc, Mutex, atomic::{AtomicU64, AtomicUsize, Ordering},
-    }
+    cell::UnsafeCell,
+    collections::VecDeque,
+    ops::{Deref, DerefMut, Range},
+    ptr::NonNull,
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+    task::Waker,
 };
 
-use bytes::Bytes;
+use arrayvec::ArrayVec;
+use bytes::{Bytes, BytesMut};
 use dashmap::{DashMap, Entry, OccupiedEntry};
-use tinyvec::TinyVec;
+use smallvec::SmallVec;
 
-use crate::{protocol::*, send_lossless::TransmissionQueue, varint::*};
+use crate::{
+    channel::{Channel, RecvDocData},
+    packet_builder::PacketBuilder,
+    protocol::*,
+    send_lossless::TransmissionQueue,
+    varint::*,
+};
 
-pub type DocNo = usize;
+pub type DocNo = u64;
 pub type SocketId = u32;
-
-pub struct Payload {
-    ref_count: AtomicUsize,
-    mem: [u8],
-}
-
-
-#[derive(Default)]
-pub struct RecvDoc {
-    parent_no: usize,
-    /// This `Vec` may only increase in length.
-    data: UnsafeCell<Vec<u8>>,
-    /// TODO: This field is redundant, remove it.
-    total_len: usize,
-    variant: u8,
-    total_recv: AtomicUsize,
-    first_unacked_seg_no: AtomicUsize,
-    /// This `Vec` may only increase in length.
-    set_segs: Vec<AtomicUsize>,
-}
 
 pub struct Session<R: Route>(pub Arc<SessionInner<R>>);
 
@@ -50,53 +43,101 @@ impl<R: Route> Clone for Session<R> {
 }
 
 pub struct SessionInner<R: Route> {
-    min_unseen_recv_doc_no: usize,
-    last_recv_time: AtomicU64,
+    pub(crate) is_initiator: bool,
+    pub(crate) last_recv_time: AtomicU64,
     pub(crate) plpmtu: u32,
-    pub(crate) doc_counter: AtomicUsize,
-
-    pub(crate) nagle_payload: Mutex<Vec<u8>>,
     /// Document numbers may not be reused, otherwise severely delayed document segments could
     /// corrupt new documents.
     /// There is no way around this, segments which share a document number are indistinguishable.
-    pub(crate) recv_doc_table: DashMap<DocNo, RecvDocState>,
+    pub(crate) recv_total: AtomicUsize,
+    pub(crate) recv_max: AtomicUsize,
+    pub(crate) recv_table: Vec<RecvDocEntry<R>>,
+
+    pub(crate) send_bytes_total: AtomicU64,
+    /// This is set to 0 if this session was abandoned.
+    pub(crate) send_bytes_max: AtomicU64,
+    pub(crate) send_total: AtomicUsize,
+    pub(crate) send_doc_no: AtomicU64,
+    pub(crate) send_wakers: Mutex<VecDeque<Waker>>,
+    pub(crate) send_table: Vec<SendDocEntry<R>>,
+
+    pub(crate) send_queue: Mutex<VecDeque<DocNo>>,
     pub(crate) transmissions: TransmissionQueue,
+
+    pub(crate) socket_idx: bool,
+    pub(crate) sockets: RwLock<ArrayVec<Socket, 2>>,
+
     pub(crate) congestion_control: (),
     pub(crate) stats: (),
     pub(crate) route: R,
 }
 
-pub struct DocSender<R: Route> {
-    pub(crate) session: Session<R>,
-    pub(crate) parent_no: usize,
+pub(crate) struct Socket {
+    pub(crate) acks: Mutex<VecDeque<u32>>,
+    // pub(crate) socket: Sock
 }
 
-pub struct DocReceiver<R: Route> {
-    pub(crate) session: Session<R>,
-    pub(crate) parent_no: usize,
+pub(crate) struct RecvDocEntry<R: Route> {
+    pub(crate) lock: Mutex<RecvDocInner<R>>,
 }
 
-pub enum RecvDocState {
-    Active(RecvDoc),
-    /// If any segment of a document is severely delayed, it could arrive after the document is
-    /// already fully received and processed. In this case we must make sure that the delayed
-    /// segment does not reopen the document.
-    Completed,
-    ClosedRecv,
-    ClosedSend,
-    Closed,
+pub(crate) struct RecvDocInner<R: Route> {
+    pub(crate) doc_no: DocNo,
+    pub(crate) doc: RecvDocState,
+    pub(crate) channel: Option<ChannelState<R>>,
+    // This may only be set to true once at the same time `channel` is set to `None` or when `doc`
+    // is set to `Fin`.
+    pub(crate) needs_send_control: bool,
 }
 
-pub enum RecvData<R: Route> {
-    LossyDoc(Vec<u8>),
-    SyncDoc(Vec<u8>),
-    SyncDocRecv(Vec<u8>, DocReceiver<R>),
-    SyncDocSend(Vec<u8>, DocSender<R>),
+pub(crate) enum RecvDocState {
+    Recv(RecvDoc),
+    // These are awoken when we receive an ack for our doc fin frame.
+    Fin(SmallVec<[Waker; 1]>),
+    FinAck,
 }
-impl<R: Route> Default for RecvData<R> {
-    fn default() -> Self {
-        Self::LossyDoc(Vec::new())
-    }
+
+pub(crate) struct RecvDoc {
+    pub(crate) mem: Box<[u8]>,
+    pub(crate) total_recv: usize,
+    pub(crate) set_segs: Vec<usize>,
+}
+
+pub(crate) struct SendDocEntry<R: Route> {
+    pub(crate) lock: Mutex<SendDocInner<R>>,
+}
+
+pub(crate) struct SendDocInner<R: Route> {
+    pub(crate) doc_no: DocNo,
+    pub(crate) doc: Option<SendDoc>,
+    pub(crate) channel: Option<ChannelState<R>>,
+    /// This slot in `send_table` cannot be reused for a different document until this document is
+    /// finished and the request to close this document is acked.
+    pub(crate) close_acked: bool,
+    /// This may only be set to true once at the same time `channel` is set to `None`.
+    pub(crate) needs_send_close: bool,
+}
+
+pub(crate) struct SendDoc {
+    pub(crate) parent_no: DocNo,
+    pub(crate) has_special_parent: bool,
+    pub(crate) has_been_acked: bool,
+    pub(crate) next_seg_off: usize,
+    pub(crate) data: Bytes,
+    /// These are awoken when we receive a doc fin frame.
+    pub(crate) flush_wakers: SmallVec<[Waker; 1]>,
+}
+
+pub(crate) struct ChannelState<R: Route> {
+    pub(crate) ref_count: usize,
+    pub(crate) ready_wakers: SmallVec<[Waker; 1]>,
+    pub(crate) ready_docs: SmallVec<[RecvDocData<R>; 1]>,
+    pub(crate) reply_buffer: Option<ReplyState<R>>,
+}
+
+pub enum ReplyState<R: Route> {
+    Awaiting(Range<*mut u8>, Waker),
+    Recv(Channel<R>),
 }
 
 pub enum RecvError {
@@ -111,13 +152,20 @@ pub enum RouteError {
     Other,
 }
 
-pub struct Work(WorkInner);
+pub struct Work(pub(crate) WorkInner);
 
 pub enum WorkInner {
-    TrySendDoc(DocNo),
-    TryRetransmit(RetransmitWork),
+    Send(PacketBuilder),
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum AllocData<'a> {
+    Long(&'a [u8]),
+    Short(u64),
+    None,
+}
+
+/// TODO: change the name of this.
 pub trait Route {
     fn send(&self, packet: &[u8]) -> Result<(), RouteError>;
 }
@@ -135,423 +183,175 @@ impl<R: Route> Session<R> {
         todo!()
     }
 
-    fn recv_doc(&self, doc_no: usize, seg_no: usize, seg: &[u8]) -> Result<Option<RecvData<R>>, RecvError> {
+    fn recv_doc(&self, doc: &mut RecvDoc, seg_off: usize, seg: &[u8]) -> Result<bool, RecvError> {
         // TODO: check `first_incomplete_doc`, and also allow completed docs in the `recv_doc_table`.
-        fn check_overlap(set_seg: &AtomicUsize, set_bits: usize) -> usize {
-            let pre_bits = set_seg.fetch_or(set_bits, Ordering::SeqCst);
+        fn check_overlap(set_seg: &mut usize, set_bits: usize) -> usize {
+            let pre_bits = *set_seg;
+            *set_seg |= set_bits;
 
             let bits_set = !pre_bits & set_bits;
             bits_set.count_ones() as usize
         }
 
+        // It is safe to read the length of `data` since it is only written to when the
+        // write lock is held.
+        let doc_len = doc.mem.len();
+
         if seg.is_empty() {
-            if let Some(state) = self.recv_doc_table.get(&doc_no) {
-                if let RecvDocState::Active(doc) = state.value() {
-                    doc.first_unacked_seg_no.fetch_min(seg_no, Ordering::SeqCst);
-                }
-            }
-            return Ok(None);
+            return Ok(doc_len == 0);
         }
 
-        let seg_end = seg_no + seg.len() - 1;
-        let seg_no_idx = seg_no / usize::BITS as usize;
+        let seg_end = seg_off + seg.len() - 1;
+        let seg_off_idx = seg_off / usize::BITS as usize;
+        let seg_off_rem = seg_off % usize::BITS as usize;
         let seg_end_idx = seg_end / usize::BITS as usize;
-        let seg_no_rem = seg_no % usize::BITS as usize;
         let seg_end_rem = seg_end % usize::BITS as usize;
 
-        let seg_no_set = usize::MAX >> seg_no_rem;
+        let seg_off_set = usize::MAX >> seg_off_rem;
         let seg_end_set = usize::MAX << (usize::BITS as usize - seg_end_rem - 1);
 
-        loop {
-            let entry = self.recv_doc_table.get(&doc_no);
-            if let Some(RecvDocState::Active(doc)) = entry.map(|s| s.value()) {
-                // It is safe to read the length of `data` since it is only written to when the
-                // write lock is held.
-                let data_len = unsafe { doc.data.get().as_ref_unchecked().len() };
-
-                if seg_end < data_len {
-                    let mut total_new_bytes = 0;
-                    if seg_no_idx == seg_end_idx {
-                        total_new_bytes += check_overlap(&doc.set_segs[seg_no_idx], seg_no_set & seg_end_set);
-                    } else {
-                        total_new_bytes += check_overlap(&doc.set_segs[seg_no_idx], seg_no_set);
-                        for i in seg_no_idx + 1..seg_end_idx - 1 {
-                            total_new_bytes += check_overlap(&doc.set_segs[i], usize::MAX);
-                        }
-                        total_new_bytes += check_overlap(&doc.set_segs[seg_end_idx], seg_end_set);
-                    }
-                    doc.first_unacked_seg_no.fetch_min(seg_no, Ordering::SeqCst);
-
-                    if total_new_bytes == seg.len() {
-                        unsafe {
-                            let data = doc.data.get().as_mut_unchecked();
-                            data[seg_no..=seg_end].copy_from_slice(seg);
-                        }
-                        let total_recv = doc.total_recv.fetch_add(total_new_bytes, Ordering::SeqCst);
-                        if doc.total_len > 0 && total_recv == doc.total_len {
-                            drop(entry);
-                            if let Some((_, doc)) = self.recv_doc_table.remove(&doc_no) {
-                                return Some(doc.data.into_inner());
-                            }
-                        }
-                    } else if total_new_bytes > 0 {
-                        drop(doc);
-                        // Anything could change since the lock was dropped, recheck everything.
-                        // This is especially important if our peer mistakenly reuses a doc number.
-                        if let Entry::Occupied(mut entry) = self.recv_doc_table.entry(doc_no) {
-                            let doc = entry.get_mut();
-                            if let Some(segment) = doc.data.get_mut().get_mut(seg_no..=seg_end) {
-                                segment.copy_from_slice(seg);
-                                let total_recv = doc.total_recv.fetch_add(total_new_bytes, Ordering::SeqCst);
-                                return if doc.total_len > 0 && total_recv == doc.total_len {
-                                    Some(entry.remove().data.into_inner())
-                                } else {
-                                    None
-                                };
-                            }
-                        }
-                        /*
-                        This line is only reachable if the remote peer reuses a document number
-                        or sends some other corrupt data. This would likely cause this entire
-                        document to be leaked, which is why the remote peer must not reuse a
-                        document number.
-                        */
-                    }
-                    return None;
-                }
-            }
-            drop(entry);
-
-            let mut doc = self.recv_doc_table.entry(doc_no).or_default();
-            if doc.total_len > 0 && seg_end >= doc.total_len {
-                // The remote peer has sent us corrupt data that would overflow the expected
-                // document length.
-                return None;
-            }
-
-            doc.set_segs.resize_with(seg_end_idx + 1, Default::default);
-            let data = doc.data.get_mut();
-            // TODO: resize with uninitialized memory.
-            data.resize(seg_end + 1, 0);
+        if seg_end >= doc_len {
+            return Err(RecvError::Invalid);
         }
-    }
 
-    fn extract_doc(
-        &self,
-        doc_no: usize,
-        parent_no: usize,
-        variant: u8,
-        data: Vec<u8>,
-    ) -> Result<Option<RecvData<R>>, RecvError> {
-        // TODO: Better delineate flags.
-        let ret = if variant == VARIANT_DOC_HEAD_RECV {
-            let receiver = DocReceiver { session: self.clone(), parent_no: doc_no };
-            RecvData::SyncDocRecv(data, receiver)
-        } else if variant == VARIANT_DOC_HEAD_SEND {
-            let sender = DocSender { session: self.clone(), parent_no: doc_no };
-            RecvData::SyncDocSend(data, sender)
+        let mut total_new_bytes = 0;
+        if seg_off_idx == seg_end_idx {
+            total_new_bytes += check_overlap(&mut doc.set_segs[seg_off_idx], seg_off_set & seg_end_set);
         } else {
-            RecvData::SyncDoc(data)
-        };
-
-        // TODO: check parent doc.
-
-        Ok(Some(ret))
-    }
-
-    fn finish_recv_doc(
-        &self,
-        doc_no: usize,
-        mut entry: OccupiedEntry<usize, RecvDocState>,
-    ) -> Result<Option<RecvData<R>>, RecvError> {
-        let mut new_state = RecvDocState::Finished;
-        std::mem::swap(&mut new_state, entry.get_mut());
-        drop(entry);
-        if let RecvDocState::Active(doc) = new_state {
-            self.extract_doc(doc_no, doc.parent_no, doc.variant, doc.data.into_inner())
-        } else {
-            debug_assert!(false, "unreachable");
-            Err(RecvError::Invalid)
-        }
-    }
-
-    fn recv_doc_header(
-        &self,
-        doc_no: usize,
-        parent_no: usize,
-        doc_len: usize,
-        variant: u8,
-    ) -> Result<Option<RecvData<R>>, RecvError> {
-        let doc_seg_len = doc_len.div_ceil(usize::BITS as usize);
-
-        match self.recv_doc_table.entry(doc_no) {
-            Entry::Occupied(mut entry) => {
-                if let RecvDocState::Active(doc) = entry.get_mut() {
-                    if doc.total_len == 0 {
-                        doc.set_segs.resize_with(doc_seg_len, Default::default);
-                        let data = doc.data.get_mut();
-                        // TODO: resize with uninitialized memory.
-                        data.resize(doc_len, 0);
-                        doc.total_len = doc_len;
-                        doc.variant = variant;
-                        if doc.total_recv.load(Ordering::SeqCst) >= doc.total_len {
-                            return self.finish_recv_doc(doc_no, entry);
-                        }
-                    }
-                }
-                Ok(None)
+            total_new_bytes += check_overlap(&mut doc.set_segs[seg_off_idx], seg_off_set);
+            for i in seg_off_idx + 1..seg_end_idx - 1 {
+                total_new_bytes += check_overlap(&mut doc.set_segs[i], usize::MAX);
             }
-            Entry::Vacant(entry) => {
-                if doc_len > 0 {
-                    let data = UnsafeCell::new(vec![0; doc_len]);
-                    let mut set_segs = Vec::with_capacity(doc_seg_len);
-                    set_segs.resize_with(doc_seg_len, Default::default);
-                    entry.insert(RecvDocState::Active(RecvDoc {
-                        total_len: doc_len,
-                        data,
-                        set_segs,
-                        variant,
-                        parent_no,
-                        ..Default::default()
-                    }));
-
-                    Ok(None)
-                } else {
-                    entry.insert(RecvDocState::Finished);
-                    self.extract_doc(doc_no, parent_no, variant, Vec::new())
-                }
-            }
+            total_new_bytes += check_overlap(&mut doc.set_segs[seg_end_idx], seg_end_set);
         }
+
+        doc.total_recv += total_new_bytes;
+        doc.mem[seg_off..=seg_end].copy_from_slice(seg);
+        Ok(doc.total_recv == doc_len)
     }
 
-    pub async fn recv(&self, packet: &mut [u8], route: R) -> Result<TinyVec<[RecvData<R>; 1]>, RecvError> {
+    pub(crate) fn recv(&self, packet: &mut [u8], route: R) -> Result<(), RecvError> {
         // TODO: Decrypt packet.
-        let mut ret = TinyVec::new();
+        let mut ret = SmallVec::new();
 
+        let mut ack_eliciting = false;
         let mut i = 0;
         while i < packet.len() {
             let variant = packet[i];
             i += 1;
             match variant {
                 VARIANT_NULL_TERMINATOR => break,
-                VARIANT_SEGMENT..=VARIANT_SEGMENT_MAX => {
-                    let base_variant = variant & VARIANT_SEGMENT_BASE_MASK;
-                    let has_offset = variant & VARIANT_SEGMENT_FLAG_HAS_OFFSET > 0;
-                    let has_metadata = variant & VARIANT_SEGMENT_FLAG_HAS_METADATA > 0;
-                    let has_memory_limit = variant & VARIANT_SEGMENT_FLAG_HAS_MEMORY_LIMIT > 0;
-                    let close_send = variant & VARIANT_SEGMENT_FLAG_CLOSE_SEND > 0;
-                    let close_recv = variant & VARIANT_SEGMENT_FLAG_CLOSE_RECV > 0;
+                VARIANT_SEG_HAS_LEN..=VARIANT_SEG_MAX => {
+                    ack_eliciting = true;
 
-                    let doc_no = varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?;
-                    let seg_no = varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?;
-                    let seg_len = if variant == VARIANT_DOC_SEG_TERMINATOR {
-                        packet.len() - i
+                    let has_special_parent = variant & VARIANT_SEG_FLAG_HAS_SPECIAL_PARENT > 0;
+                    let has_doc_len = variant & VARIANT_SEG_FLAG_HAS_DOC_LEN > 0;
+                    let is_single_seg = variant & VARIANT_SEG_FLAG_IS_SINGLE_SEG > 0;
+                    let is_first_segment = variant & VARIANT_SEG_FLAG_IS_FIRST > 0;
+                    let variant_len = variant & VARIANT_SEG_LEN_MASK;
+                    let doc_len = None;
+                    let doc_parent_no = None;
+                    let seg_off = 0;
+
+                    let doc_no = varu64_try_read(packet, &mut i).ok_or(RecvError::Invalid)?;
+                    if has_doc_len {
+                        doc_len = Some(varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?);
+                    }
+                    if has_special_parent || is_first_segment {
+                        doc_parent_no = Some(varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?);
+                    }
+                    if !is_first_segment {
+                        seg_off = varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?;
+                    }
+
+                    let seg = if variant_len == VARIANT_SEG_IS_TERMINATOR {
+                        let ret = &packet[i..];
+                        i = packet.len();
+                        ret
+                    } else if variant_len == VARIANT_SEG_HAS_LEN {
+                        let seg_len = varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?;
+                        let seg_start = i;
+                        i = i.saturating_add(seg_len);
+                        packet.get(seg_start..i).ok_or(RecvError::Invalid)?
                     } else {
-                        varusize_try_read(packet, &mut i).ok_or(RecvError::Invalid)?
+                        debug_assert_eq!(variant_len, VARIANT_SEG_HAS_TERMINATOR);
+                        let seg_start = i;
+                        let mut seg_end = packet.len() - 1;
+                        loop {
+                            if seg_start > seg_end {
+                                return Err(RecvError::Invalid);
+                            }
+                            if packet[seg_end] == VARIANT_NULL_TERMINATOR {
+                                break;
+                            }
+                            seg_end -= 1;
+                        }
+                        &packet[seg_start..seg_end]
                     };
-                    let start = i;
-                    i += seg_len;
-                    if i > packet.len() {
-                        return Err(RecvError::Invalid);
+
+                    if is_single_seg {
+                        doc_len.get_or_insert(seg.len());
                     }
-                    let res = self.recv_doc(doc_no, seg_no, &packet[start..i])?;
-                    if let Some(res) = res {
-                        ret.push(res);
+
+                    let mut largest_recv_doc_no = self.largest_recv_doc_no.lock().unwrap();
+                    while *largest_recv_doc_no < doc_no {
+                        *largest_recv_doc_no += 2;
+                        // TODO: memory usage tracking
+                        self.recv_doc_table.insert(*largest_recv_doc_no, None);
+                        self.channel_table.insert(*largest_recv_doc_no, None);
+                    }
+
+                    match self.recv_doc_table.entry(doc_no) {
+                        Entry::Occupied(mut entry) => match entry.get_mut() {
+                            RecvDocState::Active(recv_doc) => {
+                                if self.recv_doc(recv_doc, seg_off, seg)? {
+                                    let (_, RecvDocState::Active(doc)) = entry.replace_entry(RecvDocState::Fin) else {
+                                        unreachable!()
+                                    };
+                                    ret.push(RecvData::Recv {
+                                        has_retransmission: doc.has_retransmission,
+                                        doc: doc.mem,
+                                        doc_no,
+                                    });
+                                }
+                            }
+                            RecvDocState::Fin => {}
+                        },
+                        Entry::Vacant(entry) => {
+                            if variant_alloc > 0 {
+                                // TODO: move this call out of the critical section.
+                                if let Some(mem) = route.alloc(alloc_data, doc_len) {
+                                    let set_segs_len = doc_len / usize::BITS as usize;
+                                    let mut doc = RecvDoc {
+                                        has_retransmission: variant & VARIANT_SEG_FLAG_HAS_RETRANSMISSION > 0,
+                                        mem,
+                                        total_recv: 0,
+                                        set_segs: vec![0; set_segs_len],
+                                    };
+                                    if self.recv_doc(&mut doc, seg_off, seg)? {
+                                        entry.insert(RecvDocState::Fin);
+                                        ret.push(RecvData::Recv {
+                                            has_retransmission: doc.has_retransmission,
+                                            doc: doc.mem,
+                                            doc_no,
+                                        });
+                                    } else {
+                                        entry.insert(RecvDocState::Active(doc));
+                                    }
+                                } else {
+                                    entry.insert(RecvDocState::Fin);
+                                    self.send_control_frame(VARIANT_REJECT_DOC, doc_no);
+                                }
+                            }
+                        }
                     }
                 }
-                VARIANT_LIMIT_UPDATE_GENERAL | VARIANT_LIMIT_UPDATE_DOC => {
-
-                }
-                VARIANT_ACK_SINGLE | VARIANT_ACK_RUN => {
-
-                }
-                VARIANT_RESET_DOC => {
-
-                }
+                VARIANT_ACK_SINGLE | VARIANT_ACK_RUN => {}
+                VARIANT_RESET_DOC | VARIANT_FIN_DOC => {}
                 VARIANT_PADDING => {}
                 _ => return Err(RecvError::Invalid),
             }
         }
         Ok(ret)
-    }
-
-    fn send_all(&self, now: f64) {
-
-    }
-
-    fn drive_transmission(&self, now: f64) -> Option<f64> {
-        let plpmtu = self.plpmtu as usize;
-        // let mut nagle_payload = self.nagle_payload.lock().unwrap();
-        // nagle_payload.reserve(plpmtu);
-
-        // TODO: don't bother running this code if there is not data to send
-        if let Some(next_wake) = self.congestion_control.may_transmit(now, plpmtu) {
-            return Some(next_wake);
-        }
-        let rto = self.get_last_recv_time() - self.stats.retransmission_time();
-
-        for sent_payload in self.payload_table.iter() {
-            if sent_payload.sent_at >= rto {
-                continue;
-            }
-
-            let mut idx_mem = 0;
-            let mut payload_mem = Vec::new();
-            let payload = if plpmtu.wrapping_sub(sent_payload.payload_len) <= MIN_DATA_APPEND_LEN {
-                payload_mem.reserve(plpmtu);
-                &mut payload_mem
-            } else {
-                &mut nagle_payload
-            };
-
-            for frame in &sent_payload.frames {
-                let mut not_overflown = true;
-                match frame {
-                    SentFrame::METADATA { variant, doc_no, parent_no, data_len } => {
-                        let frame_start = payload.len();
-                        payload.push(*variant);
-                        self.varusize_write_or_send(payload, plpmtu, *doc_no);
-                        not_overflown &= varusize_write(payload, plpmtu, *parent_no);
-                        not_overflown &= varusize_write(payload, plpmtu, *data_len);
-                        if !not_overflown {
-                            self.pad_and_send_packet(payload, frame_start)
-                        }
-                    }
-                    SentFrame::SEGMENT { doc_no, seg_no, data } => {
-                        payload.push(VARIANT_SEGMENT);
-                        not_overflown &= varusize_write(payload, plpmtu, *doc_no);
-                        not_overflown &= varusize_write(payload, plpmtu, *seg_no);
-                            varusize_write_segment(payload, plpmtu, &data[..]);
-                    }
-                }
-            }
-        }
-
-        macro_rules! pad_and_send {
-            ($vi: expr) => {
-                if let Some(seg) = packet.get_mut($vi..) {
-                    seg.fill(VARIANT_NULL_TERMINATOR);
-                }
-                // TODO: Encryption.
-                self.route.send(&packet);
-                i = 0;
-            };
-        }
-
-        // TODO: Eliminate this iteration, only some documents need to be visited.
-        for doc in self.recv_doc_table.iter() {
-            let first_unacked_seg_no = doc.first_unacked_seg_no.load(Ordering::SeqCst);
-            let mut has_header = first_unacked_seg_no & 1 > 0;
-            let mut j = first_unacked_seg_no >> 1;
-
-            while has_header {
-                // NOTE: This will hardlock if the plpmtu is too small.
-                debug_assert!(packet.len() >= 8 * 3);
-                packet[i] = doc.variant;
-                let vi = i;
-                i += 1;
-
-                if !varusize_write(&mut packet, &mut i, *doc.key()) {
-                    pad_and_send!(vi);
-                }
-                if !varusize_write(&mut packet, &mut i, doc.parent_no) {
-                    pad_and_send!(vi);
-                }
-                if !varusize_write(&mut packet, &mut i, doc.data.len()) {
-                    pad_and_send!(vi);
-                }
-                has_header = false;
-            }
-
-            while j < doc.data.len() {
-                if i + MIN_FRAME_APPEND_LEN > plpmtu {
-                    pad_and_send!(i);
-                }
-
-                packet[i] = VARIANT_DOC_SEG;
-                let vi = i;
-                i += 1;
-
-                if !varusize_write(&mut packet, &mut i, *doc.key()) {
-                    pad_and_send!(vi);
-                }
-                if !varusize_write(&mut packet, &mut i, j) {
-                    pad_and_send!(vi);
-                }
-                // TODO: Support long segments.
-                if !varusize_write_segment(&mut packet, &mut i, &doc.data, &mut j) {
-                    pad_and_send!(vi);
-                }
-            }
-        }
-    }
-}
-
-pub enum Error {
-    Abandoned,
-    Closed,
-}
-
-pub enum TryError {
-    Abandoned,
-    Closed,
-    NoData,
-}
-
-pub enum RecvIntoOk<R: Route> {
-    LossyDoc,
-    SyncDoc,
-    SyncDocRecv(DocReceiver<R>),
-    SyncDocSend(DocSender<R>),
-}
-
-impl<R: Route> DocReceiver<R> {
-    pub async fn recv(&self) -> Result<RecvData<R>, Error> {
-        todo!()
-    }
-
-    pub fn try_recv(&self) -> Result<RecvData<R>, TryError> {
-        todo!()
-    }
-
-    pub async fn recv_into(&self, dest: &mut [u8]) -> Result<RecvIntoOk<R>, Error> {
-        todo!()
-    }
-
-    pub fn try_recv_into(&self, dest: &mut [u8]) -> Result<RecvIntoOk<R>, TryError> {
-        todo!()
-    }
-}
-
-impl<R: Route> DocSender<R> {
-    pub async fn flush(&self) -> Result<(), Error> {
-        todo!()
-    }
-
-    pub fn send_bytes(&self, bytes: Bytes) -> Result<(), Error> {
-        // TODO: Reuse document numbers.
-        let doc_no = self.session.doc_counter.fetch_add(2, Ordering::Relaxed);
-
-        let mut set_segs = Vec::new();
-        set_segs.resize_with(bytes.len(), Default::default);
-        let doc = SendDoc {
-            data: bytes,
-            variant: VARIANT_DOC_HEAD,
-            set_segs,
-            total_acked: Default::default(),
-            first_unacked_seg_no: Default::default(),
-        };
-
-        self.session.send_doc_table.insert(doc_no, doc);
-
-        Ok(())
-    }
-
-    pub fn send_bytes_with_receiver(&self, bytes: Bytes) -> Result<DocSender<R>, Error> {
-        todo!()
-    }
-
-    pub fn send_bytes_with_sender(&self, bytes: Bytes) -> Result<DocReceiver<R>, Error> {
-        todo!()
     }
 }

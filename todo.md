@@ -1,5 +1,9 @@
 # TODO
 
+## Dev
+- Write development glossary
+- Document code architecture
+
 ## Transport
 ### Core
 - Send handshake messages

@@ -10,7 +10,8 @@ path = "src/lib.rs"
 
 [dependencies]
 # psqnet_transport = { path = "../transport" }
-tinyvec = { features = ["alloc", "serde"], version = "*"}
+arrayvec = { features = ["std", "serde"], version = "*"}
+smallvec = { features = ["union", "serde"], version = "*"}
 rand_core = "*"
 rand = "*"
 bytemuck = "*"
