@@ -7,14 +7,6 @@ use crate::{
     varint::*,
 };
 
-pub struct PacketBuilder {
-    pub buf: Vec<u8>,
-    pub segments: SmallVec<[Segment; 2]>,
-    pub plpmtu: usize,
-    has_resend_of: SmallVec<[u64; 2]>,
-}
-
-#[derive(Default)]
 pub struct Segment {
     variant_and_header_len: usize,
     doc_no: DocNo,
@@ -22,6 +14,20 @@ pub struct Segment {
     doc_parent_no: u64,
     seg_off: usize,
     data: Bytes,
+}
+
+pub enum ElicitingFrame {
+    Seg(Segment),
+    Control(u8, DocNo),
+    Reject(DocNo),
+    Reset(DocNo),
+}
+
+pub struct PacketBuilder {
+    pub buf: Vec<u8>,
+    pub eliciting_frames: SmallVec<[ElicitingFrame; 2]>,
+    pub plpmtu: usize,
+    has_resend_of: SmallVec<[u64; 2]>,
 }
 
 impl Segment {
@@ -85,7 +91,7 @@ impl PacketBuilder {
     pub fn new(plpmtu: usize) -> Self {
         Self {
             buf: Vec::with_capacity(plpmtu),
-            segments: SmallVec::new(),
+            eliciting_frames: SmallVec::new(),
             plpmtu,
             has_resend_of: SmallVec::new(),
         }
@@ -149,13 +155,28 @@ impl PacketBuilder {
                 self.buf.push(VARIANT_PADDING);
             }
         }
-        self.segments.push(seg);
+        self.eliciting_frames.push(ElicitingFrame::Seg(seg));
         self.remaining_cap() < MIN_FRAME_APPEND_LEN
     }
 
+    /// May panic if the packet has less than `MIN_FRAME_APPEND_LEN` remaining capacity.
     pub fn append_control(&mut self, variant: u8, doc_no: DocNo) -> bool {
         self.buf.push(variant);
         varu64_write(&mut self.buf, doc_no);
+        self.eliciting_frames.push(ElicitingFrame::Control(variant, doc_no));
+        self.remaining_cap() < MIN_FRAME_APPEND_LEN
+    }
+
+    /// May panic if the packet has less than `MIN_FRAME_APPEND_LEN` remaining capacity.
+    pub fn append_sorted_acks(&mut self, acks: &[u32]) -> bool {
+        
+        let variant_idx = self.buf.len();
+        self.buf.push(VARIANT_ACK_SINGLE);
+        self.buf.extend_from_slice(&acks[0].to_be_bytes());
+
+
+        varu64_write(&mut self.buf, doc_no);
+        self.eliciting_frames.push(ElicitingFrame::Control(variant, doc_no));
         self.remaining_cap() < MIN_FRAME_APPEND_LEN
     }
 }

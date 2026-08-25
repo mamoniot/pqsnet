@@ -64,16 +64,20 @@ pub struct SessionInner<R: Route> {
     pub(crate) send_queue: Mutex<VecDeque<DocNo>>,
     pub(crate) transmissions: TransmissionQueue,
 
-    pub(crate) socket_idx: bool,
-    pub(crate) sockets: RwLock<ArrayVec<Socket, 2>>,
+    pub(crate) open_sockets: RwLock<OpenSockets>,
 
     pub(crate) congestion_control: (),
     pub(crate) stats: (),
     pub(crate) route: R,
 }
 
-pub(crate) struct Socket {
-    pub(crate) acks: Mutex<VecDeque<u32>>,
+pub(crate) struct OpenSockets {
+    pub(crate) cur_idx: bool,
+    pub(crate) sockets: ArrayVec<SocketData, 2>,
+}
+
+pub(crate) struct SocketData {
+    pub(crate) acks: Mutex<Vec<u32>>,
     // pub(crate) socket: Sock
 }
 
@@ -156,13 +160,6 @@ pub struct Work(pub(crate) WorkInner);
 
 pub enum WorkInner {
     Send(PacketBuilder),
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum AllocData<'a> {
-    Long(&'a [u8]),
-    Short(u64),
-    None,
 }
 
 /// TODO: change the name of this.

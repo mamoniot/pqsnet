@@ -10,10 +10,7 @@ use dashmap::DashMap;
 use smallvec::SmallVec;
 
 use crate::{
-    packet_builder::{PacketBuilder, Segment},
-    protocol::*,
-    session::{DocNo, RecvDocState, RecvError, Route, Session, SocketId, Work, WorkInner},
-    varint::*,
+    packet_builder::{ElicitingFrame, PacketBuilder, Segment}, protocol::*, session::{RecvDocState, RecvError, Route, Session, SocketId, Work, WorkInner}, varint::*,
 };
 
 pub struct SentPayload {
@@ -21,14 +18,6 @@ pub struct SentPayload {
     sent_at: f64,
     has_resend_of: SmallVec<[u64; 2]>,
     eliciting_frames: SmallVec<[ElicitingFrame; 2]>,
-}
-
-pub enum ElicitingFrame {
-    Seg(Segment),
-    Fin(DocNo),
-    Close(DocNo),
-    Reject(DocNo),
-    Reset(DocNo),
 }
 
 pub struct TransmitWork {
@@ -44,7 +33,6 @@ pub struct TransmissionQueue {
     payload_state_table: DashMap<u64, bool>,
     orphans: Mutex<SmallVec<[ElicitingFrame; 1]>>,
     payload_queue: Mutex<VecDeque<SentPayload>>,
-    ack_table: [Mutex<VecDeque<SentPayload>>; 2],
     lost_payloads: AtomicU64,
 }
 
@@ -70,6 +58,12 @@ impl<R: Route> Session<R> {
                     false
                 }
             }};
+        }
+
+        let open_sockets = self.open_sockets.read().unwrap();
+        for (i, socket_data) in open_sockets.sockets.iter().enumerate() {
+            let mut acks = socket_data.acks.lock().unwrap();
+            acks.
         }
 
         let rto = self.get_last_recv_time() - self.stats.retransmission_timeout();
@@ -151,6 +145,7 @@ impl<R: Route> Session<R> {
                 if entry.doc_no != doc_no {
                     continue;
                 }
+
                 if let Some(doc) = &mut entry.doc {
                     match Segment::try_new(doc_no, doc, entry.channel.is_none(), packet.remaining_cap()) {
                         Ok(seg) => {
@@ -164,7 +159,18 @@ impl<R: Route> Session<R> {
                                 }
                             }
                         }
-                        Err(false) => {}
+                        Err(false) => {
+                            if entry.needs_send_close {
+                                entry.needs_send_close = false;
+                                drop(entry);
+
+                                if packet.append_control(VARIANT_CONTROL_CLOSE, doc_no) {
+                                    if send_with_budget!() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
                         Err(true) => {
                             drop(entry);
 
@@ -193,11 +199,9 @@ impl<R: Route> Session<R> {
                     }
                 } else if entry.needs_send_close {
                     entry.needs_send_close = false;
-                    let variant = VARIANT_CONTROL_CLOSE;
-                    variant |= entry.doc.is_none() as u8 * VARIANT_CONTROL_FIN;
                     drop(entry);
 
-                    if packet.append_control(variant, doc_no) {
+                    if packet.append_control(VARIANT_CONTROL_CLOSE | VARIANT_CONTROL_FIN, doc_no) {
                         if send_with_budget!() {
                             return;
                         }
@@ -210,6 +214,7 @@ impl<R: Route> Session<R> {
                 if entry.doc_no != doc_no || !entry.needs_send_control {
                     continue;
                 }
+
                 entry.needs_send_control = false;
                 let variant = entry.channel.is_none() as u8 * VARIANT_CONTROL_CLOSE;
                 variant |= (!matches!(entry.doc, RecvDocState::Recv(..))) as u8 * VARIANT_CONTROL_FIN;
