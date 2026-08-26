@@ -116,7 +116,6 @@ pub fn encode(buf: &mut Vec<u8>, sorted_acks: &[u32], capacity: usize) -> usize 
     i
 }
 
-
 /// [3u32, 1u8, 0 || 0, 0 || 1] => [3, 5, 6]
 /// [3u32, 1u8, 0 || 1, 0 || 1] => [3, 4, 6]
 /// [3u32, 1u8, 0 || 1, 2 || 0] => [3, 4, 9]
@@ -125,6 +124,7 @@ pub fn encode(buf: &mut Vec<u8>, sorted_acks: &[u32], capacity: usize) -> usize 
 /// [3u32, 1u8, 1 || 1, 1 || 1] => [3, 4, 6, 7]
 #[must_use]
 pub fn decode(buf: &[u8], is_run: bool, i: &mut usize, mut f: impl FnMut(u32)) -> bool {
+    // OPTIMIZATION: This can be made more efficient if we can acknowlegde packets in batches.
     if *i + 4 + is_run as usize > buf.len() {
         return false;
     }

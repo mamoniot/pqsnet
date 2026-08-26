@@ -64,8 +64,9 @@ impl<R: Route> Channel<R> {
         self.check_abandoned().ok_or(Error::Abandoned)?;
 
         let mut ret = Err(Error::Closed);
-        self.update_channel(|channel| {
+        self.session.update_channel(self.doc_no(), |channel| {
             ret = Ok(channel.ready_docs.pop());
+            // TODO: update `session.send_bytes_total`
         });
         ret
     }
@@ -77,7 +78,7 @@ impl<R: Route> Channel<R> {
     fn try_send_any(
         &self,
         doc: Bytes,
-        f: impl FnOnce() -> Option<ReplyState<R>>,
+        f: impl FnOnce() -> ReplyState<R>,
     ) -> Result<Channel<R>, (TrySendError, Bytes)> {
         let session = &self.session;
         // Verify and update sending limits.
@@ -140,10 +141,10 @@ impl<R: Route> Channel<R> {
         }
     }
     pub fn try_send(&self, doc: Bytes) -> Result<Channel<R>, (TrySendError, Bytes)> {
-        self.try_send_any(doc, || None)
+        self.try_send_any(doc, Default::default)
     }
 
-    pub async fn send_with_reply_buffer(&self, doc: Bytes, buffer: Pin<&mut [u8]>) -> Result<Channel<R>, SendError> {
+    pub async fn send_with_reply_buffer(&self, doc: Bytes, buffer: Pin<&mut [u8]>) -> Result<(usize, Channel<R>), SendError> {
         SendReplyFuture {
             channel: self,
             buffer,
@@ -152,6 +153,12 @@ impl<R: Route> Channel<R> {
         .await
     }
 
+    /// Document number is sending.
+    /// When flushing a sending doc, we only wake when we are sure the peer has received
+    /// the full document.
+    /// Document number is receiving.
+    /// When flushing a send doc, we only wake when we are sure the peer knows
+    /// we have received the full document, or the peer has rejected the doc.
     pub async fn flush_parent(&self) {
         FlushFuture { channel: self, has_waited: false }.await
     }
@@ -199,24 +206,20 @@ impl<R: Route> Channel<R> {
             let mut entry = session.send_table[send_idx].lock.lock().unwrap();
             if entry.doc_no == doc_no
                 && let Some(channel) = &mut entry.channel
-            {
-                if f(channel) {
+                && f(channel) {
                     closed_channel = entry.channel.take();
                     entry.needs_send_close = true;
                 }
-            }
         } else {
             // Document number is receiving.
             let recv_idx = ((doc_no >> 1) % session.recv_table.len() as u64) as usize;
             let mut entry = session.recv_table[recv_idx].lock.lock().unwrap();
             if entry.doc_no == doc_no
                 && let Some(channel) = &mut entry.channel
-            {
-                if f(channel) {
+                && f(channel) {
                     closed_channel = entry.channel.take();
                     entry.needs_send_control = true;
                 }
-            }
         }
 
         if let Some(channel) = closed_channel {
@@ -224,6 +227,7 @@ impl<R: Route> Channel<R> {
             for waker in channel.ready_wakers {
                 waker.wake();
             }
+            channel.reply_buffer.wake();
             Ok(())
         } else {
             Err(Error::Closed)
@@ -235,38 +239,13 @@ impl<R: Route> Channel<R> {
 
         self.close_if(|_| true)
     }
-
-    fn update_channel(&self, f: impl FnOnce(&mut ChannelState<R>)) {
-        let session = &self.session;
-
-        let doc_no = self.doc_no();
-        if self.parent_was_local() {
-            // Document number is sending.
-            let send_idx = ((doc_no >> 1) % session.send_table.len() as u64) as usize;
-            let mut entry = session.send_table[send_idx].lock.lock().unwrap();
-            if entry.doc_no == doc_no
-                && let Some(channel) = &mut entry.channel
-            {
-                f(channel);
-            }
-        } else {
-            // Document number is receiving.
-            let recv_idx = ((doc_no >> 1) % session.recv_table.len() as u64) as usize;
-            let mut entry = session.recv_table[recv_idx].lock.lock().unwrap();
-            if entry.doc_no == doc_no
-                && let Some(channel) = &mut entry.channel
-            {
-                f(channel);
-            }
-        }
-    }
 }
 
 impl<R: Route> Clone for Channel<R> {
     fn clone(&self) -> Self {
         // Channel cloning is infallible even if the channel is closed.
         // Closed channels clone to more closed channels.
-        self.update_channel(|channel| channel.ref_count += 1);
+        self.session.update_channel(self.doc_no(), |channel| channel.ref_count += 1);
         Self {
             session: self.session.clone(),
             doc_no_tagged: self.doc_no_tagged,
@@ -276,7 +255,7 @@ impl<R: Route> Clone for Channel<R> {
 
 impl<R: Route> Drop for Channel<R> {
     fn drop(&mut self) {
-        self.close_if(|channel| {
+        let _ = self.close_if(|channel| {
             channel.ref_count -= 1;
             channel.ref_count == 0
         });
@@ -299,7 +278,7 @@ impl<'a, R: Route> Future for SendFuture<'a, R> {
                 // waking up the next if there may be space for it.
                 if self.has_waited {
                     let waker = self.channel.session.send_wakers.lock().unwrap().pop_front();
-                    for w in waker {
+                    if let Some(w) = waker {
                         w.wake();
                     }
                 }
@@ -341,7 +320,8 @@ impl<'a, R: Route> Future for FlushFuture<'a, R> {
                 let mut entry = session.send_table[send_idx].lock.lock().unwrap();
 
                 if entry.doc_no == doc_no
-                    && entry.channel.is_some()
+                    && entry.
+                    channel.is_some()
                     && let Some(doc) = &mut entry.doc
                 {
                     doc.flush_wakers.push(cx.waker().clone());
@@ -374,11 +354,14 @@ impl<'a, R: Route> Future for RecvFuture<'a, R> {
     type Output = Result<RecvDocData<R>, Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // TODO: There is a race condition where a document is finished, but it gets
+        // closed before this future can wake up and take the finised document.
         self.channel.check_abandoned().ok_or(Error::Abandoned)?;
 
         let mut ret = Poll::Ready(Err(Error::Closed));
-        self.channel.update_channel(|channel| {
+        self.channel.session.update_channel(self.channel.doc_no(), |channel| {
             if let Some(ready_doc) = channel.ready_docs.pop() {
+                // TODO: update `session.send_bytes_total`
                 ret = Poll::Ready(Ok(ready_doc));
             } else {
                 channel.ready_wakers.push(cx.waker().clone());
@@ -404,11 +387,13 @@ enum SendReplyState<R: Route> {
 }
 
 impl<'a, R: Route> Future for SendReplyFuture<'a, R> {
-    type Output = Result<Channel<R>, SendError>;
+    type Output = Result<(usize, Channel<R>), SendError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // NOTE: This code is rather sensitive to invariants related to data representation and handling.
         // It will need to be overhauled anyways when a more thorough application buffering API is implemented.
+        // TODO: There is a race condition where a document is finished, but it gets
+        // closed before this future can wake up and take the finised document.
         match &mut *self {
             Self {
                 channel,
@@ -416,12 +401,12 @@ impl<'a, R: Route> Future for SendReplyFuture<'a, R> {
                 state: SendReplyState::Sending(doc, has_waited),
             } => {
                 match channel.try_send_any(doc.take().unwrap(), || {
-                    Some(ReplyState::Awaiting(buffer.as_mut_ptr_range(), cx.waker().clone()))
+                    ReplyState::Awaiting(Some(buffer.as_mut_ptr_range()), cx.waker().clone())
                 }) {
                     Ok(reply_channel) => {
                         if *has_waited {
                             let waker = channel.session.send_wakers.lock().unwrap().pop_front();
-                            for w in waker {
+                            if let Some(w) = waker {
                                 w.wake();
                             }
                         }
@@ -442,20 +427,18 @@ impl<'a, R: Route> Future for SendReplyFuture<'a, R> {
             }
             Self { state: SendReplyState::Sent(reply_channel), .. } => {
                 let mut ret = Poll::Ready(Err(SendError::Closed));
-                reply_channel.update_channel(|channel| {
-                    match channel.reply_buffer.take() {
-                        Some(ReplyState::Awaiting(buffer, _)) => {
+                reply_channel.session.update_channel(reply_channel.doc_no(), |channel| {
+                    match std::mem::take(&mut channel.reply_buffer) {
+                        ReplyState::Awaiting(buffer, _) => {
                             // This can only occur due to a spurious wake up.
-                            channel.reply_buffer = Some(ReplyState::Awaiting(buffer, cx.waker().clone()));
+                            channel.reply_buffer = ReplyState::Awaiting(buffer, cx.waker().clone());
                             ret = Poll::Pending;
                         }
-                        Some(ReplyState::Recv(channel)) => {
-                            // It is important that this is the only place where `reply_buffers` can be set to `None`.
-                            ret = Poll::Ready(Ok(channel));
+                        ReplyState::Recv(len, channel) => {
+                            // It is important that this is the only place where `reply_buffer` can be set to `None`.
+                            ret = Poll::Ready(Ok((len, channel)));
                         }
-                        None => {
-                            debug_assert!(false, "unreachable");
-                        }
+                        ReplyState::None => {}
                     }
                 });
                 ret

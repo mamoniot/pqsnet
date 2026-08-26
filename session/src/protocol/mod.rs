@@ -31,27 +31,19 @@ pub const VARIANT_SEG_FLAG_IS_CLOSED: u8 = 0x40;
 
 pub const VARIANT_SEG_LEN_MASK: u8 = 0x03;
 pub const VARIANT_SEG_ALLOC_MASK: u8 = 0x30;
+pub const VARIANT_SEG_MIN: u8 = 0x01;
 pub const VARIANT_SEG_MAX: u8 = 0x7F;
-
-pub const VARIANT_ACK_SINGLE: u8 = 0x80;
-pub const VARIANT_ACK_RUN: u8 = 0x81;
 
 /// Has priority over `VARIANT_RESET_DOC`
 ///
 /// Ack eliciting.
-pub const VARIANT_CONTROL_CLOSE: u8 = 0x82;
+pub const VARIANT_CONTROL_RESET: u8 = 0x81;
 pub const VARIANT_CONTROL_FIN: u8 = 0x82;
+pub const VARIANT_CONTROL_REJECT: u8 = 0x83;
+pub const VARIANT_CONTROL_CLOSE: u8 = 0x84;
 
-/// Has priority over `VARIANT_RESET`
-///
-/// Ack eliciting.
-pub const VARIANT_REJECT: u8 = 0x83;
-pub const VARIANT_SKIP_DOC_NO: u8 = 0x82;
-
-/// The length and contents of a document must not change after a reset.
-///
-/// Ack eliciting.
-pub const VARIANT_RESET: u8 = 0x84;
+pub const VARIANT_ACK_SINGLE: u8 = 0x80;
+pub const VARIANT_ACK_RUN: u8 = 0x81;
 
 /* MISC */
 
@@ -62,3 +54,10 @@ pub const MAX_SEG_HEADER_LEN: usize = 1 + 8 + 8 + 8 + 8 + 4;
 pub const MIN_SEG_HEADER_LEN: usize = 1 + 1 + 1;
 pub const MIN_SEG_DATA_LEN: usize = 16;
 pub const MIN_MTU: usize = MAX_SEG_HEADER_LEN + MIN_SEG_DATA_LEN;
+
+pub const HEADER_LEN: usize = 8;
+pub const FOOTER_LEN: usize = 16;
+
+pub const fn resend_ratio(mtu: u32) -> u32 {
+    mtu * 2 / 3
+}
