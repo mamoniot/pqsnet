@@ -22,3 +22,4 @@ buf: buffer
 uid: unique identifier
 rem: remainder
 mem: memory
+app: application

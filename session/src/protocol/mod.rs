@@ -37,9 +37,9 @@ pub const VARIANT_SEG_MAX: u8 = 0x7F;
 /// Has priority over `VARIANT_RESET_DOC`
 ///
 /// Ack eliciting.
-pub const VARIANT_CONTROL_RESET: u8 = 0x81;
 pub const VARIANT_CONTROL_FIN: u8 = 0x82;
-pub const VARIANT_CONTROL_REJECT: u8 = 0x83;
+pub const VARIANT_CONTROL_FIN_DRAIN: u8 = 0x82;
+pub const VARIANT_CONTROL_FIN_PARENT_CLOSED: u8 = 0x82;
 pub const VARIANT_CONTROL_CLOSE: u8 = 0x84;
 
 pub const VARIANT_ACK_SINGLE: u8 = 0x80;

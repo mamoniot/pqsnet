@@ -48,3 +48,4 @@ Secure, flow controlled, asynchronous, hierarchical document transfer protocol
 - Congestion window recovery on spurious congestion event.
 - Metrics
 - Tracing
+- Reduce and compress repeative code (Until the architecture is settled this is not worth doing)

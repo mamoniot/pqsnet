@@ -9,6 +9,10 @@ use smallvec::SmallVec;
 
 use crate::session::{ChannelState, DocNo, RecvDocState, ReplyState, Route, SendDoc, Session};
 
+const FLAG_IS_CLOSED: u64 = 1u64.reverse_bits();
+const FLAG_HAS_SPECIAL_PARENT: u64 = 2u64.reverse_bits();
+const DOC_NO_MASK: u64 = u64::MAX >> 2;
+
 pub struct Channel<R: Route> {
     session: Session<R>,
     doc_no_tagged: u64,
@@ -38,22 +42,38 @@ pub enum TrySendError {
 }
 
 impl<R: Route> Channel<R> {
+    /// This function assumes that the the channels internal state will be updated by the caller,
+    /// especially `ref_count`.
+    pub(crate) fn new(session: &Session<R>, doc_no: DocNo, has_special_parent: bool, is_closed: bool) -> Self {
+        Self {
+            session: session.clone(),
+            doc_no_tagged: doc_no | (has_special_parent as u64 * FLAG_HAS_SPECIAL_PARENT) | (is_closed as u64 * FLAG_IS_CLOSED),
+        }
+    }
     /// We do not bother updating the channel in memory if the session is abandoned. The keep
     /// alive system is responsible for cleaning up the memory of abandoned sessions.
-    fn check_abandoned(&self) -> Option<()> {
-        (self.session.send_bytes_max.load(Ordering::Relaxed) > 0).then_some(())
+    fn check_basic(&self) -> Result<(), Error> {
+        if self.session.send_bytes_max.load(Ordering::Relaxed) > 0 {
+            if self.doc_no_tagged & FLAG_IS_CLOSED > 0 {
+                Err(Error::Closed)
+            } else {
+                Ok(())
+            }
+        } else {
+            Err(Error::Abandoned)
+        }
     }
 
     pub fn parent_was_local(&self) -> bool {
         (self.doc_no_tagged & 1 > 0) == self.session.is_initiator
     }
 
-    pub fn parent_is_special(&self) -> bool {
-        self.doc_no_tagged & !(DocNo::MAX >> 1) > 0
+    pub fn has_special_parent(&self) -> bool {
+        self.doc_no_tagged & FLAG_HAS_SPECIAL_PARENT > 0
     }
 
     pub fn doc_no(&self) -> DocNo {
-        self.doc_no_tagged & (DocNo::MAX >> 1)
+        self.doc_no_tagged & DOC_NO_MASK
     }
 
     pub async fn recv(&self) -> Result<RecvDocData<R>, Error> {
@@ -61,7 +81,7 @@ impl<R: Route> Channel<R> {
     }
 
     pub fn try_recv(&self) -> Result<Option<RecvDocData<R>>, Error> {
-        self.check_abandoned().ok_or(Error::Abandoned)?;
+        self.check_basic()?;
 
         let mut ret = Err(Error::Closed);
         self.session.update_channel(self.doc_no(), |channel| {
@@ -165,7 +185,7 @@ impl<R: Route> Channel<R> {
 
     /// Returns true when `flush_parent` would block.
     pub fn status(&self) -> Result<bool, Error> {
-        self.check_abandoned().ok_or(Error::Abandoned)?;
+        self.check_basic()?;
 
         let doc_no = self.doc_no();
         if self.parent_was_local() {
@@ -235,7 +255,7 @@ impl<R: Route> Channel<R> {
     }
 
     pub fn close(&self) -> Result<(), Error> {
-        self.check_abandoned().ok_or(Error::Abandoned)?;
+        self.check_basic()?;
 
         self.close_if(|_| true)
     }
@@ -245,6 +265,7 @@ impl<R: Route> Clone for Channel<R> {
     fn clone(&self) -> Self {
         // Channel cloning is infallible even if the channel is closed.
         // Closed channels clone to more closed channels.
+        // TODO: check if closed and set flag.
         self.session.update_channel(self.doc_no(), |channel| channel.ref_count += 1);
         Self {
             session: self.session.clone(),
@@ -255,6 +276,18 @@ impl<R: Route> Clone for Channel<R> {
 
 impl<R: Route> Drop for Channel<R> {
     fn drop(&mut self) {
+        // TODO: Make channels wait until all pending child docs are sent before closing.
+        // So the channel should only close after we receive a fin or reject for every child doc.
+        // Channels without pending child docs can be closed immediate, since recv docs cannot be
+        // received without a channel for the application to await on. All recv docs would be
+        // rejected in that case. There is an issue where recv docs do not check the status of
+        // their parent until the doc is finished, so recv child docs that will be rejected can still
+        // waste bandwidth. Can this be fixed?
+
+        // Solution: The receiver may close a channel at any time, when the sender receives the
+        // close control frame it implicitly also rejects all of that channel's immediate children.
+        // The sender should behave as though a reject was received on all immediate children and
+        // stop transmitting them.
         let _ = self.close_if(|channel| {
             channel.ref_count -= 1;
             channel.ref_count == 0
@@ -356,7 +389,7 @@ impl<'a, R: Route> Future for RecvFuture<'a, R> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // TODO: There is a race condition where a document is finished, but it gets
         // closed before this future can wake up and take the finised document.
-        self.channel.check_abandoned().ok_or(Error::Abandoned)?;
+        self.channel.check_basic()?;
 
         let mut ret = Poll::Ready(Err(Error::Closed));
         self.channel.session.update_channel(self.channel.doc_no(), |channel| {

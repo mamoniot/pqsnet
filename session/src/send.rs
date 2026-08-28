@@ -275,7 +275,7 @@ impl<R: Route> Session<R> {
 
                 entry.needs_send_control = false;
                 let mut variant = entry.channel.is_none() as u8 * VARIANT_CONTROL_CLOSE;
-                variant |= (!matches!(entry.doc, RecvDocState::Recv(..))) as u8 * VARIANT_CONTROL_FIN;
+                variant |= (!matches!(entry.doc, RecvDocState::Active(..))) as u8 * VARIANT_CONTROL_FIN;
                 drop(entry);
 
                 if packet.append_control(variant, doc_no) {
