@@ -2,7 +2,7 @@ use bytes::Bytes;
 use smallvec::SmallVec;
 
 use crate::{
-    ack_runs::encode, protocol::*, send::SentPayload, session::{DocNo, Route, SendDoc, Session}, varint::*,
+    ack_runs::encode, application_layer::Route, protocol::*, send::SentPayload, session::{DocNo, SendDoc, Session}, varint::*,
 };
 
 pub struct Segment {
@@ -30,7 +30,12 @@ pub struct PacketBuilder {
 }
 
 impl Segment {
-    pub(crate) fn try_new(doc_no: DocNo, doc: &mut SendDoc, is_closed: bool, remaining_cap: usize) -> Result<Self, bool> {
+    pub(crate) fn try_new(
+        doc_no: DocNo,
+        doc: &mut SendDoc,
+        is_closed: bool,
+        remaining_cap: usize,
+    ) -> Result<Self, bool> {
         if doc.next_seg_off >= doc.data.len() {
             return Err(false);
         }
@@ -244,7 +249,7 @@ impl PacketBuilder {
 
 impl<R: Route> Session<R> {
     pub(crate) fn send_now(&self, mut packet: PacketBuilder, now: f64) {
-    // TODO: This function needs to be retouched.
+        // TODO: This function needs to be retouched.
         // Make space for the footer (auth tag).
         packet.buf.extend_from_slice(&[0; FOOTER_LEN]);
 
@@ -285,7 +290,6 @@ impl<R: Route> Session<R> {
             resend_len: packet.resend_len,
         };
         self.transmissions.packet_queue.lock().unwrap().push_back(payload);
-
 
         let _todo = self.route.send(&packet.buf[..]);
     }

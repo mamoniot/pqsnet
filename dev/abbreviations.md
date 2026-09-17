@@ -23,3 +23,7 @@ uid: unique identifier
 rem: remainder
 mem: memory
 app: application
+init: initialize
+ctx: context
+min: minimum
+max: maximum

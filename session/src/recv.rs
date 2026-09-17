@@ -1,10 +1,17 @@
+use std::{
+    sync::{MutexGuard, atomic::Ordering},
+    task::Waker,
+};
+
 use smallvec::SmallVec;
+use tracing::*;
 
-use crate::{channel::{Channel, RecvDocData}, protocol::*, session::{ChannelState, DocMem, OpenChannel, RecvDoc, RecvDocState, RecvError, ReplyState, Route, Session}, varint::*};
-
-
-
-
+use crate::{
+    application_layer::Route, protocol::*, session::{
+        DocMem, DocNo, OpenChannel, RecvDoc, RecvDocInner, RecvDocState, RecvError, ReplyState, Session,
+        UnfinishedRecvDoc, UnreleasedChannel,
+    }, varint::*,
+};
 
 impl<R: Route> Session<R> {
     /// This function returns `true` only if the document has been fully populated by recv segs.
@@ -51,12 +58,153 @@ impl<R: Route> Session<R> {
         Ok(doc.total_recv == doc_len)
     }
 
+    /// It is the caller's responsibility to guarantee that every portion of the document
+    /// has been written to by all of the sender's segments.
+    fn fin_doc(&self, doc_no: DocNo, mut entry: MutexGuard<RecvDocInner>) -> Result<(), RecvError> {
+        // The document is completed and needs to be finished now.
+        let doc_state = std::mem::replace(&mut entry.doc, RecvDocState::Finishing(Default::default()));
+        // The mutex is held so this state cannot change.
+        let RecvDocState::Active(doc) = doc_state else {
+            unreachable!();
+        };
+
+        let Some(parent_no) = doc.parent_no else {
+            // A completed doc must always have a parent.
+            // The first segment (`off == 0`) must contain it.
+            return Err(RecvError::Invalid);
+        };
+
+        if let Some(channel) = &mut entry.channel {
+            // The ref count has been incremented, we have to be careful to not leak it.
+            channel.ref_count += 1;
+        }
+        let is_closed = entry.channel.is_none();
+        drop(entry);
+
+        // Past this point this function needs to guarantee that something takes ownership of this
+        // doc, that this doc is fin-closed or that the session is abandoned.
+
+        // This function causes the given channel to take ownership of this unfinished doc.
+        let post_to_channel = |channel: &mut OpenChannel, mem: DocMem| -> Option<Waker> {
+            match mem {
+                DocMem::Simple(buf) => {
+                    // It is the caller's responsibility to guarantee that every portion of the
+                    // document has been written to by all of the sender's segments.
+                    let buf = unsafe { buf.assume_init() };
+                    channel.ready_docs.push(UnfinishedRecvDoc {
+                        buf,
+                        doc_no,
+                        has_special_parent: doc.has_special_parent,
+                        is_closed,
+                    });
+                    channel.ready_wakers.pop()
+                }
+                DocMem::ReplyBuf(_) => {
+                    let new_state = ReplyState::Recv(
+                        doc.total_recv,
+                        UnreleasedChannel {
+                            doc_no,
+                            has_special_parent: doc.has_special_parent,
+                            is_closed,
+                        },
+                    );
+                    if let ReplyState::Awaiting(_, w) = std::mem::replace(&mut channel.reply_buffer, new_state) {
+                        Some(w)
+                    } else {
+                        // Since we `take` the pointer range when creating this `ReplyBuf`
+                        // this `ReplyBuf` must be unique and no other thread will be able
+                        // to change the reply state.
+                        unreachable!();
+                    }
+                }
+            }
+        };
+
+        // Get the doc's parent to find the recv channel.
+        if (parent_no & 1 > 0) == self.is_initiator {
+            // Document number is sending.
+            let send_idx = ((parent_no >> 1) % self.send_table.len() as u64) as usize;
+            let mut entry = self.send_table[send_idx].lock.lock().unwrap();
+            if entry.doc_no == parent_no
+                && let Some(channel) = &mut entry.channel
+            {
+                let waker = post_to_channel(channel, doc.mem);
+                drop(entry);
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+                Ok(())
+            } else if entry.doc_no >= parent_no {
+                // Assuming that the sender is well-behaved and this doc has an existing parent,
+                // that parent must have been finished and closed, since this slot has a doc no
+                // greater than `parent_no`. So we need to notify the sender that this doc is
+                // finished but its parent was closed.
+                // TODO: provide a more reliable source of the doc len.
+                self.drop_unfinished_recv_doc(doc_no, doc.total_recv);
+                Ok(())
+            } else {
+                // `parent_no` is ahead of the latest doc no in this slot, so there cannot
+                // exist a doc with a doc no equal to `parent_no`. This is not allowed, all docs
+                // must have existing parents.
+                Err(RecvError::Invalid)
+            }
+        } else {
+            // Document number is receiving.
+            let recv_idx = ((parent_no >> 1) % self.recv_table.len() as u64) as usize;
+            let mut entry = self.recv_table[recv_idx].lock.lock().unwrap();
+            if entry.doc_no == parent_no
+                && let Some(channel) = &mut entry.channel
+            {
+                let waker = post_to_channel(channel, doc.mem);
+                drop(entry);
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+                Ok(())
+            } else if entry.doc_no >= parent_no {
+                // Assuming that the sender is well-behaved and this doc has an existing parent,
+                // that parent must have been finished and closed, since this slot has a doc no
+                // greater than `parent_no`. So we need to notify the sender that this doc is
+                // finished but its parent was closed.
+                self.drop_unfinished_recv_doc(doc_no, doc.total_recv);
+                Ok(())
+            } else if entry.doc.slot_is_fin() && entry.orphans_expected_parent_no.is_none_or(|p| p == parent_no) {
+                // The specified parent may not have arrived yet. We assume that the sender
+                // is well-behaved, and thus the parent must not have arrived yet. So
+                // this doc is temporarily an orphan while we wait for its parent to arrive.
+                let DocMem::Simple(buf) = doc.mem else {
+                    // `mem` cannot have a different state because it is only set to a different
+                    // state if it has an already received parent.
+                    unreachable!()
+                };
+                // It is the caller's responsibility to guarantee that every portion of the document
+                // has been written to by all of the sender's segments.
+                let buf = unsafe { buf.assume_init() };
+                entry.orphans_expected_parent_no = Some(parent_no);
+                entry.adoptable_orphans.push(UnfinishedRecvDoc {
+                    buf,
+                    doc_no,
+                    has_special_parent: doc.has_special_parent,
+                    is_closed,
+                });
+                Ok(())
+            } else {
+                // `parent_no` is ahead of the latest doc no in this slot and we are certain
+                // that it cannot be an orphan. So there cannot exist a doc with a doc no equal
+                // to `parent_no`. This is not allowed, all docs must have existing parents.
+                Err(RecvError::Invalid)
+            }
+        }
+    }
+
+    /// If this returns `RecvError::Invalid`, the caller is expected to abandon this session.
     fn recv_seg(&self, variant: u8, packet: &mut [u8], i: &mut usize) -> Result<(), RecvError> {
+        /* SEGMENT PARSING */
+
         let has_special_parent = variant & VARIANT_SEG_FLAG_HAS_SPECIAL_PARENT > 0;
         let has_doc_len = variant & VARIANT_SEG_FLAG_HAS_DOC_LEN > 0;
         let is_single_seg = variant & VARIANT_SEG_FLAG_IS_SINGLE_SEG > 0;
         let is_first_segment = variant & VARIANT_SEG_FLAG_IS_FIRST > 0;
-        // TODO: handle closing on segments.
         let is_closed = variant & VARIANT_SEG_FLAG_IS_CLOSED > 0;
         let variant_len = variant & VARIANT_SEG_LEN_MASK;
         let mut doc_len = None;
@@ -68,7 +216,13 @@ impl<R: Route> Session<R> {
             doc_len = Some(varusize_try_read(packet, i).ok_or(RecvError::Invalid)?);
         }
         if has_special_parent || is_first_segment {
-            parent_no = Some(varu64_try_read(packet, i).ok_or(RecvError::Invalid)?);
+            let p = varu64_try_read(packet, i).ok_or(RecvError::Invalid)?;
+            // NOTE: This is one of the only places that asserts that doc numbers must increase.
+            // Parent docs must be older than child docs. Older docs have smaller doc numbers.
+            if p >= doc_no {
+                return Err(RecvError::Invalid);
+            }
+            parent_no = Some(p);
         }
         if !is_first_segment {
             seg_off = varusize_try_read(packet, i).ok_or(RecvError::Invalid)?;
@@ -104,15 +258,12 @@ impl<R: Route> Session<R> {
             doc_len.get_or_insert(seg.len());
         }
 
+        /* DOCUMENT LOOKUP */
+
         if (doc_no & 1 > 0) == self.is_initiator {
             // Document number is sending. Segments cannot be received on sending docs.
-            return Err(RecvError::Invalid)
+            return Err(RecvError::Invalid);
         }
-        // We need to handle any remaining wakers on any channel we closed, after we drop the lock.
-        // This must be dropped after `entry` to prevent deadlock.
-        // TODO: test drop ordering to be sure that this will drop correctly.
-        let mut closed_channel = None;
-        let mut recv_flushers = None;
 
         // Document number is receiving.
         let recv_idx = ((doc_no >> 1) % self.recv_table.len() as u64) as usize;
@@ -120,11 +271,13 @@ impl<R: Route> Session<R> {
         let mut entry = slot.lock.lock().unwrap();
 
         if entry.doc_no == doc_no {
+            /* DOCUMENT UPDATE */
+
             // We handle channel closure right away, semi-independent of doc handling. It is valid
             // for a sender to close a doc by sending some segment with the close flag set.
-            if is_closed && let ChannelState::Open(channel) = std::mem::take(&mut entry.channel) {
-                closed_channel = Some(channel);
-            }
+            // `OpenChannel` structs have ownership of resources that need explicit dropping.
+            // Past this point this function must not return without handling `closed_channel`.
+            let closed_channel = if is_closed {entry.channel.take()} else {None};
 
             while let RecvDocState::ActiveReserved = &entry.doc {
                 entry = slot.condvar.wait(entry).unwrap();
@@ -132,134 +285,68 @@ impl<R: Route> Session<R> {
             let RecvDocState::Active(doc) = &mut entry.doc else {
                 // This must be a delayed packet, ignore it.
                 // TODO: tracing & metrics.
+                drop(entry);
+                self.drop_closed_channel(closed_channel);
                 return Ok(());
             };
 
-            // NOTE: we do not validate `doc_len` or `parent_no`. The values on
+            // We do not validate `doc_len` or `parent_no`. The values on
             // the first recv segment are considered authoritative.
-            if !self.recv_doc(doc, seg_off, seg)? {
-                // The doc is not complete so there is nothing to do.
-                // TODO: tracing & metrics.
-                return Ok(());
-            }
-
-            let Some(parent_no) = doc.parent_no else {
-                // A completed doc must always have a parent.
-                // The first segment (`off == 0`) must contain it.
-                todo!("abandon");
-            };
-
-            // The document is completed and needs to be finished now.
-            let doc_state = std::mem::replace(&mut entry.doc, RecvDocState::Finishing(Default::default()));
-            // The mutex is held so this state cannot change.
-            let RecvDocState::Active(doc) = doc_state else {
-                unreachable!();
-            };
-
-            if let ChannelState::Open(channel) = &mut entry.channel {
-                // The ref count has been incremented, we have to be careful to not leak it.
-                channel.ref_count += 1;
-            }
-            let is_closed = entry.channel.is_closed();
-            drop(entry);
-            let new_channel = Channel::new(self, doc_no, doc.has_special_parent, is_closed);
-
-            // TODO: handle waker.
-            let mut waker = None;
-            let mut post_to_channel = |channel: &mut OpenChannel<R>, mem: DocMem, new_channel: Channel<R>| {
-                match mem {
-                    DocMem::Simple(buf) => {
-                        let buf = unsafe {
-                            buf.assume_init()
-                        };
-                        channel.ready_docs.push(RecvDocData::Doc(buf, new_channel));
-                        waker = channel.ready_wakers.pop();
-                    }
-                    DocMem::ReplyBuf(_) => {
-                        let pre_state = std::mem::replace(&mut channel.reply_buffer, ReplyState::Recv(doc.total_recv, new_channel));
-                        if let ReplyState::Awaiting(_, w) = pre_state {
-                            waker = Some(w);
-                        } else {
-                            // Since we `take` the pointer range when creating this `ReplyBuf`
-                            // this `ReplyBuf` must be unique and no other thread will be able
-                            // to change the reply state.
-                            debug_assert!(false, "unreachable");
-                        }
-                    }
+            let ret = match self.recv_doc(doc, seg_off, seg) {
+                Ok(false) => {
+                    drop(entry);
+                    Ok(())
+                }
+                Ok(true) => self.fin_doc(doc_no, entry),
+                Err(e) => {
+                    drop(entry);
+                    Err(e)
                 }
             };
 
-            // Get the doc's parent to find the recv channel.
-            if (parent_no & 1 > 0) == self.is_initiator {
-                // Document number is sending.
-                let send_idx = ((parent_no >> 1) % self.send_table.len() as u64) as usize;
-                let mut entry = self.send_table[send_idx].lock.lock().unwrap();
-                if entry.doc_no == parent_no
-                    && let ChannelState::Open(channel) = &mut entry.channel
-                {
-                    post_to_channel(channel, doc.mem, new_channel);
-                } else if entry.doc_no > parent_no {
-                    // Assuming that the sender is well-behaved and this doc has an existing parent,
-                    // that parent must have been finished and closed, since this slot has a doc no
-                    // greater than `parent_no`. So we need to notify the sender that this doc is
-                    // finished but its parent was closed.
-                    // self.schedule_send_control(VARIANT_CONTROL_FIN_PARENT_CLOSED, doc_no);
-                    todo!()
-                } else {
-                    // `parent_no` is ahead of the latest doc no in this slot, so there cannot
-                    // exist a doc with a doc no equal to `parent_no`. This is not allowed, all docs
-                    // must have existing parents.
-                    todo!("abandon");
-                }
-            } else {
-                // Document number is receiving.
-                let recv_idx = ((parent_no >> 1) % self.recv_table.len() as u64) as usize;
-                let mut entry = self.recv_table[recv_idx].lock.lock().unwrap();
-                if entry.doc_no == parent_no
-                    && let ChannelState::Open(channel) = &mut entry.channel
-                {
-                    post_to_channel(channel, doc.mem, new_channel);
-                } else if entry.doc_no > parent_no {
-                    // Assuming that the sender is well-behaved and this doc has an existing parent,
-                    // that parent must have been finished and closed, since this slot has a doc no
-                    // greater than `parent_no`. So we need to notify the sender that this doc is
-                    // finished but its parent was closed.
-                    // self.schedule_send_control(VARIANT_CONTROL_FIN_PARENT_CLOSED, doc_no);
-                    todo!()
-                } else if entry.doc.slot_is_free() && entry.orphans_expected_parent_no.is_none_or(|p| p == parent_no) {
-                    // The specified parent may not have arrived yet. We assume that the sender
-                    // is well-behaved, and thus the parent must not have arrived yet. So
-                    // this doc is temporarily an orphan while we wait for its parent to arrive.
-                    let DocMem::Simple(doc) = doc.mem else {
-                        // `mem` cannot have a different state because it is only set to a different
-                        // state if it has an already received parent.
-                        unreachable!()
-                    };
-                    let doc = unsafe {
-                        doc.assume_init()
-                    };
-                    entry.orphans_expected_parent_no = Some(parent_no);
-                    entry.adoptable_orphans.push(RecvDocData::Doc(doc, new_channel));
-                } else {
-                    // `parent_no` is ahead of the latest doc no in this slot and we are certain
-                    // that it cannot be an orphan. So there cannot exist a doc with a doc no equal
-                    // to `parent_no`. This is not allowed, all docs must have existing parents.
-                    todo!("abandon");
-                }
-            }
+            self.drop_closed_channel(closed_channel);
+            ret
         } else if entry.doc_no < doc_no {
-            // TODO: lockless single-segment document handling.
+            /* DOCUMENT CREATION */
+            // This is the only place that populates a send slot.
+
             let Some(doc_len) = doc_len else {
                 // If first recv seg of a doc does not specify the document length then
                 // it is ignored.
                 return Ok(());
             };
 
-            if !entry.doc.slot_is_free() {
+            if !entry.doc.slot_is_fin() {
                 // The sender must not use the recv slot of a document that is not finished or has
                 // an open channel. They must wait for us to send a fin control frame first.
-                todo!("abandon");
+                return Err(RecvError::Invalid);
             }
+
+            if entry.orphans_expected_parent_no.is_some_and(|p| p != doc_no) {
+                // If this recv slot has adoptable orphans, then the next doc to use this slot
+                // must be their parent.
+                return Err(RecvError::Invalid);
+            }
+
+            // TODO: prove that this load cannot be reordered before an increase.
+            let recv_bytes_max = self.recv_bytes_max.load(Ordering::SeqCst);
+            let res = self
+                .recv_bytes_total
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |b| {
+                    // With a well-behaved peer this update never fails. The ABA problem is not an
+                    // error condition for this increment.
+                    let next_total = b.checked_add(doc_len)?;
+                    (next_total <= recv_bytes_max).then_some(next_total)
+                });
+            if res.is_err() {
+                // The sender is attempting to go above our recv bytes limit. The sender
+                // always know a value for our recv bytes limit that is less than the current value,
+                // so this can only happen if the sender is misbehaving.
+                return Err(RecvError::Invalid);
+            }
+            // Past this point, we assume that either the doc is being accepted or the session will
+            // be abandoned. If this assumption holds it means we cannot leak the increment we just
+            // made to `recv_bytes_total`
 
             // The sender is responsible for managing our recv slots. When a new doc populates a
             // recv slot, this is implicitly treated as us receiving a `fin-ack` and a `close` for
@@ -269,47 +356,46 @@ impl<R: Route> Session<R> {
 
             // Mark this recv slot as `ActiveReserved` and process its state as if a `fin-ack` was
             // recv for the previous doc.
+            // `recv_flushers` has a drop methods that will guarantee its wakers will be awoken,
+            // but we will explicitly drop them anyways for the sake of clarity.
+            let mut recv_flushers = None;
             if let RecvDocState::Finishing(flushers) = std::mem::replace(&mut entry.doc, RecvDocState::ActiveReserved) {
                 recv_flushers = Some(flushers);
             }
 
-            if entry.orphans_expected_parent_no.is_some_and(|p| p != doc_no) {
-                // If this recv slot has adoptable orphans, then the next doc to use this slot
-                // must be their parent.
-                todo!("abandon");
-            }
-            // Adopt any existing orphans.
+            // Adopt any existing orphans. `orphans_expected_parent_no` was checked above.
             let mut ready_docs = SmallVec::new();
             std::mem::swap(&mut ready_docs, &mut entry.adoptable_orphans);
 
-            // Mark this recv slot as `Open` and process its state as if a `close` was recv for the
-            // previous doc.
-            let new_channel_state = ChannelState::Open(OpenChannel {
-                ref_count: 0,
-                ready_wakers: SmallVec::new(),
-                ready_docs,
-                reply_buffer: Default::default(),
-            });
-            if let ChannelState::Open(channel) = std::mem::replace(&mut entry.channel, new_channel_state) {
-                closed_channel = Some(channel);
-            }
+            // Something must take ownership of the orphan docs or they must be closed.
+            // Past this point this function must not return without handling `closed_orphans`.
+            let mut closed_orphans = SmallVec::new();
+            // `OpenChannel` structs have ownership of resources that need explicit dropping.
+            // Past this point this function must not return without handling `closed_channel`.
+            let closed_channel;
+            if is_closed {
+                closed_orphans = ready_docs;
+                closed_channel = entry.channel.take();
+            } else {
+                closed_channel = entry.channel.replace(OpenChannel {
+                    ref_count: 0,
+                    ready_wakers: SmallVec::new(),
+                    ready_docs,
+                    reply_buffer: Default::default(),
+                })
+            };
 
-            // This doc slot is fully initialized and can be safely replaced with the
-            // new doc.
+            // If this doc has a special parent we must look it up before allocating the doc.
             let mut mem = None;
+            // From this point on we cannot return without explicitly handling `needs_notify`.
             let mut needs_notify = false;
             if has_special_parent && let Some(parent_no) = parent_no {
-                // If this doc has a special parent we must look up that parent before allocating the doc.
-                if parent_no >= doc_no {
-                    // Parent docs must be older than child docs.
-                    return Err(RecvError::Invalid);
-                }
                 needs_notify = true;
                 // We must drop the lock to prevent deadlock when looking up a document's parent.
-                drop(entry);
-
                 // We cannot hold two locks into the send/recv tables at the same time.
                 // This is why we set the `RecvDocState` to reserved, so we can unlock.
+                drop(entry);
+
                 let mut has_open_parent = false;
                 self.update_channel(parent_no, |channel| {
                     has_open_parent = true;
@@ -320,6 +406,9 @@ impl<R: Route> Session<R> {
             }
             debug_assert!(matches!(&entry.doc, RecvDocState::ActiveReserved));
 
+            // This doc slot is fully initialized and can be safely replaced with the new doc.
+            // OPTIMIZATION: If this doc is a single segment, we do not need to track `set_segs` or
+            // `total_recv`. Eliminate them in that case.
             let mut doc = RecvDoc {
                 mem: mem.unwrap_or_else(|| DocMem::Simple(Box::new_uninit_slice(doc_len))),
                 total_recv: 0,
@@ -327,40 +416,63 @@ impl<R: Route> Session<R> {
                 has_special_parent,
                 parent_no,
             };
-            if self.recv_doc(&mut doc, seg_off, seg)? {
-                todo!();
-            }
 
-            entry.doc = RecvDocState::Active(doc);
-            drop(entry);
+            let ret = match self.recv_doc(&mut doc, seg_off, seg) {
+                Ok(false) => {
+                    entry.doc = RecvDocState::Active(doc);
+                    drop(entry);
+                    Ok(())
+                }
+                Ok(true) => {
+                    // `fin_doc` expects `entry.doc == RecvDocState::Active(..)`
+                    entry.doc = RecvDocState::Active(doc);
+                    self.fin_doc(doc_no, entry)
+                }
+                Err(e) => {
+                    drop(entry);
+                    Err(e)
+                }
+            };
 
-            // Now that the lock is dropped we can send notifications to any waiting threads/tasks.
             if needs_notify {
                 slot.condvar.notify_all();
             }
+            drop(recv_flushers);
+            for orphan in closed_orphans {
+                self.drop_unfinished_recv_doc(orphan.doc_no, orphan.buf.len());
+            }
+            self.drop_closed_channel(closed_channel);
+            ret
+        } else {
+            // This must be a delayed packet, ignore it.
+            // TODO: tracing & metrics.
+            Ok(())
         }
-        Ok(())
     }
 
-    pub(crate) fn recv(&self, packet: &mut [u8], route: R) -> Result<(), RecvError> {
-        // TODO: Decrypt packet.
+    pub(crate) fn recv(&self, packet: &mut [u8], i: &mut usize, route: R) {
+        // TODO: Decrypt packet.``
 
         let mut ack_eliciting = false;
-        let mut i = 0;
-        while i < packet.len() {
-            let variant = packet[i];
-            i += 1;
+        while *i < packet.len() {
+            let variant = packet[*i];
+            *i += 1;
             match variant {
                 VARIANT_NULL_TERMINATOR => break,
                 VARIANT_SEG_MIN..=VARIANT_SEG_MAX => {
                     ack_eliciting = true;
-                    self.recv_seg(variant, packet, &mut i)?;
+                    let ret = self.recv_seg(variant, packet, i);
+                    if ret.is_err() {
+                        self.abandon();
+                        return;
+                    }
                 }
                 VARIANT_ACK_SINGLE | VARIANT_ACK_RUN => {}
                 VARIANT_PADDING => {}
-                _ => return Err(RecvError::Invalid),
+                _ => {
+                    warn!("received unrecognized frame variant '{variant}'");
+                }
             }
         }
-        Ok(())
     }
 }

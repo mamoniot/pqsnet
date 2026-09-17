@@ -1,16 +1,13 @@
 use std::{
     collections::VecDeque,
-    sync::{
-        Mutex,
-        atomic::AtomicU64,
-    },
+    sync::{Mutex, atomic::AtomicU64},
 };
 
 use dashmap::DashSet;
 use smallvec::SmallVec;
 
 use crate::{
-    ack_runs::decode, packet_builder::{ElicitingFrame, PacketBuilder, Segment}, protocol::*, session::{RecvDocState, RecvError, Route, SendDocInner, Session, Work, WorkInner},
+    ack_runs::decode, application_layer::Route, packet_builder::{ElicitingFrame, PacketBuilder, Segment}, protocol::*, session::{RecvError, SendDocInner, Session, Work, WorkInner},
 };
 
 pub struct SentPayload {
@@ -175,7 +172,7 @@ impl<R: Route> Session<R> {
                     continue;
                 }
 
-                if let SendDocInner { doc: Some(doc), channel, ..} = &mut *entry {
+                if let SendDocInner { doc: Some(doc), channel, .. } = &mut *entry {
                     match Segment::try_new(doc_no, doc, channel.is_none(), packet.remaining_cap()) {
                         Ok(seg) => {
                             // This segment contains a close signal so none others need to be sent.
@@ -218,9 +215,8 @@ impl<R: Route> Session<R> {
                             packet = PacketBuilder::new(mtu);
 
                             let mut entry = self.send_table[send_idx].lock.lock().unwrap();
-                            if let SendDocInner { doc: Some(doc), channel, ..} = &mut *entry {
-                                let Ok(seg) =
-                                    Segment::try_new(doc_no, doc, channel.is_none(), packet.remaining_cap())
+                            if let SendDocInner { doc: Some(doc), channel, .. } = &mut *entry {
+                                let Ok(seg) = Segment::try_new(doc_no, doc, channel.is_none(), packet.remaining_cap())
                                 else {
                                     // If the document had no data, continue. It should not be
                                     // possible for the document to overflow a fresh packet.
@@ -275,7 +271,7 @@ impl<R: Route> Session<R> {
 
                 entry.needs_send_control = false;
                 let mut variant = entry.channel.is_none() as u8 * VARIANT_CONTROL_CLOSE;
-                variant |= (!matches!(entry.doc, RecvDocState::Active(..))) as u8 * VARIANT_CONTROL_FIN;
+                variant |= entry.doc.slot_is_fin() as u8 * VARIANT_CONTROL_FIN;
                 drop(entry);
 
                 if packet.append_control(variant, doc_no) {

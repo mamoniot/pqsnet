@@ -12,6 +12,7 @@ pub fn varu64_len(value: u64) -> usize {
         if value <= VARINT_U32_MAX as u64 { 4 } else { 8 }
     }
 }
+
 pub fn varusize_len(value: usize) -> usize {
     if value <= VARINT_U16_MAX as usize {
         if value <= VARINT_U8_MAX as usize { 1 } else { 2 }
@@ -19,14 +20,15 @@ pub fn varusize_len(value: usize) -> usize {
         if value <= VARINT_U32_MAX as usize { 4 } else { 8 }
     }
 }
+
 pub fn varu32_len(value: u32) -> usize {
     varusize_len(value as usize)
 }
 
-pub fn varu64_write(buf: &mut Vec<u8>, value: u64) {
+pub fn varu64_write(mut buf: impl BufMut, value: u64) {
     if value <= VARINT_U16_MAX as u64 {
         if value <= VARINT_U8_MAX as u64 {
-            buf.push(value as u8);
+            buf.put_u8(value as u8);
         } else {
             buf.put_u16(value as u16 | 0b01 << 14);
         }
@@ -38,10 +40,11 @@ pub fn varu64_write(buf: &mut Vec<u8>, value: u64) {
         }
     }
 }
-pub fn varusize_write(buf: &mut Vec<u8>, value: usize) {
+
+pub fn varusize_write(mut buf: impl BufMut, value: usize) {
     if value <= VARINT_U16_MAX as usize {
         if value <= VARINT_U8_MAX as usize {
-            buf.push(value as u8);
+            buf.put_u8(value as u8);
         } else {
             buf.put_u16(value as u16 | 0b01 << 14);
         }
@@ -53,7 +56,8 @@ pub fn varusize_write(buf: &mut Vec<u8>, value: usize) {
         }
     }
 }
-pub fn varu32_write(buf: &mut Vec<u8>, value: u32) {
+
+pub fn varu32_write(buf: impl BufMut, value: u32) {
     varusize_write(buf, value as usize);
 }
 
@@ -102,3 +106,34 @@ macro_rules! impl_try_read {
 impl_try_read!(varu64_try_read, u64);
 impl_try_read!(varusize_try_read, usize);
 impl_try_read!(varu32_try_read, u32);
+
+pub fn varu30_try_read(buf: &[u8], idx: &mut usize) -> Option<u32> {
+    let i = *idx;
+    if i >= buf.len() {
+        return None;
+    }
+    match buf[i] >> 6 {
+        0b00 => {
+            *idx += 1;
+            Some(buf[i] as u32)
+        }
+        0b01 => {
+            let j = *idx + 2;
+            if j > buf.len() {
+                return None;
+            }
+            *idx = j;
+            Some((u16::from_be_bytes(buf[i..j].try_into().unwrap()) & VARINT_U16_MAX) as u32)
+        }
+        0b10 => {
+            let j = *idx + 4;
+            if j > buf.len() {
+                return None;
+            }
+            *idx = j;
+            Some(u32::from_be_bytes(buf[i..j].try_into().unwrap()) & VARINT_U32_MAX)
+        }
+        0b11 => None,
+        _ => unreachable!(),
+    }
+}

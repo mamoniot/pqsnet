@@ -7,15 +7,23 @@ use std::{
 use bytes::Bytes;
 use smallvec::SmallVec;
 
-use crate::session::{ChannelState, DocNo, RecvDocState, ReplyState, Route, SendDoc, Session};
+use crate::{
+    application_layer::Route, protocol::*, session::{DocNo, OpenChannel, RecvDocState, ReplyState, SendDoc, Session},
+};
 
 const FLAG_IS_CLOSED: u64 = 1u64.reverse_bits();
 const FLAG_HAS_SPECIAL_PARENT: u64 = 2u64.reverse_bits();
 const DOC_NO_MASK: u64 = u64::MAX >> 2;
 
 pub struct Channel<R: Route> {
-    session: Session<R>,
+    pub(crate) session: Session<R>,
     doc_no_tagged: u64,
+}
+
+pub struct ChannelStatus {
+    pub ref_count: usize,
+    pub parent_is_flushed: bool,
+    pub ready_recv_docs: usize,
 }
 
 pub enum RecvDocData<R: Route> {
@@ -47,7 +55,9 @@ impl<R: Route> Channel<R> {
     pub(crate) fn new(session: &Session<R>, doc_no: DocNo, has_special_parent: bool, is_closed: bool) -> Self {
         Self {
             session: session.clone(),
-            doc_no_tagged: doc_no | (has_special_parent as u64 * FLAG_HAS_SPECIAL_PARENT) | (is_closed as u64 * FLAG_IS_CLOSED),
+            doc_no_tagged: doc_no
+                | (has_special_parent as u64 * FLAG_HAS_SPECIAL_PARENT)
+                | (is_closed as u64 * FLAG_IS_CLOSED),
         }
     }
     /// We do not bother updating the channel in memory if the session is abandoned. The keep
@@ -84,8 +94,18 @@ impl<R: Route> Channel<R> {
         self.check_basic()?;
 
         let mut ret = Err(Error::Closed);
-        self.session.update_channel(self.doc_no(), |channel| {
-            ret = Ok(channel.ready_docs.pop());
+        let doc_no = self.doc_no();
+        self.session.update_channel(doc_no, |channel| {
+            ret = Ok(None);
+            if let Some(ready_doc) = channel.ready_docs.pop() {
+                // This store must always be ordered before any new docs are received.
+                // Otherwise the sender may see and act on the decremented `recv_bytes_total` before
+                // the receiver has propagated the decremented `recv_bytes_total` to all cores.
+                self.session.recv_bytes_total.fetch_sub(ready_doc.buf.len(), Ordering::SeqCst);
+                self.session.schedule_send_control(VARIANT_CONTROL_FIN, ready_doc.doc_no);
+
+                ret = Ok(Some(RecvDocData::Doc(ready_doc.buf, Channel::new(&self.session, ready_doc.doc_no, ready_doc.has_special_parent, ready_doc.is_closed))));
+            }
             // TODO: update `session.send_bytes_total`
         });
         ret
@@ -95,11 +115,7 @@ impl<R: Route> Channel<R> {
         SendFuture { channel: self, doc: Some(doc), has_waited: false }.await
     }
 
-    fn try_send_any(
-        &self,
-        doc: Bytes,
-        f: impl FnOnce() -> ReplyState<R>,
-    ) -> Result<Channel<R>, (TrySendError, Bytes)> {
+    fn try_send_any(&self, doc: Bytes, f: impl FnOnce() -> ReplyState) -> Result<Channel<R>, (TrySendError, Bytes)> {
         let session = &self.session;
         // Verify and update sending limits.
         let send_total = session.send_total.fetch_add(1, Ordering::Relaxed);
@@ -135,26 +151,27 @@ impl<R: Route> Channel<R> {
             let doc_no = session.send_doc_no.fetch_add(2, Ordering::Relaxed);
             let send_idx = ((doc_no >> 1) % session.send_table.len() as u64) as usize;
             let mut entry = session.send_table[send_idx].lock.lock().unwrap();
-            if !entry.close_acked || entry.doc.is_some() {
+
+            if entry.channel.is_some() || entry.doc.is_some() {
                 continue;
             }
 
+            // This is the only place that populates a send slot.
             entry.doc_no = doc_no;
             entry.doc = Some(SendDoc {
                 parent_no: doc_no,
                 data: doc,
                 flush_wakers: SmallVec::new(),
-                has_special_parent: self.parent_is_special(),
+                has_special_parent: self.has_special_parent(),
                 has_been_acked: false,
                 next_seg_off: 0,
             });
-            entry.channel = Some(ChannelState {
+            entry.channel = Some(OpenChannel {
                 ref_count: 1,
                 ready_wakers: SmallVec::new(),
                 ready_docs: SmallVec::new(),
                 reply_buffer,
             });
-            entry.close_acked = false;
             entry.needs_send_close = false;
             // A channel with a special parent cannot be created here.
             return Ok(Channel { session: session.clone(), doc_no_tagged: doc_no });
@@ -164,7 +181,11 @@ impl<R: Route> Channel<R> {
         self.try_send_any(doc, Default::default)
     }
 
-    pub async fn send_with_reply_buffer(&self, doc: Bytes, buffer: Pin<&mut [u8]>) -> Result<(usize, Channel<R>), SendError> {
+    pub async fn send_with_reply_buffer(
+        &self,
+        doc: Bytes,
+        buffer: Pin<&mut [u8]>,
+    ) -> Result<(usize, Channel<R>), SendError> {
         SendReplyFuture {
             channel: self,
             buffer,
@@ -191,7 +212,7 @@ impl<R: Route> Channel<R> {
         if self.parent_was_local() {
             // Document number is sending.
             // When flushing a sending doc, we only wake when we are sure the peer has received
-            // the full document.
+            // the full document, aka we receive a fin.
             let send_idx = ((doc_no >> 1) % self.session.send_table.len() as u64) as usize;
             let entry = self.session.send_table[send_idx].lock.lock().unwrap();
 
@@ -202,62 +223,73 @@ impl<R: Route> Channel<R> {
             }
         } else {
             // Document number is receiving.
-            // When flushing a send doc, we only wake when we are sure the peer knows
-            // we have received the full document.
+            // When flushing a recv doc, we only wake when we are sure the peer knows
+            // we have received the full document, aka we have received a fin-ack.
             let recv_idx = ((doc_no >> 1) % self.session.recv_table.len() as u64) as usize;
             let entry = self.session.recv_table[recv_idx].lock.lock().unwrap();
             if entry.doc_no == doc_no && entry.channel.is_some() {
-                Ok(matches!(&entry.doc, RecvDocState::Fin(_)))
+                Ok(matches!(&entry.doc, RecvDocState::Finishing(_)))
             } else {
                 Err(Error::Closed)
             }
         }
     }
 
-    fn close_if(&self, f: impl FnOnce(&mut ChannelState<R>) -> bool) -> Result<(), Error> {
-        // Channel state deletion occurs here.
-        let mut closed_channel = None;
+    /// This function is the only place currently that closes a channel such that an explicit
+    /// close must be sent.
+    fn close_if_inner(&self, f: impl FnOnce(&mut OpenChannel) -> bool) -> Result<(), Error> {
+        let doc_no = self.doc_no();
         let session = &self.session;
 
-        let doc_no = self.doc_no();
-        if self.parent_was_local() {
+        let mut closed_channel = None;
+
+        if (doc_no & 1 > 0) == session.is_initiator {
             // Document number is sending.
             let send_idx = ((doc_no >> 1) % session.send_table.len() as u64) as usize;
             let mut entry = session.send_table[send_idx].lock.lock().unwrap();
             if entry.doc_no == doc_no
                 && let Some(channel) = &mut entry.channel
-                && f(channel) {
-                    closed_channel = entry.channel.take();
-                    entry.needs_send_close = true;
-                }
+                && f(channel)
+            {
+                closed_channel = entry.channel.take();
+                entry.needs_send_close = true;
+            }
         } else {
             // Document number is receiving.
             let recv_idx = ((doc_no >> 1) % session.recv_table.len() as u64) as usize;
             let mut entry = session.recv_table[recv_idx].lock.lock().unwrap();
             if entry.doc_no == doc_no
                 && let Some(channel) = &mut entry.channel
-                && f(channel) {
-                    closed_channel = entry.channel.take();
-                    entry.needs_send_control = true;
-                }
+                && f(channel)
+            {
+                closed_channel = entry.channel.take();
+                entry.needs_send_control = true;
+            }
         }
 
-        if let Some(channel) = closed_channel {
-            self.session.send_queue.lock().unwrap().push_front(self.doc_no());
-            for waker in channel.ready_wakers {
-                waker.wake();
-            }
-            channel.reply_buffer.wake();
+        let ret = if closed_channel.is_some() {
+            // TODO: This could be made more efficient and context aware.
+            session.schedule_send_control(VARIANT_CONTROL_CLOSE, doc_no);
             Ok(())
         } else {
             Err(Error::Closed)
-        }
+        };
+
+        session.drop_closed_channel(closed_channel);
+
+        ret
     }
 
     pub fn close(&self) -> Result<(), Error> {
         self.check_basic()?;
 
-        self.close_if(|_| true)
+        self.close_if_inner(|_| true)
+    }
+
+    pub fn close_if(&self, f: impl FnOnce() -> bool) -> Result<(), Error> {
+        self.check_basic()?;
+
+        self.close_if_inner(|_| f())
     }
 }
 
@@ -266,7 +298,8 @@ impl<R: Route> Clone for Channel<R> {
         // Channel cloning is infallible even if the channel is closed.
         // Closed channels clone to more closed channels.
         // TODO: check if closed and set flag.
-        self.session.update_channel(self.doc_no(), |channel| channel.ref_count += 1);
+        self.session
+            .update_channel(self.doc_no(), |channel| channel.ref_count += 1);
         Self {
             session: self.session.clone(),
             doc_no_tagged: self.doc_no_tagged,
@@ -288,7 +321,7 @@ impl<R: Route> Drop for Channel<R> {
         // close control frame it implicitly also rejects all of that channel's immediate children.
         // The sender should behave as though a reject was received on all immediate children and
         // stop transmitting them.
-        let _ = self.close_if(|channel| {
+        let _ = self.close_if_inner(|channel| {
             channel.ref_count -= 1;
             channel.ref_count == 0
         });
@@ -347,14 +380,13 @@ impl<'a, R: Route> Future for FlushFuture<'a, R> {
             let doc_no = self.channel.doc_no();
             if self.channel.parent_was_local() {
                 // Document number is sending.
-                // When flushing a sending doc, we only wake when we are sure the peer has received
+                // When flushing a send doc, we only wake when we are sure the peer has received
                 // the full document.
                 let send_idx = ((doc_no >> 1) % session.send_table.len() as u64) as usize;
                 let mut entry = session.send_table[send_idx].lock.lock().unwrap();
 
                 if entry.doc_no == doc_no
-                    && entry.
-                    channel.is_some()
+                    && entry.channel.is_some()
                     && let Some(doc) = &mut entry.doc
                 {
                     doc.flush_wakers.push(cx.waker().clone());
@@ -362,15 +394,15 @@ impl<'a, R: Route> Future for FlushFuture<'a, R> {
                 }
             } else {
                 // Document number is receiving.
-                // When flushing a send doc, we only wake when we are sure the peer knows
-                // we have received the full document.
+                // When flushing a recv doc, we only wake when we are sure the peer knows
+                // we have received the full document, aka we have received a fin-ack.
                 let recv_idx = ((doc_no >> 1) % session.recv_table.len() as u64) as usize;
                 let mut entry = session.recv_table[recv_idx].lock.lock().unwrap();
                 if entry.doc_no == doc_no
                     && entry.channel.is_some()
-                    && let RecvDocState::Fin(flush_wakers) = &mut entry.doc
+                    && let RecvDocState::Finishing(flush_wakers) = &mut entry.doc
                 {
-                    flush_wakers.push(cx.waker().clone());
+                    flush_wakers.0.push(cx.waker().clone());
                     return Poll::Pending;
                 }
             }
@@ -394,8 +426,12 @@ impl<'a, R: Route> Future for RecvFuture<'a, R> {
         let mut ret = Poll::Ready(Err(Error::Closed));
         self.channel.session.update_channel(self.channel.doc_no(), |channel| {
             if let Some(ready_doc) = channel.ready_docs.pop() {
-                // TODO: update `session.send_bytes_total`
-                ret = Poll::Ready(Ok(ready_doc));
+                // TODO: Deduplicate this code.
+                let session = &self.channel.session;
+                session.recv_bytes_total.fetch_sub(ready_doc.buf.len(), Ordering::SeqCst);
+                session.schedule_send_control(VARIANT_CONTROL_FIN, ready_doc.doc_no);
+
+                ret = Poll::Ready(Ok(RecvDocData::Doc(ready_doc.buf, Channel::new(session, ready_doc.doc_no, ready_doc.has_special_parent, ready_doc.is_closed))));
             } else {
                 channel.ready_wakers.push(cx.waker().clone());
                 ret = Poll::Pending;
@@ -458,9 +494,10 @@ impl<'a, R: Route> Future for SendReplyFuture<'a, R> {
                     Err((TrySendError::TooLarge, _)) => Poll::Ready(Err(SendError::TooLarge)),
                 }
             }
-            Self { state: SendReplyState::Sent(reply_channel), .. } => {
+            Self { state: SendReplyState::Sent(reply_channel), channel: parent_channel, .. } => {
                 let mut ret = Poll::Ready(Err(SendError::Closed));
                 reply_channel.session.update_channel(reply_channel.doc_no(), |channel| {
+                    // TODO: Analyze this section for errors.
                     match std::mem::take(&mut channel.reply_buffer) {
                         ReplyState::Awaiting(buffer, _) => {
                             // This can only occur due to a spurious wake up.
@@ -468,8 +505,7 @@ impl<'a, R: Route> Future for SendReplyFuture<'a, R> {
                             ret = Poll::Pending;
                         }
                         ReplyState::Recv(len, channel) => {
-                            // It is important that this is the only place where `reply_buffer` can be set to `None`.
-                            ret = Poll::Ready(Ok((len, channel)));
+                            ret = Poll::Ready(Ok((len, Channel::new(&parent_channel.session, channel.doc_no, channel.has_special_parent, channel.is_closed))));
                         }
                         ReplyState::None => {}
                     }

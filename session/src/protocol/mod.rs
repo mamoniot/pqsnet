@@ -1,4 +1,11 @@
-/* PAYLOAD FRAME VARIANTS */
+/* HANDSHAKE PAYLOAD */
+
+use crate::{context::SocketId, varint::VARINT_U8_MAX};
+
+pub const HANDSHAKE_PAYLOAD_LEN_MAX: usize = 64;
+pub const HANDSHAKE_HEADER_LEN: usize = 8;
+
+/* FRAME VARIANTS */
 
 pub const VARIANT_NULL_TERMINATOR: u8 = 0x0;
 pub const VARIANT_PADDING: u8 = 0xFF;
@@ -45,7 +52,12 @@ pub const VARIANT_CONTROL_CLOSE: u8 = 0x84;
 pub const VARIANT_ACK_SINGLE: u8 = 0x80;
 pub const VARIANT_ACK_RUN: u8 = 0x81;
 
+pub const VARIANT_BYTES_MAX_INC: u8 = 0x81;
+
 /* MISC */
+
+pub const SOCKET_ID_NEW_SESSION_V1: SocketId = 0;
+pub const SOCKET_ID_RESERVED_MAX: SocketId = VARINT_U8_MAX as SocketId;
 
 // TODO: Keep alive, explicit congestion, data blocked, connection close.
 

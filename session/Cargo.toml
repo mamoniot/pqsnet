@@ -23,6 +23,7 @@ serde = { features = ["derive"], version = "*" }
 serde_bytes = "*"
 bytes = "*"
 tokio = { features = ["sync"], version = "*" }
+tracing = { version = "*" }
 # rustqlite = "*"
 
 [lints.clippy]
