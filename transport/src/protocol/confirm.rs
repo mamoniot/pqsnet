@@ -1,18 +1,19 @@
 use std::ops::Range;
 
-use crate::{crypto::*, key_bundle::KEY_BUNDLE_MIN_LEN};
+use crate::crypto::*;
 
 /* START OF MESSAGE DEFINITION */
 
-pub const KEY_BUNDLE_START: usize = super::shared::SEGMENT_HEADER_END;
+pub const PAYLOAD_LEN_START: usize = 0;
+pub const PAYLOAD_LEN_LEN: usize = 2;
+pub const PAYLOAD_LEN_END: usize = PAYLOAD_LEN_START + PAYLOAD_LEN_LEN;
+pub const PAYLOAD_LEN_RANGE: Range<usize> = PAYLOAD_LEN_START..PAYLOAD_LEN_END;
 
-pub const PAYLOAD_ENCRYPTION_START: usize = KEY_BUNDLE_START;
-
-pub const PREMESSAGE_RANGE: Range<usize> = 0..KEY_BUNDLE_START;
+pub const PAYLOAD_START: usize = PAYLOAD_LEN_END;
 
 /* START OF MESSAGE TAIL DEFINITION */
 
-pub const PAYLOAD_REV_START: usize = PAYLOAD_TAG_REV_END;
+pub const KEY_BUNDLE_REV_START: usize = PAYLOAD_TAG_REV_END;
 
 pub const PAYLOAD_TAG_REV_END: usize = PAYLOAD_TAG_REV_START + PAYLOAD_TAG_LEN;
 pub const PAYLOAD_TAG_LEN: usize = aes256::TAG_LEN;
@@ -29,9 +30,5 @@ pub const ONLINE_SIGNATURE_TAG_REV_START: usize = 0;
 /* START OF LENGTH CONSTANTS */
 
 pub const HEADER_LEN: usize = super::shared::SEGMENT_HEADER_END;
-
-pub const MESSAGE_MIN_LEN_WITHOUT_BUNDLE: usize = KEY_BUNDLE_START + PAYLOAD_REV_START;
-pub const MESSAGE_MIN_LEN: usize = MESSAGE_MIN_LEN_WITHOUT_BUNDLE + KEY_BUNDLE_MIN_LEN;
-pub const MESSAGE_MAX_LEN: usize = 2 * MESSAGE_MIN_LEN.next_power_of_two();
 
 pub const MESSAGE_GCM_TOTAL: u32 = 2;

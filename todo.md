@@ -34,6 +34,7 @@ Secure, flow controlled, asynchronous, hierarchical document transfer protocol
 - Implement initial timeout negotiation
 - Eliminate overflow math
 - Add async scheduling of transmission
+- Test protocol versioning for backwards compatibility
 ### Extraneous
 - Utalize received ICMP messages (Destination Unreachable, Time Exceeded, Parameter Problem)
 - Ensure correct handling of asymmetric routes (https://www.rfc-editor.org/info/rfc3449)
@@ -48,4 +49,4 @@ Secure, flow controlled, asynchronous, hierarchical document transfer protocol
 - Congestion window recovery on spurious congestion event.
 - Metrics
 - Tracing
-- Reduce and compress repeative code (Until the architecture is settled this is not worth doing)
+- Reduce and compress repeative code (Until the architecture is settled this is not worth doing

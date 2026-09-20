@@ -27,3 +27,4 @@ init: initialize
 ctx: context
 min: minimum
 max: maximum
+rev: reverse

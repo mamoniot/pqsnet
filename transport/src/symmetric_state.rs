@@ -1,16 +1,22 @@
 use zeroize::Zeroizing;
 
 use crate::{
-    crypto::{aes256::TAG_LEN, prelude::*},
-    error::Error,
-    protocol::{domain, resume::COUNTER_SKIP, shared::*},
-    session_layer::{ResumptionKey, ResumptionToken, SessionLayer},
+    crypto::{aes256::TAG_LEN, prelude::*}, error::Error, protocol::{domain, resume::COUNTER_SKIP, shared::*}, session_layer::{ResumptionKey, ResumptionToken, SessionLayer, SocketKey},
 };
 
 pub struct SymmetricState<S: SessionLayer> {
     key_buffer: Zeroizing<[u8; SHAKE256_NORMAL_OUTPUT_LEN]>,
     counter: u32,
     _s: std::marker::PhantomData<S>,
+}
+
+// TODO: switch to single zeroizing buffer.
+pub struct SymmetricKeys {
+    pub initiator_key: SocketKey,
+    pub responder_key: SocketKey,
+    pub initiator_resumption_token: ResumptionToken,
+    pub responder_resumption_token: ResumptionToken,
+    pub resumption_key: ResumptionKey,
 }
 
 impl<S: SessionLayer> Clone for SymmetricState<S> {
@@ -87,45 +93,29 @@ impl<S: SessionLayer> SymmetricState<S> {
         if auth { Ok(()) } else { Err(Error::Inauthentic) }
     }
 
-    pub fn channel_binding(&self) -> &[u8] {
-        &self.key_buffer[CHANNEL_BINDING_START..CHANNEL_BINDING_END]
+    pub fn channel_binding(&self) -> [u8; CHANNEL_BINDING_LEN] {
+        self.key_buffer[CHANNEL_BINDING_RANGE].try_into().unwrap()
     }
 
-    pub fn split(
-        self,
-        is_initiator: bool,
-    ) -> (
-        S::HotPathDuplexCipherImpl,
-        ResumptionToken,
-        ResumptionToken,
-        ResumptionKey,
-    ) {
+    pub fn split(self) -> SymmetricKeys {
         let mut buffer = Zeroizing::new([0u8; SHAKE256_FINAL_OUTPUT_LEN]);
         let mut hasher = S::Shake256Impl::new();
 
         hasher.update(&self.key_buffer[CHAINING_KEY_START..CHAINING_KEY_END]);
         hasher.finish(&mut buffer[..]);
 
-        let resumption_key = &buffer[RESPONDER_KEY_RANGE].try_into().unwrap();
-        let initiator_resumption_token = &buffer[INITIATOR_RESUMPTION_TOKEN_RANGE].try_into().unwrap();
-        let responder_resumption_token = &buffer[RESPONDER_RESUMPTION_TOKEN_RANGE].try_into().unwrap();
-        let initiator_key = &buffer[INITIATOR_KEY_RANGE].try_into().unwrap();
-        let responder_key = &buffer[RESPONDER_KEY_RANGE].try_into().unwrap();
+        let resumption_key = Zeroizing::new(buffer[RESUMPTION_KEY_RANGE].try_into().unwrap());
+        let initiator_resumption_token = buffer[INITIATOR_RESUMPTION_TOKEN_RANGE].try_into().unwrap();
+        let responder_resumption_token = buffer[RESPONDER_RESUMPTION_TOKEN_RANGE].try_into().unwrap();
+        let initiator_key = Zeroizing::new(buffer[INITIATOR_KEY_RANGE].try_into().unwrap());
+        let responder_key = Zeroizing::new(buffer[RESPONDER_KEY_RANGE].try_into().unwrap());
 
-        if is_initiator {
-            (
-                S::HotPathDuplexCipherImpl::new(initiator_key, responder_key),
-                *initiator_resumption_token,
-                *responder_resumption_token,
-                Zeroizing::new(*resumption_key),
-            )
-        } else {
-            (
-                S::HotPathDuplexCipherImpl::new(responder_key, initiator_key),
-                *responder_resumption_token,
-                *initiator_resumption_token,
-                Zeroizing::new(*resumption_key),
-            )
+        SymmetricKeys {
+            initiator_key,
+            responder_key,
+            initiator_resumption_token,
+            responder_resumption_token,
+            resumption_key,
         }
     }
 }

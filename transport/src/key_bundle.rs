@@ -114,11 +114,15 @@ impl<P: PublicSigningKey> AuthenticBundle<P> {
         todo!()
     }
 
-    pub fn authenticate_and_get_end<H: Shake256>(bundle_bytes: &[u8]) -> Result<(Arc<Self>, usize), AuthError> {
-        Self::authenticate_and_get_end_with_time::<H>(bundle_bytes, get_secs_since_unix_epoch())
+    pub fn authenticate<H: Shake256>(bundle_bytes: &[u8]) -> Result<Arc<Self>, AuthError> {
+        Self::authenticate_and_get_len::<H>(bundle_bytes).map(|k| k.0)
     }
 
-    pub fn authenticate_and_get_end_with_time<'a, H: Shake256>(
+    pub fn authenticate_and_get_len<H: Shake256>(bundle_bytes: &[u8]) -> Result<(Arc<Self>, usize), AuthError> {
+        Self::authenticate_and_get_len_with_time::<H>(bundle_bytes, get_secs_since_unix_epoch())
+    }
+
+    pub fn authenticate_and_get_len_with_time<'a, H: Shake256>(
         bundle_bytes: &'a [u8],
         secs_since_unix_epoch: u64,
     ) -> Result<(Arc<Self>, usize), AuthError> {

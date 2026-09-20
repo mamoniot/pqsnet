@@ -5,12 +5,6 @@ use crate::crypto::*;
 
 /* START OF MESSAGE DEFINITION */
 
-pub const HANDSHAKE_VERSION_START: usize = reply::HANDSHAKE_VERSION_START;
-pub const HANDSHAKE_VERSION_LEN: usize = reply::HANDSHAKE_VERSION_LEN;
-pub const HANDSHAKE_VERSION_END: usize = reply::HANDSHAKE_VERSION_END;
-pub const HANDSHAKE_VERSION_IDX: usize = reply::HANDSHAKE_VERSION_IDX;
-pub const HANDSHAKE_VERSION_VALUE: u8 = reply::HANDSHAKE_VERSION_VALUE;
-
 pub const HANDSHAKE_FLAGS_START: usize = reply::HANDSHAKE_FLAGS_START;
 pub const HANDSHAKE_FLAGS_LEN: usize = reply::HANDSHAKE_FLAGS_LEN;
 pub const HANDSHAKE_FLAGS_END: usize = reply::HANDSHAKE_FLAGS_END;
@@ -21,14 +15,12 @@ pub const EPHEMERAL_CIPHERTEXT_LEN: usize = reply::EPHEMERAL_CIPHERTEXT_LEN;
 pub const EPHEMERAL_CIPHERTEXT_END: usize = reply::EPHEMERAL_CIPHERTEXT_END;
 pub const EPHEMERAL_CIPHERTEXT_RANGE: Range<usize> = reply::EPHEMERAL_CIPHERTEXT_RANGE;
 
-pub const PAYLOAD_ENCRYPTION_START: usize = reply::PAYLOAD_ENCRYPTION_START;
+pub const PAYLOAD_LEN_START: usize = reply::PAYLOAD_LEN_START;
+pub const PAYLOAD_LEN_LEN: usize = reply::PAYLOAD_LEN_LEN;
+pub const PAYLOAD_LEN_END: usize = reply::PAYLOAD_LEN_END;
+pub const PAYLOAD_LEN_RANGE: Range<usize> = reply::PAYLOAD_LEN_RANGE;
 
-pub const NEW_SOCKET_ID_START: usize = reply::NEW_SOCKET_ID_START;
-pub const NEW_SOCKET_ID_LEN: usize = reply::NEW_SOCKET_ID_LEN;
-pub const NEW_SOCKET_ID_END: usize = reply::NEW_SOCKET_ID_END;
-pub const NEW_SOCKET_ID_RANGE: Range<usize> = reply::NEW_SOCKET_ID_RANGE;
-
-pub const PAYLOAD_START: usize = NEW_SOCKET_ID_END;
+pub const PAYLOAD_START: usize = PAYLOAD_LEN_END;
 
 /* START OF MESSAGE TAIL DEFINITION */
 

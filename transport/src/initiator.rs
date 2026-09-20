@@ -4,19 +4,11 @@ use rand_core::Rng;
 use zeroize::Zeroizing;
 
 use crate::{
-    context::{Context, RecvOk},
-    crypto::prelude::*,
-    desegmentation::{Mtu, Segmenter},
-    error::Error,
-    key_bundle::{AuthenticBundle, PrivateBundleSL, check_handshake_flags},
-    protocol::{
+    crypto::prelude::*, error::Error, key_bundle::{AuthenticBundle, PrivateBundleSL, check_handshake_flags}, protocol::{
         domain::{CONFIRM_BINDING, INITIALIZE_BINDING, REPLY_BINDING},
         shared::*,
         *,
-    },
-    session_layer::{ResumptionKey, ResumptionToken, SessionLayer},
-    socket::{HandshakeState, Socket},
-    symmetric_state::SymmetricState,
+    }, session_layer::{ResumptionKey, ResumptionToken, SessionLayer}, symmetric_state::{SymmetricKeys, SymmetricState},
 };
 
 pub struct InitializeState<S: SessionLayer> {
@@ -26,12 +18,11 @@ pub struct InitializeState<S: SessionLayer> {
     decapsulation_key: S::DecapsulationKeyImpl,
     payload: Box<[u8]>,
     private_key_bundle: Option<PrivateBundleSL<S>>,
-    key_bundle: Option<AuthenticBundle<S::PublicSigningKeyImpl>>,
+    remote_key_bundle: Option<AuthenticBundle<S::PublicSigningKeyImpl>>,
 }
 
-impl<S: SessionLayer> Context<S> {
+impl<S: SessionLayer> InitializeState<S> {
     pub fn initialize(
-        &self,
         mut sl: S,
         resumption: Option<(
             &ResumptionToken,
@@ -39,9 +30,8 @@ impl<S: SessionLayer> Context<S> {
             AuthenticBundle<S::PublicSigningKeyImpl>,
         )>,
         combined_bundle_flags: u8,
-        mtu: Mtu,
         payload: Box<[u8]>,
-    ) -> Result<Arc<Socket<S>>, Error> {
+    ) -> Result<InitializeState<S>, Error> {
         use initialize::*;
 
         /* START OF HANDSHAKE VERSION AND FLAGS HANDLING */
@@ -49,29 +39,26 @@ impl<S: SessionLayer> Context<S> {
         let (message_len, init_handshake_flags) = match (resumption.is_some(), combined_bundle_flags) {
             // If we have a resumption token, we need to signal that to the responder.
             (true, f) if f & HANDSHAKE_FLAGS_FULL_HANDSHAKE > 0 => {
-                (MESSAGE_LEN_WITH_FULL, f | HANDSHAKE_FLAGS_USE_RESUMPTION)
+                (RESUMPTION_ONLY_TAG_END, f | HANDSHAKE_FLAGS_USE_RESUMPTION)
             }
             // If we are not doing a full handshake, we must send our signature in this message.
             (true, f) => (
-                MESSAGE_MIN_LEN_WITH_SIGN + payload.len(),
+                PAYLOAD_START + payload.len() + PAYLOAD_REV_START,
                 f | HANDSHAKE_FLAGS_USE_RESUMPTION,
             ),
             // If the flags say to use resumption, but there is not resumption token, we must abort.
             (false, f) if f & HANDSHAKE_FLAGS_USE_RESUMPTION > 0 => return Err(Error::Invalid),
             // If there is not a resumption token then we must to do a full handshake.
-            (false, f) => (MESSAGE_LEN_WITHOUT_SIGN, f | HANDSHAKE_FLAGS_FULL_HANDSHAKE),
+            (false, f) => (EPHEMERAL_ENC_KEY_END, f | HANDSHAKE_FLAGS_FULL_HANDSHAKE),
         };
         debug_assert!(check_handshake_flags(combined_bundle_flags, init_handshake_flags));
 
         /* START OF HEADER ENCODING */
 
-        let mut init_message = Segmenter::create_message(message_len, HEADER_LEN, 0, mtu);
-
-        init_message[INITIALIZE_UID_RANGE].copy_from_slice(&sl.rng().next_u64().to_be_bytes());
+        let mut init_message = vec![0; message_len];
 
         /* START OF HANDSHAKE VERSION AND FLAGS ENCODING */
 
-        init_message[HANDSHAKE_VERSION_IDX] = HANDSHAKE_VERSION_VALUE;
         init_message[HANDSHAKE_FLAGS_IDX] = init_handshake_flags;
 
         /* START OF MLKEM1024 EPHEMERAL ENCAPSULATION KEY HANDLING */
@@ -79,20 +66,14 @@ impl<S: SessionLayer> Context<S> {
         let (encapsulation_key, decapsulation_key) = S::DecapsulationKeyImpl::generate();
         init_message[EPHEMERAL_ENC_KEY_RANGE].copy_from_slice(&encapsulation_key);
 
-        /* START OF SEND SOCKET ID HANDLING */
-
-        let socket = self.reserve_socket(&mut sl);
-
-        init_message[NEW_SOCKET_ID_RANGE].copy_from_slice(&socket.recv_socket_id.to_be_bytes());
-
         /* START OF RESUMPTION TOKEN HANDLING */
 
         let mut symmetric = SymmetricState::<S>::default();
         let mut fallback = None;
-        let mut key_bundle = None;
+        let mut remote_key_bundle = None;
         let mut private_key_bundle = None;
 
-        if let Some((token, key, bundle)) = resumption {
+        if let Some((token, key, key_bundle)) = resumption {
             init_message[RESUMPTION_TOKEN_RANGE].copy_from_slice(token);
 
             symmetric.mix(&init_message[PREMESSAGE_RESUMPTION_RANGE]);
@@ -106,82 +87,62 @@ impl<S: SessionLayer> Context<S> {
             symmetric.mix(&key[..]);
 
             if init_handshake_flags & HANDSHAKE_FLAGS_FULL_HANDSHAKE > 0 {
-                let resumption_tag_start = message_len - RESUMPTION_TAG_REV_END;
-                let resumption_tag_end = message_len - RESUMPTION_TAG_REV_START;
 
                 /* START OF RESUMPTION TAG HANDLING */
 
-                symmetric.encrypt_and_mix(&mut init_message[resumption_tag_start..resumption_tag_end]);
+                symmetric.encrypt_and_mix(&mut init_message[RESUMPTION_ONLY_TAG_RANGE]);
             } else {
                 let payload_end = message_len - PAYLOAD_REV_START;
-                let bundle_uid_xor_start = message_len - BUNDLE_UID_XOR_REV_END;
-                let bundle_uid_xor_end = message_len - BUNDLE_UID_XOR_REV_START;
+                let payload_tag_end = message_len - PAYLOAD_REV_START;
                 let online_sign_start = message_len - ONLINE_SIGNATURE_REV_END;
                 let online_sign_end = message_len - ONLINE_SIGNATURE_REV_START;
                 let online_sign_tag_end = message_len - RESUMPTION_TAG_REV_START;
-
-                /* START OF PAYLOAD ENCODING */
-
-                init_message[PAYLOAD_START..payload_end].copy_from_slice(&payload[..]);
 
                 /* START OF EXPECTED KEY UID HANDLING */
 
                 let local_private_key_bundle = sl.private_key_bundle();
 
-                let uid_xor = bundle.uid ^ local_private_key_bundle.uid;
-                init_message[bundle_uid_xor_start..bundle_uid_xor_end].copy_from_slice(&uid_xor.to_be_bytes());
+                let mut bundle_hasher = S::Shake256Impl::new();
+                bundle_hasher.update(domain::KEY_BUNDLE_CHECKSUM);
+                bundle_hasher.update(&local_private_key_bundle.uid.to_be_bytes());
+                bundle_hasher.update(&key_bundle.uid.to_be_bytes());
+
+                bundle_hasher.finish(&mut init_message[KEY_BUNDLE_CHECKSUM_RANGE]);
+
+                /* START OF PAYLOAD ENCODING */
+
+                init_message[PAYLOAD_START..payload_end].copy_from_slice(&payload[..]);
 
                 /* START OF ONLINE SIGNATURE HANDLING */
 
-                let sign = local_private_key_bundle.sign(INITIALIZE_BINDING, symmetric.channel_binding());
+                let sign = local_private_key_bundle.sign(INITIALIZE_BINDING, &symmetric.channel_binding());
                 init_message[online_sign_start..online_sign_end].copy_from_slice(&sign);
 
-                symmetric.encrypt_and_mix(&mut init_message[bundle_uid_xor_start..online_sign_tag_end]);
+                symmetric.encrypt_and_mix(&mut init_message[KEY_BUNDLE_CHECKSUM_START..online_sign_tag_end]);
 
                 private_key_bundle = Some(local_private_key_bundle);
             }
 
-            key_bundle = Some(bundle);
+            remote_key_bundle = Some(key_bundle);
         } else {
             symmetric.mix(&init_message[PREMESSAGE_DEFAULT_HANDSHAKE_RANGE]);
         }
 
-        /* START OF STATE MANAGEMENT */
-
-        let segmenter = Segmenter::new(init_message, HEADER_LEN, mtu);
-
-        *socket.state.write().unwrap() = HandshakeState::SendingInitialize {
-            state: InitializeState {
-                symmetric,
-                fallback,
-                decapsulation_key,
-                init_handshake_flags,
-                payload,
-                key_bundle,
-                private_key_bundle,
-            },
-            segmenter,
-            desegmenter: Default::default(),
-        };
-
-        Ok(socket)
+        Ok(InitializeState { symmetric, fallback, init_handshake_flags, decapsulation_key: (), payload, private_key_bundle, remote_key_bundle: () })
     }
 
-    pub(crate) fn process_reply(
-        &self,
+    pub(crate) fn process_reply<'a>(
+        self,
         mut sl: S,
-        state: InitializeState<S>,
-        guard: SocketGuard<S>,
-        reply_message: &mut [u8],
-        mtu: Mtu,
-    ) -> Result<RecvOk<S>, Error> {
+        reply_message: &'a mut [u8],
+    ) -> Result<(SymmetricKeys, &'a mut [u8]), Error> {
         use shared::*;
 
         let mut fallback = state.fallback;
         let mut symmetric = state.symmetric;
         let mut decapsulation_key = state.decapsulation_key;
         let mut init_handshake_flags = state.init_handshake_flags;
-        let mut expected_key_bundle = state.key_bundle;
+        let mut expected_key_bundle = state.remote_key_bundle;
         let mut send_payload = state.payload;
 
         /* START OF REPLY MESSAGE AND RESUME MESSAGE SHARED SECTION */

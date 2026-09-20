@@ -8,6 +8,7 @@ use crate::protocol::*;
 
 pub type ResumptionToken = [u8; initialize::RESUMPTION_TOKEN_LEN];
 pub type ResumptionKey = Zeroizing<[u8; initialize::RESUMPTION_KEY_LEN]>;
+pub type SocketKey = Zeroizing<[u8; aes256::KEY_LEN]>;
 
 #[derive(Default)]
 pub enum ResumptionAction<S: SessionLayer> {

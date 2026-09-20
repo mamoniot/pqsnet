@@ -1,26 +1,24 @@
 
 
-pub struct Desegmenter<T> {
-    t: T,
-
+pub struct Desegmenter {
 }
 
-pub enum NewResult<T> {
-    Success(Desegmenter<T>),
-    SingleSeg(Box<[u8]>, T),
+pub enum NewResult<'a> {
+    Success(Desegmenter),
+    SingleSeg(&'a [u8]),
     Failure,
 }
 
-impl<T> Desegmenter<T> {
-    pub fn new(packet: &[u8], i: &mut usize, t: T) -> NewResult<T> {
+impl Desegmenter {
+    pub fn new<'a>(packet: &'a [u8], idx: &mut usize) -> NewResult<'a> {
         todo!()
     }
 
-    pub fn recv(&self, packet: &[u8], i: &mut usize) -> Option<(Box<[u8]>, T)> {
+    pub fn recv(&self, packet: &[u8], idx: &mut usize) -> Option<Vec<u8>> {
         todo!()
     }
 
-    pub fn recv_mut(&mut self, packet: &[u8], i: &mut usize) -> Option<(Box<[u8]>, T)> {
+    pub fn recv_mut(&mut self, packet: &[u8], idx: &mut usize) -> Option<Vec<u8>> {
         todo!()
     }
 }
