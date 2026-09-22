@@ -2,7 +2,12 @@ use bytes::Bytes;
 use smallvec::SmallVec;
 
 use crate::{
-    ack_runs::encode, application_layer::Route, protocol::*, send::SentPayload, session::{DocNo, SendDoc, Session}, varint::*,
+    ack_runs::encode,
+    application_layer::Route,
+    protocol::*,
+    send::SentPayload,
+    session::{DocNo, SendDoc, Session},
+    varint::*,
 };
 
 pub struct Segment {

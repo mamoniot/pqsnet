@@ -7,10 +7,13 @@ use smallvec::SmallVec;
 use tracing::*;
 
 use crate::{
-    application_layer::Route, protocol::*, session::{
+    application_layer::Route,
+    protocol::*,
+    session::{
         DocMem, DocNo, OpenChannel, RecvDoc, RecvDocInner, RecvDocState, RecvError, ReplyState, Session,
         UnfinishedRecvDoc, UnreleasedChannel,
-    }, varint::*,
+    },
+    varint::*,
 };
 
 impl<R: Route> Session<R> {
@@ -277,7 +280,7 @@ impl<R: Route> Session<R> {
             // for a sender to close a doc by sending some segment with the close flag set.
             // `OpenChannel` structs have ownership of resources that need explicit dropping.
             // Past this point this function must not return without handling `closed_channel`.
-            let closed_channel = if is_closed {entry.channel.take()} else {None};
+            let closed_channel = if is_closed { entry.channel.take() } else { None };
 
             while let RecvDocState::ActiveReserved = &entry.doc {
                 entry = slot.condvar.wait(entry).unwrap();

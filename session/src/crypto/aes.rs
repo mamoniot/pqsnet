@@ -1,5 +1,3 @@
-
-
 pub struct HotAesGcmEncryptor {}
 
 pub struct HotAesGcmDecryptor {}
@@ -13,6 +11,4 @@ impl HotAesGcmDecryptor {
     }
 }
 
-impl HotAesGcmEncryptor {
-
-}
+impl HotAesGcmEncryptor {}

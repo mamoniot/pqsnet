@@ -15,7 +15,8 @@ use bytes::{Bytes, buf::UninitSlice};
 use smallvec::SmallVec;
 
 use crate::{
-    application_layer::Route, congestion::CongestionControl, packet_builder::PacketBuilder, protocol::*, send::TransmissionQueue, stats::Stats,
+    application_layer::Route, congestion::CongestionControl, packet_builder::PacketBuilder, protocol::*,
+    send::TransmissionQueue, stats::Stats,
 };
 
 pub type DocNo = u64;

@@ -1,14 +1,18 @@
 use std::sync::{Arc, Weak, atomic::AtomicU64};
 
-use rand_core::Rng;
 use zeroize::Zeroizing;
 
 use crate::{
-    crypto::prelude::*, error::Error, key_bundle::{AuthenticBundle, PrivateBundleSL, check_handshake_flags}, protocol::{
+    crypto::prelude::*,
+    error::Error,
+    key_bundle::{AuthenticBundle, PrivateBundleSL, check_handshake_flags},
+    protocol::{
         domain::{CONFIRM_BINDING, INITIALIZE_BINDING, REPLY_BINDING},
         shared::*,
         *,
-    }, session_layer::{ResumptionKey, ResumptionToken, SessionLayer}, symmetric_state::{SymmetricKeys, SymmetricState},
+    },
+    session_layer::{ResumptionKey, ResumptionToken, SessionLayer},
+    symmetric_state::{SymmetricKeys, SymmetricState},
 };
 
 pub struct InitializeState<S: SessionLayer> {
@@ -87,7 +91,6 @@ impl<S: SessionLayer> InitializeState<S> {
             symmetric.mix(&key[..]);
 
             if init_handshake_flags & HANDSHAKE_FLAGS_FULL_HANDSHAKE > 0 {
-
                 /* START OF RESUMPTION TAG HANDLING */
 
                 symmetric.encrypt_and_mix(&mut init_message[RESUMPTION_ONLY_TAG_RANGE]);
@@ -103,7 +106,7 @@ impl<S: SessionLayer> InitializeState<S> {
                 let local_private_key_bundle = sl.private_key_bundle();
 
                 let mut bundle_hasher = S::Shake256Impl::new();
-                bundle_hasher.update(domain::KEY_BUNDLE_CHECKSUM);
+                bundle_hasher.update(&symmetric.channel_binding());
                 bundle_hasher.update(&local_private_key_bundle.uid.to_be_bytes());
                 bundle_hasher.update(&key_bundle.uid.to_be_bytes());
 
@@ -125,10 +128,18 @@ impl<S: SessionLayer> InitializeState<S> {
 
             remote_key_bundle = Some(key_bundle);
         } else {
-            symmetric.mix(&init_message[PREMESSAGE_DEFAULT_HANDSHAKE_RANGE]);
+            symmetric.mix(&init_message[PREMESSAGE_UNRESUMED_RANGE]);
         }
 
-        Ok(InitializeState { symmetric, fallback, init_handshake_flags, decapsulation_key: (), payload, private_key_bundle, remote_key_bundle: () })
+        Ok(InitializeState {
+            symmetric,
+            fallback,
+            init_handshake_flags,
+            decapsulation_key,
+            payload,
+            private_key_bundle,
+            remote_key_bundle,
+        })
     }
 
     pub(crate) fn process_reply<'a>(

@@ -1,13 +1,11 @@
-use std::sync::{
-    Arc, Mutex, RwLock, Weak,
-    atomic::{AtomicU64, Ordering},
-};
-
-use rand_core::Rng;
 use zeroize::Zeroizing;
 
 use crate::{
-    crypto::prelude::*, key_bundle::{AuthenticBundle, OFFLINE_HASH_LEN}, protocol::*, session_layer::SessionLayer, symmetric_state::{SymmetricKeys, SymmetricState}
+    crypto::prelude::*,
+    key_bundle::{AuthenticBundle, OFFLINE_HASH_LEN},
+    protocol::*,
+    session_layer::SessionLayer,
+    symmetric_state::{SymmetricKeys, SymmetricState},
 };
 
 pub(crate) struct ReplyState<S: SessionLayer> {
@@ -17,13 +15,13 @@ pub(crate) struct ReplyState<S: SessionLayer> {
 
 pub enum ResponseOk<'a, S: SessionLayer> {
     Complete(SymmetricKeys, &'a mut [u8]),
-    Incomplete(Vec<u8>, ReplyState<S>)
+    Incomplete(Vec<u8>, ReplyState<S>),
 }
 
 pub enum Error {
     Invalid,
     Inauthentic,
-    InvalidPayload
+    InvalidPayload,
 }
 
 impl From<crate::error::Error> for Error {
@@ -32,13 +30,17 @@ impl From<crate::error::Error> for Error {
     }
 }
 
-
 impl<S: SessionLayer> ReplyState<S> {
     /// Reserves a socket in the socket table for use.
     /// Reserved sockets cannot receive packets and cannot be reserved twice simultaneously.
     /// If this socket is dropped, its socket id is unreserved, preventing a memory leak.
     /// This guard does not hold any locks and cannot cause a deadlock.
-    pub(crate) fn init<'a>(mut sl: S, aad: &[u8], init_message: &'a mut [u8], create_payload: impl FnOnce(&mut Vec<u8>)) -> Result<ResponseOk<'a, S>, Error> {
+    pub(crate) fn init<'a>(
+        mut sl: S,
+        aad: &[u8],
+        init_message: &'a mut [u8],
+        create_payload: impl FnOnce(&mut Vec<u8>),
+    ) -> Result<ResponseOk<'a, S>, Error> {
         use shared::*;
         let mut symmetric = SymmetricState::<S>::default();
 
@@ -93,16 +95,13 @@ impl<S: SessionLayer> ReplyState<S> {
 
                     symmetric.mix(&resumption_key[..]);
 
+                    let checksum_channel_binding = symmetric.channel_binding();
+
                     /* START OF PAYLOAD HANDLING */
 
                     symmetric.decrypt_and_mix(&mut init_message[PAYLOAD_START..payload_tag_end])?;
 
-
-                    let payload_len = u16::from_be_bytes(
-                        init_message[PAYLOAD_LEN_RANGE]
-                            .try_into()
-                            .unwrap(),
-                    ) as usize;
+                    let payload_len = u16::from_be_bytes(init_message[PAYLOAD_LEN_RANGE].try_into().unwrap()) as usize;
                     if payload_len != payload_end - PAYLOAD_START {
                         return Err(Error::Invalid);
                     }
@@ -110,7 +109,7 @@ impl<S: SessionLayer> ReplyState<S> {
                     private_key_bundle = sl.private_key_bundle();
 
                     let mut bundle_hasher = S::Shake256Impl::new();
-                    bundle_hasher.update(domain::KEY_BUNDLE_CHECKSUM);
+                    bundle_hasher.update(&checksum_channel_binding);
                     bundle_hasher.update(&resumption_key_bundle.uid.to_be_bytes());
                     bundle_hasher.update(&private_key_bundle.uid.to_be_bytes());
 
@@ -135,7 +134,7 @@ impl<S: SessionLayer> ReplyState<S> {
 
                     /* START OF ONLINE SIGNATURE HANDLING */
 
-                    let channel_binding = symmetric.channel_binding();
+                    let signature_channel_binding = symmetric.channel_binding();
 
                     symmetric.decrypt_and_mix(&mut init_message[online_sign_start..online_sign_tag_end])?;
 
@@ -146,7 +145,7 @@ impl<S: SessionLayer> ReplyState<S> {
                         resumption_key_bundle
                             .verify(
                                 domain::INITIALIZE_BINDING,
-                                &channel_binding,
+                                &signature_channel_binding,
                                 (&init_message[online_sign_start..online_sign_end]).try_into().unwrap(),
                             )
                             .map_err(|_| Error::Inauthentic)?;
@@ -247,10 +246,10 @@ impl<S: SessionLayer> ReplyState<S> {
 
             /* START OF STATE MANAGEMENT */
 
-            Ok(ResponseOk::Incomplete(reply_message, ReplyState {
-                symmetric,
-                expected_offline_hash,
-            }))
+            Ok(ResponseOk::Incomplete(
+                reply_message,
+                ReplyState { symmetric, expected_offline_hash },
+            ))
         } else {
             /* START OF RESUME ENCODING */
 
@@ -280,10 +279,7 @@ impl<S: SessionLayer> ReplyState<S> {
         }
     }
 
-    pub(crate) fn confirm<'a>(
-        self,
-        confirm_message: &'a mut [u8],
-    ) -> Result<(SymmetricKeys, &'a mut [u8]), Error> {
+    pub(crate) fn confirm<'a>(self, confirm_message: &'a mut [u8]) -> Result<(SymmetricKeys, &'a mut [u8]), Error> {
         let mut symmetric = self.symmetric;
 
         let recv_payload;
@@ -303,11 +299,7 @@ impl<S: SessionLayer> ReplyState<S> {
 
             symmetric.decrypt_and_mix(&mut confirm_message[PAYLOAD_LEN_START..payload_tag_end])?;
 
-            let payload_len = u16::from_be_bytes(
-                confirm_message[PAYLOAD_LEN_RANGE]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
+            let payload_len = u16::from_be_bytes(confirm_message[PAYLOAD_LEN_RANGE].try_into().unwrap()) as usize;
 
             let payload_end = PAYLOAD_START + payload_len;
             let key_bundle_start = payload_end;
@@ -315,9 +307,10 @@ impl<S: SessionLayer> ReplyState<S> {
                 return Err(Error::Invalid);
             }
 
-            let key_bundle =
-                AuthenticBundle::<S::PublicSigningKeyImpl>::authenticate::<S::Shake256Impl>(&confirm_message[key_bundle_start..key_bundle_end])
-                    .map_err(|_| Error::Inauthentic)?;
+            let key_bundle = AuthenticBundle::<S::PublicSigningKeyImpl>::authenticate::<S::Shake256Impl>(
+                &confirm_message[key_bundle_start..key_bundle_end],
+            )
+            .map_err(|_| Error::Inauthentic)?;
 
             if let Some(expected_offline_hash) = self.expected_offline_hash {
                 /* If the offline hashes are not equal then we are not connecting with the party we

@@ -1,10 +1,22 @@
-use std::{borrow::Cow, cell::UnsafeCell, sync::{OnceLock, Weak}};
+use std::{
+    borrow::Cow,
+    cell::UnsafeCell,
+    sync::{OnceLock, Weak},
+};
 
 use cbor4ii::serde::to_writer;
 use dashmap::{DashMap, Entry};
 use tracing::*;
 
-use crate::{application_layer::Route, channel::Channel, crypto::aes::HotAesGcmDecryptor, desegmenter::{Desegmenter, NewResult}, protocol::*, session::{Session, SessionInner}, varint::*};
+use crate::{
+    application_layer::Route,
+    channel::Channel,
+    crypto::aes::HotAesGcmDecryptor,
+    desegmenter::{Desegmenter, NewResult},
+    protocol::*,
+    session::{Session, SessionInner},
+    varint::*,
+};
 
 pub(crate) type SocketId = u64;
 
@@ -12,7 +24,6 @@ pub(crate) struct Socket<R: Route> {
     session: Weak<SessionInner<R>>,
     decryptor: HotAesGcmDecryptor,
 }
-
 
 pub(crate) struct HandshakeProgress {
     pub(crate) state: UnsafeCell<HandshakeState>,
@@ -35,18 +46,14 @@ impl HandshakeEntry {
     pub fn recv_mut<'a>(&mut self, packet: &'a [u8], idx: &mut usize) -> Option<Cow<'a, [u8]>> {
         match self {
             HandshakeEntry::Init(desegmenter) => desegmenter.recv_mut(packet, idx).map(Cow::Owned),
-            HandshakeEntry::State(progress) => {
-                match Desegmenter::new(packet, idx) {
-                    NewResult::Success(desegmenter) => {
-                        progress.desegmenter = OnceLock::from(desegmenter);
-                        None
-                    }
-                    NewResult::SingleSeg(message) => {
-                        Some(Cow::Borrowed(message))
-                    }
-                    NewResult::Failure => None,
+            HandshakeEntry::State(progress) => match Desegmenter::new(packet, idx) {
+                NewResult::Success(desegmenter) => {
+                    progress.desegmenter = OnceLock::from(desegmenter);
+                    None
                 }
-            }
+                NewResult::SingleSeg(message) => Some(Cow::Borrowed(message)),
+                NewResult::Failure => None,
+            },
         }
     }
 }
@@ -56,9 +63,7 @@ impl<R: Route> Context<R> {
         todo!()
     }
 
-    pub fn drive(&self, packet: &mut [u8], route: R) {
-
-    }
+    pub fn drive(&self, packet: &mut [u8], route: R) {}
 
     pub fn recv_init_message(&self, handshake_header: u128, message: &[u8]) -> Option<Channel<R>> {
         trace!(handshake_header, "recv initial message");
@@ -78,11 +83,14 @@ impl<R: Route> Context<R> {
                     self.socket_table.insert(new_socket_id, Default::default());
                     reserved_socket_id = Some(new_socket_id);
 
-                    to_writer(writer, &HandshakePayload {
-                        major_version: CUR_MAJOR_VERSION,
-                        minor_version: CUR_MINOR_VERSION,
-                        socket_id: new_socket_id,
-                    });
+                    to_writer(
+                        writer,
+                        &HandshakePayload {
+                            major_version: CUR_MAJOR_VERSION,
+                            minor_version: CUR_MINOR_VERSION,
+                            socket_id: new_socket_id,
+                        },
+                    );
                     return;
                 }
             }
@@ -97,12 +105,21 @@ impl<R: Route> Context<R> {
                 let response_header = handshake_header + HANDSHAKE_HEADER_SOCKET_ID_INC;
                 let confirm_header = response_header + HANDSHAKE_HEADER_SOCKET_ID_INC;
 
-                self.hanshake_table.insert(confirm_header, SocketState::Handshake(HandshakeProgress { state, cur_message: reply_message, desegmenter: OnceLock::new() }));
+                self.hanshake_table.insert(
+                    confirm_header,
+                    SocketState::Handshake(HandshakeProgress {
+                        state,
+                        cur_message: reply_message,
+                        desegmenter: OnceLock::new(),
+                    }),
+                );
                 // TODO: send reply message and queue it to be resent.
             }
             Err(e) => {
                 if let Some(socket_id) = reserved_socket_id {
-                    self.socket_table.remove(&socket_id).expect("reserved socket id was absent");
+                    self.socket_table
+                        .remove(&socket_id)
+                        .expect("reserved socket id was absent");
                 }
                 todo!();
             }
@@ -129,43 +146,34 @@ impl<R: Route> Context<R> {
             debug_assert_eq!(socket_id, (handshake_header >> (u128::BITS - 8)) as u64);
 
             match socket_id {
-                SOCKET_ID_INIT_MESSAGE => {
-                    match self.hanshake_table.entry(handshake_header) {
-                        Entry::Occupied(entry) => {
-                            let HandshakeEntry::Init(desegmenter) = entry.get_mut() else {
-                                unreachable!();
-                            };
-                            let Some(message) = desegmenter.recv(packet, idx) else {
-                                trace!(handshake_header, "received initial message fragment for handshake");
-                                return None;
-                            };
-                            entry.remove();
-                            return self.recv_init_message(handshake_header, &message[..]);
-                        }
-                        Entry::Vacant(entry) => {
-                            match Desegmenter::new(packet, idx) {
-                                NewResult::Success(desegmenter) => {
-                                    entry.insert(HandshakeEntry::Init(desegmenter));
-                                    trace!(handshake_header, "received first message fragment for handshake");
-                                }
-                                NewResult::SingleSeg(message) => {
-                                    drop(entry);
-                                    return self.recv_init_message(handshake_header, message);
-                                }
-                                NewResult::Failure => {
-                                    warn!(handshake_header, "received invalid handshake fragment")
-                                }
-                            }
-                        }
+                SOCKET_ID_INIT_MESSAGE => match self.hanshake_table.entry(handshake_header) {
+                    Entry::Occupied(entry) => {
+                        let HandshakeEntry::Init(desegmenter) = entry.get_mut() else {
+                            unreachable!();
+                        };
+                        let Some(message) = desegmenter.recv(packet, idx) else {
+                            trace!(handshake_header, "received initial message fragment for handshake");
+                            return None;
+                        };
+                        entry.remove();
+                        return self.recv_init_message(handshake_header, &message[..]);
                     }
-
-                }
-                SOCKET_ID_RESPONSE_MESSAGE => {
-
-                }
-                SOCKET_ID_CONFIRM_MESSAGE => {
-
-                }
+                    Entry::Vacant(entry) => match Desegmenter::new(packet, idx) {
+                        NewResult::Success(desegmenter) => {
+                            entry.insert(HandshakeEntry::Init(desegmenter));
+                            trace!(handshake_header, "received first message fragment for handshake");
+                        }
+                        NewResult::SingleSeg(message) => {
+                            drop(entry);
+                            return self.recv_init_message(handshake_header, message);
+                        }
+                        NewResult::Failure => {
+                            warn!(handshake_header, "received invalid handshake fragment")
+                        }
+                    },
+                },
+                SOCKET_ID_RESPONSE_MESSAGE => {}
+                SOCKET_ID_CONFIRM_MESSAGE => {}
                 _ => {
                     warn!(socket_id, "received unrecognized socket id in reserved range");
                     return None;
@@ -180,18 +188,16 @@ impl<R: Route> Context<R> {
                     entry.remove();
                     return self.recv_init_message(handshake_header, &message[..]);
                 }
-                Entry::Vacant(entry) => {
-                    match Desegmenter::new(packet, idx) {
-                        NewResult::Success(desegmenter) => {
-                            entry.insert(desegmenter);
-                        }
-                        NewResult::SingleSeg(message) => {
-                            drop(entry);
-                            return self.recv_init_message(handshake_header, message);
-                        }
-                        NewResult::Failure => {}
+                Entry::Vacant(entry) => match Desegmenter::new(packet, idx) {
+                    NewResult::Success(desegmenter) => {
+                        entry.insert(desegmenter);
                     }
-                }
+                    NewResult::SingleSeg(message) => {
+                        drop(entry);
+                        return self.recv_init_message(handshake_header, message);
+                    }
+                    NewResult::Failure => {}
+                },
             }
         } else {
             let Some(entry) = self.socket_table.get(&socket_id) else {

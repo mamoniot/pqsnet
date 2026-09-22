@@ -1,4 +1,3 @@
-
 pub enum RouteError {
     RouteClosed,
     RouteBusy,
@@ -9,6 +8,4 @@ pub enum RouteError {
 /// TODO: change the name of this.
 pub trait Route {
     fn send(&self, packet: &[u8]) -> Result<(), RouteError>;
-
-    
 }

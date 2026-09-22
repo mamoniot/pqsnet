@@ -1,7 +1,10 @@
 use zeroize::Zeroizing;
 
 use crate::{
-    crypto::{aes256::TAG_LEN, prelude::*}, error::Error, protocol::{domain, resume::COUNTER_SKIP, shared::*}, session_layer::{ResumptionKey, ResumptionToken, SessionLayer, SocketKey},
+    crypto::{aes256::TAG_LEN, prelude::*},
+    error::Error,
+    protocol::{domain, resume::COUNTER_SKIP, shared::*},
+    session_layer::{ResumptionKey, ResumptionToken, SessionLayer, SocketKey},
 };
 
 pub struct SymmetricState<S: SessionLayer> {

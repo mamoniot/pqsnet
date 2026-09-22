@@ -58,7 +58,6 @@ pub const VARIANT_BYTES_MAX_INC: u8 = 0x81;
 
 /* MISC */
 
-
 pub const SOCKET_ID_INIT_MESSAGE: SocketId = 0;
 pub const SOCKET_ID_RESPONSE_MESSAGE: SocketId = 1;
 pub const SOCKET_ID_CONFIRM_MESSAGE: SocketId = 2;

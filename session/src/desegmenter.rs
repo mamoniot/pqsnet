@@ -1,7 +1,4 @@
-
-
-pub struct Desegmenter {
-}
+pub struct Desegmenter {}
 
 pub enum NewResult<'a> {
     Success(Desegmenter),

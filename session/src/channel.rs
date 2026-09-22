@@ -8,7 +8,9 @@ use bytes::Bytes;
 use smallvec::SmallVec;
 
 use crate::{
-    application_layer::Route, protocol::*, session::{DocNo, OpenChannel, RecvDocState, ReplyState, SendDoc, Session},
+    application_layer::Route,
+    protocol::*,
+    session::{DocNo, OpenChannel, RecvDocState, ReplyState, SendDoc, Session},
 };
 
 const FLAG_IS_CLOSED: u64 = 1u64.reverse_bits();
@@ -101,10 +103,21 @@ impl<R: Route> Channel<R> {
                 // This store must always be ordered before any new docs are received.
                 // Otherwise the sender may see and act on the decremented `recv_bytes_total` before
                 // the receiver has propagated the decremented `recv_bytes_total` to all cores.
-                self.session.recv_bytes_total.fetch_sub(ready_doc.buf.len(), Ordering::SeqCst);
-                self.session.schedule_send_control(VARIANT_CONTROL_FIN, ready_doc.doc_no);
+                self.session
+                    .recv_bytes_total
+                    .fetch_sub(ready_doc.buf.len(), Ordering::SeqCst);
+                self.session
+                    .schedule_send_control(VARIANT_CONTROL_FIN, ready_doc.doc_no);
 
-                ret = Ok(Some(RecvDocData::Doc(ready_doc.buf, Channel::new(&self.session, ready_doc.doc_no, ready_doc.has_special_parent, ready_doc.is_closed))));
+                ret = Ok(Some(RecvDocData::Doc(
+                    ready_doc.buf,
+                    Channel::new(
+                        &self.session,
+                        ready_doc.doc_no,
+                        ready_doc.has_special_parent,
+                        ready_doc.is_closed,
+                    ),
+                )));
             }
             // TODO: update `session.send_bytes_total`
         });
@@ -428,10 +441,20 @@ impl<'a, R: Route> Future for RecvFuture<'a, R> {
             if let Some(ready_doc) = channel.ready_docs.pop() {
                 // TODO: Deduplicate this code.
                 let session = &self.channel.session;
-                session.recv_bytes_total.fetch_sub(ready_doc.buf.len(), Ordering::SeqCst);
+                session
+                    .recv_bytes_total
+                    .fetch_sub(ready_doc.buf.len(), Ordering::SeqCst);
                 session.schedule_send_control(VARIANT_CONTROL_FIN, ready_doc.doc_no);
 
-                ret = Poll::Ready(Ok(RecvDocData::Doc(ready_doc.buf, Channel::new(session, ready_doc.doc_no, ready_doc.has_special_parent, ready_doc.is_closed))));
+                ret = Poll::Ready(Ok(RecvDocData::Doc(
+                    ready_doc.buf,
+                    Channel::new(
+                        session,
+                        ready_doc.doc_no,
+                        ready_doc.has_special_parent,
+                        ready_doc.is_closed,
+                    ),
+                )));
             } else {
                 channel.ready_wakers.push(cx.waker().clone());
                 ret = Poll::Pending;
@@ -494,7 +517,11 @@ impl<'a, R: Route> Future for SendReplyFuture<'a, R> {
                     Err((TrySendError::TooLarge, _)) => Poll::Ready(Err(SendError::TooLarge)),
                 }
             }
-            Self { state: SendReplyState::Sent(reply_channel), channel: parent_channel, .. } => {
+            Self {
+                state: SendReplyState::Sent(reply_channel),
+                channel: parent_channel,
+                ..
+            } => {
                 let mut ret = Poll::Ready(Err(SendError::Closed));
                 reply_channel.session.update_channel(reply_channel.doc_no(), |channel| {
                     // TODO: Analyze this section for errors.
@@ -505,7 +532,15 @@ impl<'a, R: Route> Future for SendReplyFuture<'a, R> {
                             ret = Poll::Pending;
                         }
                         ReplyState::Recv(len, channel) => {
-                            ret = Poll::Ready(Ok((len, Channel::new(&parent_channel.session, channel.doc_no, channel.has_special_parent, channel.is_closed))));
+                            ret = Poll::Ready(Ok((
+                                len,
+                                Channel::new(
+                                    &parent_channel.session,
+                                    channel.doc_no,
+                                    channel.has_special_parent,
+                                    channel.is_closed,
+                                ),
+                            )));
                         }
                         ReplyState::None => {}
                     }
