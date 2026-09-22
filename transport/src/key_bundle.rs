@@ -8,14 +8,14 @@ use smallvec::SmallVec;
 
 use crate::{
     crypto::{mldsa87::*, shake256::Shake256},
-    protocol::domain::OFFLINE_KEY_CERTIFICATION,
+    protocol::domain,
     session_layer::SessionLayer,
 };
 
 pub const OFFLINE_HASH_LEN: usize = 48;
-pub const BUNDLE_UID_LEN: usize = 16;
+pub const BUNDLE_HASH_LEN: usize = 32;
 
-pub const KEY_BUNDLE_MIN_LEN: usize = 2 * PUBLIC_KEY_LEN + SIGNATURE_LEN + BUNDLE_UID_LEN + 6;
+pub const KEY_BUNDLE_MIN_LEN: usize = 2 * PUBLIC_KEY_LEN + SIGN_LEN + 6;
 
 pub fn get_secs_since_unix_epoch() -> u64 {
     // An `Err` is only returned if the systen time is set before unix epoch. In this case we
@@ -28,13 +28,13 @@ pub fn get_secs_since_unix_epoch() -> u64 {
 
 pub struct AuthenticBundle<P: PublicSigningKey> {
     pub offline_hash: [u8; OFFLINE_HASH_LEN],
+    pub bundle_hash: [u8; BUNDLE_HASH_LEN],
     pub online_key: P,
     pub counter: u64,
-    pub uid: u128,
     pub not_before: u64,
     pub not_after: u64,
     pub flags: u32,
-    extensions: SmallVec<[Extension; 4]>,
+    extensions: SmallVec<[Extension; 2]>,
 }
 
 /// TODO: implement creation, serialization and deserialization.
@@ -75,7 +75,7 @@ impl std::fmt::Display for AuthError {
 
 impl<P: PublicSigningKey, S: PrivateSigningKey> PrivateBundle<P, S> {
     /// This function does not check
-    pub fn sign(&self, ctx: &[u8], data: &[u8]) -> [u8; SIGNATURE_LEN] {
+    pub fn sign(&self, ctx: &[u8], data: &[u8]) -> [u8; SIGN_LEN] {
         self.private_online_key.sign(ctx, data)
     }
 
@@ -103,11 +103,10 @@ impl<P: PublicSigningKey> AuthenticBundle<P> {
         let bundle = RawKeyBundle {
             offline_key: offline_public_key,
             online_key: online_public_key,
-            counter: todo!(),
-            uid: todo!(),
+            counter,
             not_before,
-            not_after: todo!(),
-            flags: todo!(),
+            not_after,
+            flags,
             extensions: todo!(),
         };
         cbor4ii::serde::to_writer(&mut writer, &bundle);
@@ -115,7 +114,11 @@ impl<P: PublicSigningKey> AuthenticBundle<P> {
     }
 
     pub fn authenticate<H: Shake256>(bundle_bytes: &[u8]) -> Result<Arc<Self>, AuthError> {
-        Self::authenticate_and_get_len::<H>(bundle_bytes).map(|k| k.0)
+        let (ret, len) = Self::authenticate_and_get_len::<H>(bundle_bytes)?;
+        if bundle_bytes.len() != len {
+            return Err(AuthError::Inauthentic);
+        }
+        Ok(ret)
     }
 
     pub fn authenticate_and_get_len<H: Shake256>(bundle_bytes: &[u8]) -> Result<(Arc<Self>, usize), AuthError> {
@@ -130,8 +133,10 @@ impl<P: PublicSigningKey> AuthenticBundle<P> {
 
         let bundle: RawKeyBundle = cbor4ii::serde::from_reader(&mut reader).map_err(|_| AuthError::Inauthentic)?;
 
-        let signature_start = reader.as_ptr() as usize - bundle_bytes.as_ptr() as usize;
-        let signature_end = signature_start + SIGNATURE_LEN;
+        let signature_start = bundle_bytes.len() - reader.len();
+        let Some(signature_end) = signature_start.checked_add(SIGN_LEN) else {
+            return Err(AuthError::Inauthentic);
+        };
 
         if signature_end > bundle_bytes.len() {
             return Err(AuthError::Inauthentic);
@@ -145,23 +150,31 @@ impl<P: PublicSigningKey> AuthenticBundle<P> {
         let online_key = P::decode(bundle.online_key.try_into().unwrap());
 
         offline_key.verify(
-            OFFLINE_KEY_CERTIFICATION,
+            domain::OFFLINE_KEY_CERTIFICATION,
             &bundle_bytes[..signature_start],
             (&bundle_bytes[signature_start..signature_end]).try_into().unwrap(),
         );
 
         let mut hasher = H::new();
 
+        hasher.update(domain::OFFLINE_SALT);
         hasher.update(&bundle.offline_key);
         let mut offline_hash = [0; OFFLINE_HASH_LEN];
         hasher.finish(&mut offline_hash);
 
+        let mut hasher = H::new();
+
+        hasher.update(domain::BUNDLE_SALT);
+        hasher.update(&bundle_bytes[..signature_start]);
+        let mut bundle_hash = [0; BUNDLE_HASH_LEN];
+        hasher.finish(&mut bundle_hash);
+
         Ok((
             Arc::new(AuthenticBundle {
                 offline_hash,
+                bundle_hash,
                 online_key,
                 counter: bundle.counter,
-                uid: u128::from_be_bytes(bundle.uid),
                 not_before: bundle.not_before,
                 not_after: bundle.not_after,
                 flags: bundle.flags,
@@ -178,7 +191,7 @@ impl<P: PublicSigningKey> AuthenticBundle<P> {
         &self,
         ctx: &[u8],
         data: &[u8],
-        signature: &[u8; SIGNATURE_LEN],
+        signature: &[u8; SIGN_LEN],
         secs_since_unix_epoch: u64,
     ) -> Result<(), AuthError> {
         if secs_since_unix_epoch < self.not_before {
@@ -193,7 +206,7 @@ impl<P: PublicSigningKey> AuthenticBundle<P> {
     }
 
     #[must_use]
-    pub fn verify(&self, ctx: &[u8], data: &[u8], signature: &[u8; SIGNATURE_LEN]) -> Result<(), AuthError> {
+    pub fn verify(&self, ctx: &[u8], data: &[u8], signature: &[u8; SIGN_LEN]) -> Result<(), AuthError> {
         self.verify_with_time(ctx, data, signature, get_secs_since_unix_epoch())
     }
 
@@ -216,18 +229,21 @@ pub(crate) fn check_handshake_flags(required_flags: u8, handshake_flags: u8) -> 
 pub struct ExtensionContents {}
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct Extension(bool, SmallVec<[u8; 4]>, ExtensionContents);
+#[serde(tag = "n")]
+pub enum Extension {
+    #[serde(untagged)]
+    Unknown { r: bool },
+}
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SerdeKeyBundle(
     #[serde(with = "serde_bytes")] [u8; PUBLIC_KEY_LEN],
     #[serde(with = "serde_bytes")] [u8; PUBLIC_KEY_LEN],
-    #[serde(with = "serde_bytes")] [u8; BUNDLE_UID_LEN],
     u64,
     u64,
     u64,
     u32,
-    SmallVec<[Extension; 4]>,
+    SmallVec<[Extension; 2]>,
 );
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -236,12 +252,11 @@ struct SerdeKeyBundle(
 pub struct RawKeyBundle {
     offline_key: [u8; PUBLIC_KEY_LEN],
     online_key: [u8; PUBLIC_KEY_LEN],
-    uid: [u8; BUNDLE_UID_LEN],
     counter: u64,
     not_before: u64,
     not_after: u64,
     flags: u32,
-    extensions: SmallVec<[Extension; 4]>,
+    extensions: SmallVec<[Extension; 2]>,
 }
 
 impl From<SerdeKeyBundle> for RawKeyBundle {
@@ -249,12 +264,11 @@ impl From<SerdeKeyBundle> for RawKeyBundle {
         Self {
             offline_key: v.0,
             online_key: v.1,
-            uid: v.2,
-            counter: v.3,
-            not_before: v.4,
-            not_after: v.5,
-            flags: v.6,
-            extensions: v.7,
+            counter: v.2,
+            not_before: v.3,
+            not_after: v.4,
+            flags: v.5,
+            extensions: v.6,
         }
     }
 }
@@ -263,7 +277,6 @@ impl From<RawKeyBundle> for SerdeKeyBundle {
         Self(
             v.offline_key,
             v.online_key,
-            v.uid,
             v.counter,
             v.not_before,
             v.not_after,

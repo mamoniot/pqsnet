@@ -4,7 +4,7 @@ use crate::crypto::*;
 
 /* START OF MESSAGE DEFINITION */
 
-pub const GCM_COUNTER_START: usize = super::shared::SOCKET_ID_END;
+pub const GCM_COUNTER_START: usize = 0;
 pub const GCM_COUNTER_LEN: usize = 4;
 pub const GCM_COUNTER_END: usize = GCM_COUNTER_START + GCM_COUNTER_LEN;
 pub const GCM_COUNTER_RANGE: Range<usize> = GCM_COUNTER_START..GCM_COUNTER_END;

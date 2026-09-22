@@ -1,20 +1,11 @@
 use std::ops::Range;
 
-use crate::crypto::*;
+use crate::{
+    crypto::aes256,
+    protocol::{confirm, reply},
+};
 
-/* START OF SEGMENTATION HEADER DEFINITION */
-
-pub const SOCKET_ID_START: usize = 0;
-pub const SOCKET_ID_LEN: usize = 4;
-pub const SOCKET_ID_END: usize = SOCKET_ID_START + SOCKET_ID_LEN;
-pub const SOCKET_ID_RANGE: Range<usize> = SOCKET_ID_START..SOCKET_ID_END;
-
-pub const SEGMENT_NO_IDX: usize = 4;
-pub const SEGMENT_REMAINDER_IDX: usize = 5;
-pub const SEGMENT_TOTAL_IDX: usize = 6;
-pub const SEGMENT_HEADER_END: usize = 8;
-
-/* START OF SHAKE256 OUTPUT DEFINITION */
+/* SHAKE256 OUTPUT DEFINITION */
 
 pub const CHAINING_KEY_START: usize = 0;
 pub const CHAINING_KEY_LEN: usize = 64;
@@ -27,11 +18,11 @@ pub const AES_KEY_END: usize = AES_KEY_START + AES_KEY_LEN;
 pub const AES_KEY_RANGE: Range<usize> = AES_KEY_START..AES_KEY_END;
 
 pub const CHANNEL_BINDING_START: usize = AES_KEY_END;
-pub const CHANNEL_BINDING_LEN: usize = 32;
+pub const CHANNEL_BINDING_LEN: usize = 48;
 pub const CHANNEL_BINDING_END: usize = CHANNEL_BINDING_START + CHANNEL_BINDING_LEN;
 pub const CHANNEL_BINDING_RANGE: Range<usize> = CHANNEL_BINDING_START..CHANNEL_BINDING_END;
 
-/* START OF SHAKE256 SPLIT OUTPUT DEFINITION */
+/* SHAKE256 SPLIT OUTPUT DEFINITION */
 
 pub const RESUMPTION_KEY_START: usize = 0;
 pub const RESUMPTION_KEY_LEN: usize = 64;
@@ -60,13 +51,10 @@ pub const RESPONDER_KEY_LEN: usize = aes256::KEY_LEN;
 pub const RESPONDER_KEY_END: usize = RESPONDER_KEY_START + RESPONDER_KEY_LEN;
 pub const RESPONDER_KEY_RANGE: Range<usize> = RESPONDER_KEY_START..RESPONDER_KEY_END;
 
-/* START OF GENERAL CONSTANTS */
-
-pub const SHAKE256_NORMAL_OUTPUT_LEN: usize = CHANNEL_BINDING_END;
-pub const SHAKE256_FINAL_OUTPUT_LEN: usize = RESPONDER_KEY_END;
+/* MISC CONSTANTS */
 
 pub const AES_GCM_INIT_COUNTER: u32 = 1;
+pub const AES_GCM_RESUME_COUNTER_SKIP: u32 = reply::MESSAGE_GCM_TOTAL + confirm::MESSAGE_GCM_TOTAL;
 
-pub const HANDSHAKE_FLAGS_USE_RESUMPTION: u8 = 0b1;
-pub const HANDSHAKE_FLAGS_FULL_HANDSHAKE: u8 = 0b10;
-pub const HANDSHAKE_FLAGS_DENY_FALLBACK: u8 = 0b100;
+pub const SHAKE256_HANDSHAKE_OUTPUT_LEN: usize = CHANNEL_BINDING_END;
+pub const SHAKE256_SPLIT_OUTPUT_LEN: usize = RESPONDER_KEY_END;

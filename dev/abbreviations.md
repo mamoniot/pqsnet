@@ -28,3 +28,5 @@ ctx: context
 min: minimum
 max: maximum
 rev: reverse
+sign: signature
+aad: additional authentication data

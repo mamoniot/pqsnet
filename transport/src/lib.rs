@@ -4,8 +4,6 @@ pub mod crypto;
 
 pub(crate) mod protocol;
 
-pub mod antireplay;
-
 pub mod initiator;
 
 pub mod responder;
