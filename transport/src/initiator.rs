@@ -5,8 +5,8 @@ use zeroize::Zeroizing;
 use crate::{
     crypto::prelude::*,
     error::{Error, InitError},
-    key_bundle::{AuthenticBundle, KEY_BUNDLE_FLAG_RELIABLE_STORAGE, PrivateBundleSL},
-    protocol::*,
+    key_bundle::{AuthenticBundle, PrivateBundleSL},
+    protocol::{key_bundle::KEY_BUNDLE_FLAG_RELIABLE_STORAGE, *},
     session_layer::{ResumptionKey, ResumptionToken, SessionLayer},
     symmetric_state::{SymmetricKeys, SymmetricState},
 };
@@ -81,8 +81,8 @@ impl<S: SessionLayer> InitializeState<S> {
 
             let mut bundle_hasher = S::Shake256Impl::new();
             bundle_hasher.update(&symmetric.channel_binding());
-            bundle_hasher.update(&private_key_bundle.bundle_hash);
-            bundle_hasher.update(&key_bundle.bundle_hash);
+            bundle_hasher.update(private_key_bundle.bundle_hash());
+            bundle_hasher.update(key_bundle.bundle_hash());
 
             bundle_hasher.finish(&mut init_message[KEY_BUNDLE_CHECKSUM_RANGE]);
 
@@ -184,14 +184,16 @@ impl<S: SessionLayer> InitializeState<S> {
             if handshake_type != HANDSHAKE_TYPE_RESUME {
                 /* KEY BUNDLE HANDLING */
 
-                let (key_bundle, key_bundle_len) =
-                    AuthenticBundle::authenticate::<S::Shake256Impl>(&reply_message[PAYLOAD_START..payload_end])
-                        .map_err(|_| Error::Inauthentic)?;
+                let mixed_payload = &reply_message[PAYLOAD_START..payload_end];
+                let result = AuthenticBundle::authenticate::<S::Shake256Impl>(mixed_payload);
+                let (key_bundle, key_bundle_len) = result.map_err(|_| Error::Inauthentic)?;
+                remote_key_bundle = Arc::new(key_bundle);
 
                 key_bundle_end = PAYLOAD_START + key_bundle_len;
 
                 if handshake_type == HANDSHAKE_TYPE_FALLBACK
-                    && (key_bundle.flags & self.private_key_bundle.flags) & KEY_BUNDLE_FLAG_RELIABLE_STORAGE > 0
+                    && (remote_key_bundle.flags() & self.private_key_bundle.flags()) & KEY_BUNDLE_FLAG_RELIABLE_STORAGE
+                        > 0
                 {
                     return Err(Error::Inauthentic);
                 }
@@ -199,12 +201,10 @@ impl<S: SessionLayer> InitializeState<S> {
                 if let Some(expected_key_bundle) = self.remote_key_bundle {
                     /* If the offline hashes are not equal then we are not connecting with the party we
                     intended to connect to. A party's offline key is their id and it must never change. */
-                    if expected_key_bundle.offline_hash != key_bundle.offline_hash {
+                    if !expected_key_bundle.offline_eq(&remote_key_bundle) {
                         return Err(Error::Inauthentic);
                     }
                 }
-
-                remote_key_bundle = key_bundle;
             } else if let Some(key_bundle) = self.remote_key_bundle {
                 remote_key_bundle = key_bundle;
                 key_bundle_end = PAYLOAD_START;
@@ -216,12 +216,9 @@ impl<S: SessionLayer> InitializeState<S> {
 
             symmetric.decrypt_and_mix(5, &mut reply_message[online_sign_start..online_sign_tag_end])?;
 
+            let sign = (&reply_message[online_sign_start..online_sign_end]).try_into().unwrap();
             remote_key_bundle
-                .verify(
-                    domain::REPLY_BINDING,
-                    &symmetric.channel_binding(),
-                    (&reply_message[online_sign_start..online_sign_end]).try_into().unwrap(),
-                )
+                .verify(domain::REPLY_BINDING, &symmetric.channel_binding(), sign)
                 .map_err(|_| Error::Inauthentic)?;
 
             recv_payload = &mut reply_message[key_bundle_end..payload_end];
@@ -261,8 +258,6 @@ impl<S: SessionLayer> InitializeState<S> {
             confirm_message[online_sign_start..online_sign_end].copy_from_slice(&sign);
 
             symmetric.encrypt_and_mix(7, &mut confirm_message[online_sign_start..online_sign_tag_end]);
-
-            /* STATE MANAGEMENT */
 
             Ok((
                 Some(confirm_message),

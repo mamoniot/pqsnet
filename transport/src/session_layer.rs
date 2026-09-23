@@ -27,9 +27,6 @@ pub trait SessionLayer: Sized {
     type PrivateSigningKeyImpl: mldsa87::PrivateSigningKey;
     type PublicSigningKeyImpl: mldsa87::PublicSigningKey;
     type DecapsulationKeyImpl: mlkem1024::DecapsulationKey;
-    type RngImpl: rand_core::CryptoRng;
-
-    fn rng(&mut self) -> &mut Self::RngImpl;
 
     // TODO: add return values for identifying the remote party.
     fn lookup_resumption_key(

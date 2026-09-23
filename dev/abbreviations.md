@@ -1,5 +1,3 @@
-
-
 seg: segment
 alloc: allocation
 len: length
@@ -30,3 +28,5 @@ max: maximum
 rev: reverse
 sign: signature
 aad: additional authentication data
+ret: return
+eq: equal

@@ -1,9 +1,12 @@
+use std::sync::Arc;
+
+use constant_time_eq::constant_time_eq_16;
 use zeroize::Zeroizing;
 
 use crate::{
     crypto::prelude::*,
     error::{Error, ReplyError},
-    key_bundle::{AuthenticBundle, OFFLINE_HASH_LEN},
+    key_bundle::{AuthenticBundle, OfflineHash},
     protocol::*,
     session_layer::SessionLayer,
     symmetric_state::{SymmetricKeys, SymmetricState},
@@ -11,7 +14,7 @@ use crate::{
 
 pub struct ReplyState<S: SessionLayer> {
     symmetric: SymmetricState<S>,
-    expected_offline_hash: Option<[u8; OFFLINE_HASH_LEN]>,
+    expected_offline_hash: Option<OfflineHash>,
 }
 
 pub enum ResponseOk<'a, S: SessionLayer> {
@@ -74,7 +77,7 @@ impl<S: SessionLayer> ReplyState<S> {
             private_key_bundle = sl.private_key_bundle();
 
             if let Some((resumption_key, remote_key_bundle)) = resumption {
-                expected_offline_hash = Some(remote_key_bundle.offline_hash);
+                expected_offline_hash = Some(*remote_key_bundle.offline_hash());
 
                 symmetric.mix(10, &resumption_key[..]);
 
@@ -101,8 +104,8 @@ impl<S: SessionLayer> ReplyState<S> {
 
                 let mut bundle_hasher = S::Shake256Impl::new();
                 bundle_hasher.update(&checksum_channel_binding);
-                bundle_hasher.update(&remote_key_bundle.bundle_hash);
-                bundle_hasher.update(&private_key_bundle.bundle_hash);
+                bundle_hasher.update(remote_key_bundle.bundle_hash());
+                bundle_hasher.update(private_key_bundle.bundle_hash());
 
                 let mut local_checksum = [0; KEY_BUNDLE_CHECKSUM_LEN];
                 bundle_hasher.finish(&mut local_checksum);
@@ -111,7 +114,7 @@ impl<S: SessionLayer> ReplyState<S> {
                 /* An incorrect bundle checksum indicates one party currently has an
                 outdated or incorrect public key of the other party. So we need to do a
                 fallback handshake to re-exchange public keys. */
-                let has_correct_bundle = &local_checksum[..] == remote_checksum;
+                let has_correct_bundle = constant_time_eq_16(&local_checksum, remote_checksum.try_into().unwrap());
 
                 /* ONLINE SIGNATURE HANDLING */
 
@@ -123,12 +126,9 @@ impl<S: SessionLayer> ReplyState<S> {
                 full handshake if the initiator has the incorrect keys. A full handshake
                 will force the initiator to send a second, better signature later. */
                 if has_correct_bundle {
+                    let sign = (&init_message[online_sign_start..online_sign_end]).try_into().unwrap();
                     remote_key_bundle
-                        .verify(
-                            domain::INITIALIZE_BINDING,
-                            &signature_channel_binding,
-                            (&init_message[online_sign_start..online_sign_end]).try_into().unwrap(),
-                        )
+                        .verify(domain::INITIALIZE_BINDING, &signature_channel_binding, sign)
                         .map_err(|_| ReplyError::Inauthentic)?;
 
                     handshake_type = reply::HANDSHAKE_TYPE_RESUME;
@@ -209,10 +209,21 @@ impl<S: SessionLayer> ReplyState<S> {
         }
     }
 
-    pub fn confirm<'a>(self, confirm_message: &'a mut [u8]) -> Result<(SymmetricKeys, &'a mut [u8]), Error> {
+    pub fn confirm<'a>(
+        self,
+        confirm_message: &'a mut [u8],
+    ) -> Result<
+        (
+            SymmetricKeys,
+            Arc<AuthenticBundle<S::PublicSigningKeyImpl>>,
+            &'a mut [u8],
+        ),
+        Error,
+    > {
         let mut symmetric = self.symmetric;
 
         let recv_payload;
+        let remote_key_bundle;
         {
             use confirm::*;
             if confirm_message.len() < PAYLOAD_START + PAYLOAD_REV_START {
@@ -229,16 +240,17 @@ impl<S: SessionLayer> ReplyState<S> {
 
             symmetric.decrypt_and_mix(6, &mut confirm_message[PAYLOAD_START..payload_tag_end])?;
 
-            let (key_bundle, key_bundle_len) = AuthenticBundle::<S::PublicSigningKeyImpl>::authenticate::<
-                S::Shake256Impl,
-            >(&confirm_message[PAYLOAD_START..payload_end])
-            .map_err(|_| Error::Inauthentic)?;
+            let mixed_payload = &confirm_message[PAYLOAD_START..payload_end];
+            let result = AuthenticBundle::authenticate::<S::Shake256Impl>(mixed_payload);
+            let (key_bundle, key_bundle_len) = result.map_err(|_| Error::Inauthentic)?;
+            remote_key_bundle = Arc::new(key_bundle);
+
             let key_bundle_end = PAYLOAD_START + key_bundle_len;
 
             if let Some(expected_offline_hash) = self.expected_offline_hash {
                 /* If the offline hashes are not equal then we are not connecting with the party we
                 intended to connect to. A party's offline key is their id and it must never change. */
-                if key_bundle.offline_hash != expected_offline_hash {
+                if !remote_key_bundle.offline_eq_raw(&expected_offline_hash) {
                     return Err(Error::Inauthentic);
                 }
             }
@@ -249,19 +261,14 @@ impl<S: SessionLayer> ReplyState<S> {
 
             symmetric.decrypt_and_mix(7, &mut confirm_message[online_sign_start..online_sign_tag_end])?;
 
-            key_bundle
-                .verify(
-                    domain::CONFIRM_BINDING,
-                    &channel_binding,
-                    (&confirm_message[online_sign_start..online_sign_end])
-                        .try_into()
-                        .unwrap(),
-                )
+            let sign = &confirm_message[online_sign_start..online_sign_end];
+            remote_key_bundle
+                .verify(domain::CONFIRM_BINDING, &channel_binding, sign.try_into().unwrap())
                 .map_err(|_| Error::Inauthentic)?;
 
             recv_payload = &mut confirm_message[key_bundle_end..payload_end];
         }
 
-        Ok((symmetric.split(8), recv_payload))
+        Ok((symmetric.split(8), remote_key_bundle, recv_payload))
     }
 }

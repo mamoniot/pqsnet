@@ -9,15 +9,8 @@ path = "src/lib.rs"
 
 
 [dependencies]
-rand_core = "*"
-bytemuck = "*"
-dashmap = "*"
-zeroize = "*"
-hex-literal = "*"
-cbor4ii = { features = ["use_std", "serde1"], version = "*" }
-serde = { features = ["derive"], version = "*" }
-serde_bytes = "*"
-smallvec = { features = ["serde", "union"], version = "*" }
+zeroize = { version = "*" }
+constant_time_eq = { version = "*" }
 
 [lints.clippy]
 type_complexity = "allow"

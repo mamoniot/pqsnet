@@ -3,21 +3,17 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rand_core::CryptoRng;
-use smallvec::SmallVec;
+use constant_time_eq::{constant_time_eq_32, constant_time_eq_n};
 
 use crate::{
     crypto::{mldsa87::*, shake256::Shake256},
-    protocol::domain,
+    protocol::{domain, key_bundle::*},
     session_layer::SessionLayer,
 };
 
-pub const OFFLINE_HASH_LEN: usize = 48;
-pub const BUNDLE_HASH_LEN: usize = 32;
-
-pub const KEY_BUNDLE_FLAG_RELIABLE_STORAGE: u32 = 0b1;
-
-pub const KEY_BUNDLE_MIN_LEN: usize = 2 * PUBLIC_KEY_LEN + SIGN_LEN + 6;
+pub mod constants {
+    pub use crate::protocol::key_bundle::*;
+}
 
 pub fn get_secs_since_unix_epoch() -> u64 {
     // An `Err` is only returned if the systen time is set before unix epoch. In this case we
@@ -28,40 +24,36 @@ pub fn get_secs_since_unix_epoch() -> u64 {
         .map_or(0, Duration::as_secs)
 }
 
+pub type OfflineHash = [u8; OFFLINE_HASH_LEN];
+
+pub type BundleHash = [u8; BUNDLE_HASH_LEN];
+
 pub struct AuthenticBundle<P: PublicSigningKey> {
-    pub offline_hash: [u8; OFFLINE_HASH_LEN],
-    pub bundle_hash: [u8; BUNDLE_HASH_LEN],
-    pub online_key: P,
-    pub counter: u64,
-    pub not_before: u64,
-    pub not_after: u64,
-    pub flags: u32,
-    extensions: SmallVec<[Extension; 2]>,
+    offline_hash: OfflineHash,
+    bundle_hash: BundleHash,
+    online_key: P,
+    not_before: u64,
+    not_after: u64,
+    counter: u32,
+    flags: u32,
+    extensions: Box<[u8]>,
 }
 
-/// TODO: implement creation, serialization and deserialization.
 pub struct PrivateBundle<P: PublicSigningKey, S: PrivateSigningKey> {
-    private_online_key: S,
+    online_private_key: S,
     public_bundle_bytes: Box<[u8]>,
     public_bundle: AuthenticBundle<P>,
 }
 
 pub type PrivateBundleSL<S: SessionLayer> = Arc<PrivateBundle<S::PublicSigningKeyImpl, S::PrivateSigningKeyImpl>>;
 
-impl<P: PublicSigningKey, S: PrivateSigningKey> std::ops::Deref for PrivateBundle<P, S> {
-    type Target = AuthenticBundle<P>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.public_bundle
-    }
-}
-
-#[derive(Debug, Clone, Copy, Hash)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum AuthError {
     Invalid,
     Inauthentic,
     ExpiredKey,
     PostdatedKey,
+    UnrecognizedVersion,
 }
 
 impl std::error::Error for AuthError {}
@@ -73,18 +65,116 @@ impl std::fmt::Display for AuthError {
             AuthError::Inauthentic => write!(f, "inauthentic"),
             AuthError::ExpiredKey => write!(f, "expired key"),
             AuthError::PostdatedKey => write!(f, "postdated key"),
+            AuthError::UnrecognizedVersion => write!(f, "unrecognized key version"),
         }
     }
 }
 
+fn hash_bundle<H: Shake256>(buf: &[u8]) -> (OfflineHash, BundleHash) {
+    let mut hasher = H::new();
+    hasher.update(domain::OFFLINE_SALT);
+    hasher.update(&buf[OFFLINE_KEY_RANGE]);
+
+    let mut offline_hash = [0; OFFLINE_HASH_LEN];
+    hasher.finish(&mut offline_hash);
+
+    let mut hasher = H::new();
+    hasher.update(domain::BUNDLE_SALT);
+    hasher.update(buf);
+
+    let mut bundle_hash = [0; BUNDLE_HASH_LEN];
+    hasher.finish(&mut bundle_hash);
+
+    (offline_hash, bundle_hash)
+}
+
+impl<P: PublicSigningKey, S: PrivateSigningKey> std::ops::Deref for PrivateBundle<P, S> {
+    type Target = AuthenticBundle<P>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.public_bundle
+    }
+}
+
 impl<P: PublicSigningKey, S: PrivateSigningKey> PrivateBundle<P, S> {
-    /// This function does not check
-    pub fn sign(&self, ctx: &[u8], data: &[u8]) -> [u8; SIGN_LEN] {
-        self.private_online_key.sign(ctx, data)
+    pub fn update<K: PrivateSigningKey, H: Shake256>(
+        &self,
+        offline_private_key: K,
+        online_private_key: S,
+        online_key: P,
+        not_before: u64,
+        not_after: u64,
+        flags: u32,
+        extensions: Box<[u8]>,
+    ) -> Self {
+        Self::new::<K, H>(
+            offline_private_key,
+            online_private_key,
+            self.public_bundle_bytes[OFFLINE_KEY_RANGE].try_into().unwrap(),
+            online_key,
+            not_before,
+            not_after,
+            self.counter + 1,
+            flags,
+            extensions,
+        )
     }
 
-    pub fn private_online_key(&self) -> &S {
-        &self.private_online_key
+    pub fn new<K: PrivateSigningKey, H: Shake256>(
+        offline_private_key: K,
+        online_private_key: S,
+        offline_public_key: [u8; PUBLIC_KEY_LEN],
+        online_key: P,
+        not_before: u64,
+        not_after: u64,
+        counter: u32,
+        flags: u32,
+        extensions: Box<[u8]>,
+    ) -> Self {
+        let offline_sign_start = EXTENSIONS_START + extensions.len();
+        let offline_sign_end = offline_sign_start + OFFLINE_SIGN_LEN;
+
+        let mut buf = vec![0; offline_sign_end];
+
+        buf[VERSION_IDX] = VERSION_VALUE;
+        buf[OFFLINE_KEY_RANGE].copy_from_slice(&offline_public_key);
+        buf[ONLINE_KEY_RANGE].copy_from_slice(&online_key.encode());
+        buf[NOT_BEFORE_RANGE].copy_from_slice(&not_before.to_be_bytes());
+        buf[NOT_AFTER_RANGE].copy_from_slice(&not_after.to_be_bytes());
+        buf[COUNTER_RANGE].copy_from_slice(&counter.to_be_bytes());
+        buf[FLAGS_RANGE].copy_from_slice(&flags.to_be_bytes());
+        buf[EXTENSIONS_LEN_RANGE].copy_from_slice(&(extensions.len() as u32).to_be_bytes());
+
+        buf[EXTENSIONS_START..offline_sign_start].copy_from_slice(&extensions);
+
+        let sign = offline_private_key.sign(domain::OFFLINE_KEY_CERTIFICATION, &buf[..offline_sign_start]);
+        buf[offline_sign_start..offline_sign_end].copy_from_slice(&sign);
+
+        let (offline_hash, bundle_hash) = hash_bundle::<H>(&buf[..]);
+
+        Self {
+            online_private_key,
+            public_bundle_bytes: buf.into(),
+            public_bundle: AuthenticBundle {
+                offline_hash,
+                bundle_hash,
+                online_key,
+                counter,
+                not_before,
+                not_after,
+                flags,
+                extensions,
+            },
+        }
+    }
+
+    /// This function does not check if this key bundle is expired or post-dated.
+    pub fn sign(&self, ctx: &[u8], data: &[u8]) -> [u8; SIGN_LEN] {
+        self.online_private_key.sign(ctx, data)
+    }
+
+    pub fn online_private_key(&self) -> &S {
+        &self.online_private_key
     }
 
     pub fn public_bundle_bytes(&self) -> &[u8] {
@@ -93,93 +183,61 @@ impl<P: PublicSigningKey, S: PrivateSigningKey> PrivateBundle<P, S> {
 }
 
 impl<P: PublicSigningKey> AuthenticBundle<P> {
-    pub fn new<W: std::io::Write, R: CryptoRng, K: PrivateSigningKey>(
-        writer: W,
-        rng: &mut R,
-        offline_private_key: K,
-        offline_public_key: [u8; PUBLIC_KEY_LEN],
-        online_public_key: [u8; PUBLIC_KEY_LEN],
-        counter: u64,
-        not_before: u64,
-        not_after: u64,
-        flags: u32,
-    ) -> Result<Self, std::io::Error> {
-        let bundle = RawKeyBundle {
-            offline_key: offline_public_key,
-            online_key: online_public_key,
-            counter,
-            not_before,
-            not_after,
-            flags,
-            extensions: todo!(),
-        };
-        cbor4ii::serde::to_writer(&mut writer, &bundle);
-        todo!()
-    }
-
-    pub fn authenticate<H: Shake256>(bundle_bytes: &[u8]) -> Result<(Arc<Self>, usize), AuthError> {
-        Self::authenticate_with_time::<H>(bundle_bytes, get_secs_since_unix_epoch())
+    pub fn authenticate<H: Shake256>(buf: &[u8]) -> Result<(Self, usize), AuthError> {
+        Self::authenticate_with_time::<H>(buf, get_secs_since_unix_epoch())
     }
 
     pub fn authenticate_with_time<'a, H: Shake256>(
-        bundle_bytes: &'a [u8],
+        buf: &[u8],
         secs_since_unix_epoch: u64,
-    ) -> Result<(Arc<Self>, usize), AuthError> {
-        let mut reader = bundle_bytes;
+    ) -> Result<(Self, usize), AuthError> {
+        if buf[VERSION_IDX] != VERSION_VALUE {
+            return Err(AuthError::UnrecognizedVersion);
+        }
 
-        let bundle: RawKeyBundle = cbor4ii::serde::from_reader(&mut reader).map_err(|_| AuthError::Invalid)?;
+        let not_before = u64::from_be_bytes(buf[NOT_BEFORE_RANGE].try_into().unwrap());
+        let not_after = u64::from_be_bytes(buf[NOT_AFTER_RANGE].try_into().unwrap());
+        let counter = u32::from_be_bytes(buf[COUNTER_RANGE].try_into().unwrap());
+        let flags = u32::from_be_bytes(buf[FLAGS_RANGE].try_into().unwrap());
+        let extensions_len = u32::from_be_bytes(buf[EXTENSIONS_LEN_RANGE].try_into().unwrap()) as usize;
+        let offline_sign_start = EXTENSIONS_START + extensions_len;
+        let offline_sign_end = offline_sign_start + OFFLINE_SIGN_LEN;
 
-        let signature_start = bundle_bytes.len() - reader.len();
-        let Some(signature_end) = signature_start.checked_add(SIGN_LEN) else {
-            return Err(AuthError::Inauthentic);
-        };
-
-        if signature_end > bundle_bytes.len() {
-            return Err(AuthError::Invalid);
-        } else if secs_since_unix_epoch < bundle.not_before {
+        if secs_since_unix_epoch < not_before {
             return Err(AuthError::PostdatedKey);
-        } else if secs_since_unix_epoch > bundle.not_after {
+        } else if secs_since_unix_epoch > not_after {
             return Err(AuthError::ExpiredKey);
         }
 
-        let offline_key = P::decode(bundle.offline_key);
-        let online_key = P::decode(bundle.online_key);
+        let offline_key = P::decode(buf[OFFLINE_KEY_RANGE].try_into().unwrap());
 
         let auth = offline_key.verify(
             domain::OFFLINE_KEY_CERTIFICATION,
-            &bundle_bytes[..signature_start],
-            (&bundle_bytes[signature_start..signature_end]).try_into().unwrap(),
+            &buf[..offline_sign_start],
+            (&buf[offline_sign_start..offline_sign_end]).try_into().unwrap(),
         );
         if !auth {
             return Err(AuthError::Inauthentic);
         }
 
-        let mut hasher = H::new();
+        let online_key = P::decode(buf[ONLINE_KEY_RANGE].try_into().unwrap());
 
-        hasher.update(domain::OFFLINE_SALT);
-        hasher.update(&bundle.offline_key);
-        let mut offline_hash = [0; OFFLINE_HASH_LEN];
-        hasher.finish(&mut offline_hash);
+        let extensions = Box::from(&buf[EXTENSIONS_START..offline_sign_start]);
 
-        let mut hasher = H::new();
-
-        hasher.update(domain::BUNDLE_SALT);
-        hasher.update(&bundle_bytes[..signature_start]);
-        let mut bundle_hash = [0; BUNDLE_HASH_LEN];
-        hasher.finish(&mut bundle_hash);
+        let (offline_hash, bundle_hash) = hash_bundle::<H>(&buf[..offline_sign_end]);
 
         Ok((
-            Arc::new(AuthenticBundle {
+            AuthenticBundle {
                 offline_hash,
                 bundle_hash,
                 online_key,
-                counter: bundle.counter,
-                not_before: bundle.not_before,
-                not_after: bundle.not_after,
-                flags: bundle.flags,
-                extensions: bundle.extensions,
-            }),
-            signature_end,
+                counter,
+                not_before,
+                not_after,
+                flags,
+                extensions,
+            },
+            offline_sign_end,
         ))
     }
 
@@ -206,65 +264,43 @@ impl<P: PublicSigningKey> AuthenticBundle<P> {
     pub fn verify(&self, ctx: &[u8], data: &[u8], signature: &[u8; SIGN_LEN]) -> Result<(), AuthError> {
         self.verify_with_time(ctx, data, signature, get_secs_since_unix_epoch())
     }
-}
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct ExtensionContents {}
-
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "n")]
-pub enum Extension {
-    #[serde(untagged)]
-    Unknown { r: bool },
-}
-
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct SerdeKeyBundle(
-    #[serde(with = "serde_bytes")] [u8; PUBLIC_KEY_LEN],
-    #[serde(with = "serde_bytes")] [u8; PUBLIC_KEY_LEN],
-    u64,
-    u64,
-    u64,
-    u32,
-    SmallVec<[Extension; 2]>,
-);
-
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-#[serde(from = "SerdeKeyBundle")]
-#[serde(into = "SerdeKeyBundle")]
-pub struct RawKeyBundle {
-    offline_key: [u8; PUBLIC_KEY_LEN],
-    online_key: [u8; PUBLIC_KEY_LEN],
-    counter: u64,
-    not_before: u64,
-    not_after: u64,
-    flags: u32,
-    extensions: SmallVec<[Extension; 2]>,
-}
-
-impl From<SerdeKeyBundle> for RawKeyBundle {
-    fn from(v: SerdeKeyBundle) -> Self {
-        Self {
-            offline_key: v.0,
-            online_key: v.1,
-            counter: v.2,
-            not_before: v.3,
-            not_after: v.4,
-            flags: v.5,
-            extensions: v.6,
-        }
+    pub fn offline_eq_raw(&self, other: &OfflineHash) -> bool {
+        constant_time_eq_n(&self.offline_hash, other)
     }
-}
-impl From<RawKeyBundle> for SerdeKeyBundle {
-    fn from(v: RawKeyBundle) -> Self {
-        Self(
-            v.offline_key,
-            v.online_key,
-            v.counter,
-            v.not_before,
-            v.not_after,
-            v.flags,
-            v.extensions,
-        )
+    pub fn bundle_eq_raw(&self, other: &BundleHash) -> bool {
+        constant_time_eq_32(&self.bundle_hash, other)
+    }
+
+    pub fn offline_eq(&self, other: &Self) -> bool {
+        self.offline_eq_raw(other.offline_hash())
+    }
+    pub fn bundle_eq(&self, other: &Self) -> bool {
+        self.bundle_eq_raw(other.bundle_hash())
+    }
+
+    pub fn offline_hash(&self) -> &OfflineHash {
+        &self.offline_hash
+    }
+    pub fn bundle_hash(&self) -> &BundleHash {
+        &self.bundle_hash
+    }
+    pub fn online_key(&self) -> &P {
+        &self.online_key
+    }
+    pub fn not_before(&self) -> u64 {
+        self.not_before
+    }
+    pub fn not_after(&self) -> u64 {
+        self.not_after
+    }
+    pub fn counter(&self) -> u32 {
+        self.counter
+    }
+    pub fn flags(&self) -> u32 {
+        self.flags
+    }
+    pub fn extensions(&self) -> &[u8] {
+        &self.extensions
     }
 }
