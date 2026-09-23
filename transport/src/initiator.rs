@@ -58,16 +58,16 @@ impl<S: SessionLayer> InitializeState<S> {
         let mut remote_key_bundle = None;
         let mut symmetric = SymmetricState::<S>::new(aad);
 
-        if let Some((token, key, key_bundle)) = resumption {
-            init_message[RESUMPTION_TOKEN_RANGE].copy_from_slice(token);
+        if let Some((resumption_token, resumption_key, key_bundle)) = resumption {
+            init_message[RESUMPTION_TOKEN_RANGE].copy_from_slice(resumption_token);
 
-            symmetric.mix(&init_message[..RESUMPTION_TOKEN_END]);
+            symmetric.mix(9, &init_message[..RESUMPTION_TOKEN_END]);
 
             // If we are allowing fallback we need the symmetric state from before mixing the
             // secret resumption key.
             fallback = Some(symmetric.clone());
 
-            symmetric.mix(&key[..]);
+            symmetric.mix(10, &resumption_key[..]);
 
             /* RESUMPTION HANDLING */
 
@@ -90,25 +90,25 @@ impl<S: SessionLayer> InitializeState<S> {
 
             init_message[PAYLOAD_START..payload_end].copy_from_slice(&payload[..]);
 
-            symmetric.encrypt_and_mix(&mut init_message[KEY_BUNDLE_CHECKSUM_START..payload_tag_end]);
+            symmetric.encrypt_and_mix(11, &mut init_message[KEY_BUNDLE_CHECKSUM_START..payload_tag_end]);
 
             /* ONLINE SIGNATURE HANDLING */
 
             let sign = private_key_bundle.sign(domain::INITIALIZE_BINDING, &symmetric.channel_binding());
             init_message[online_sign_start..online_sign_end].copy_from_slice(&sign);
 
-            symmetric.encrypt_and_mix(&mut init_message[online_sign_start..online_sign_tag_end]);
+            symmetric.encrypt_and_mix(12, &mut init_message[online_sign_start..online_sign_tag_end]);
 
             if let Some(fallback) = &mut fallback {
                 // A fallback handshake must still authenticate the entire init message.
-                fallback.mix(&init_message[RESUMPTION_TOKEN_END..]);
+                fallback.mix(14, &init_message[RESUMPTION_TOKEN_END..]);
             }
 
             remote_key_bundle = Some(key_bundle);
         } else {
             /* FULL HANDSHAKE HANDLING */
 
-            symmetric.mix(&init_message[..]);
+            symmetric.mix(1, &init_message[..]);
         }
 
         Ok(InitializeState {
@@ -167,8 +167,8 @@ impl<S: SessionLayer> InitializeState<S> {
                     .ok_or(Error::Inauthentic)?,
             );
 
-            symmetric.mix(&reply_message[..EPHEMERAL_CIPHERTEXT_END]);
-            symmetric.mix(&shared_secret[..]);
+            symmetric.mix(2, &reply_message[..EPHEMERAL_CIPHERTEXT_END]);
+            symmetric.mix(3, &shared_secret[..]);
 
             /* PAYLOAD HANDLING */
 
@@ -178,7 +178,7 @@ impl<S: SessionLayer> InitializeState<S> {
             let online_sign_end = reply_message.len() - ONLINE_SIGN_REV_START;
             let online_sign_tag_end = reply_message.len() - ONLINE_SIGN_TAG_REV_START;
 
-            symmetric.decrypt_and_mix(&mut reply_message[PAYLOAD_START..payload_tag_end])?;
+            symmetric.decrypt_and_mix(4, &mut reply_message[PAYLOAD_START..payload_tag_end])?;
 
             let key_bundle_end;
             if handshake_type != HANDSHAKE_TYPE_RESUME {
@@ -214,7 +214,7 @@ impl<S: SessionLayer> InitializeState<S> {
 
             /* ONLINE SIGNATURE HANDLING */
 
-            symmetric.decrypt_and_mix(&mut reply_message[online_sign_start..online_sign_tag_end])?;
+            symmetric.decrypt_and_mix(5, &mut reply_message[online_sign_start..online_sign_tag_end])?;
 
             remote_key_bundle
                 .verify(
@@ -228,7 +228,7 @@ impl<S: SessionLayer> InitializeState<S> {
             if handshake_type == HANDSHAKE_TYPE_RESUME {
                 /* SPLIT */
 
-                return Ok((None, remote_key_bundle, symmetric.split(), recv_payload));
+                return Ok((None, remote_key_bundle, symmetric.split(13), recv_payload));
             }
         }
         {
@@ -251,7 +251,7 @@ impl<S: SessionLayer> InitializeState<S> {
 
             confirm_message[key_bundle_end..payload_end].copy_from_slice(&self.payload[..]);
 
-            symmetric.encrypt_and_mix(&mut confirm_message[PAYLOAD_START..payload_tag_end]);
+            symmetric.encrypt_and_mix(6, &mut confirm_message[PAYLOAD_START..payload_tag_end]);
 
             /* ONLINE SIGNATURE HANDLING */
 
@@ -260,14 +260,14 @@ impl<S: SessionLayer> InitializeState<S> {
                 .sign(domain::CONFIRM_BINDING, &symmetric.channel_binding());
             confirm_message[online_sign_start..online_sign_end].copy_from_slice(&sign);
 
-            symmetric.encrypt_and_mix(&mut confirm_message[online_sign_start..online_sign_tag_end]);
+            symmetric.encrypt_and_mix(7, &mut confirm_message[online_sign_start..online_sign_tag_end]);
 
             /* STATE MANAGEMENT */
 
             Ok((
                 Some(confirm_message),
                 remote_key_bundle,
-                symmetric.split(),
+                symmetric.split(8),
                 recv_payload,
             ))
         }

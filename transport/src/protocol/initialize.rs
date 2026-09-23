@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use crate::crypto::*;
+use crate::{crypto::*, protocol::symmetric_state};
 
 /* MESSAGE DEFINITION */
 
@@ -10,7 +10,7 @@ pub const EPHEMERAL_ENC_KEY_END: usize = EPHEMERAL_ENC_KEY_START + EPHEMERAL_ENC
 pub const EPHEMERAL_ENC_KEY_RANGE: Range<usize> = EPHEMERAL_ENC_KEY_START..EPHEMERAL_ENC_KEY_END;
 
 pub const RESUMPTION_TOKEN_START: usize = EPHEMERAL_ENC_KEY_END;
-pub const RESUMPTION_TOKEN_LEN: usize = 32;
+pub const RESUMPTION_TOKEN_LEN: usize = symmetric_state::RESUMPTION_TOKEN_LEN;
 pub const RESUMPTION_TOKEN_END: usize = RESUMPTION_TOKEN_START + RESUMPTION_TOKEN_LEN;
 pub const RESUMPTION_TOKEN_RANGE: Range<usize> = RESUMPTION_TOKEN_START..RESUMPTION_TOKEN_END;
 
@@ -38,5 +38,3 @@ pub const ONLINE_SIGN_TAG_LEN: usize = aes256::TAG_LEN;
 pub const ONLINE_SIGN_TAG_REV_START: usize = 0;
 
 /* MISC CONSTANTS */
-
-pub const RESUMPTION_KEY_LEN: usize = 64;

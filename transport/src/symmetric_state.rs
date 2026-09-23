@@ -24,53 +24,48 @@ impl<S: SessionLayer> Clone for SymmetricState<S> {
 }
 
 impl<S: SessionLayer> SymmetricState<S> {
-    pub fn new(aad: &[u8]) -> Self {
-        let mut hasher = S::Shake256Impl::new();
-        hasher.update(domain::TRANSPORT_PROTOCOL_SALT);
-        hasher.update(aad);
-
-        let mut key_buffer = Zeroizing::new([0u8; SHAKE256_HANDSHAKE_OUTPUT_LEN]);
-        hasher.finish(&mut key_buffer[..]);
-
-        Self { key_buffer, _s: Default::default() }
-    }
-
-    pub fn mix(&mut self, shared_data: &[u8]) {
+    fn hash3(&self, step_no: u8, shared_data: &[u8]) -> S::Shake256Impl {
         let mut hasher = S::Shake256Impl::new();
         hasher.update(&self.key_buffer[CHAINING_KEY_RANGE]);
+        hasher.update(&[step_no]);
         hasher.update(shared_data);
-
-        hasher.finish(&mut self.key_buffer[..]);
+        hasher
     }
 
-    pub fn encrypt_and_mix(&mut self, plaintext_and_pad: &mut [u8]) {
+    pub fn mix(&mut self, step_no: u8, shared_data: &[u8]) {
+        self.hash3(step_no, shared_data).finish(&mut self.key_buffer[..]);
+    }
+
+    pub fn new(aad: &[u8]) -> Self {
+        let mut ret = Self { key_buffer: Zeroizing::new([0u8; _]), _s: Default::default() };
+
+        ret.key_buffer[..domain::HANDSHAKE_SALT.len()].copy_from_slice(domain::HANDSHAKE_SALT);
+        ret.mix(0, aad);
+
+        ret
+    }
+
+    pub fn encrypt_and_mix(&mut self, step_no: u8, plaintext_and_pad: &mut [u8]) {
         let (plaintext, pad) = plaintext_and_pad.split_at_mut(plaintext_and_pad.len() - TAG_LEN);
 
         let tag = S::ColdPathCipher::encrypt_in_place(
             (&self.key_buffer[AES_KEY_RANGE]).try_into().unwrap(),
-            domain::AES_GCM_FIXED_FIELD_HANDSHAKE,
+            domain::to_handshake_nonce(step_no),
             plaintext,
         );
         pad.copy_from_slice(&tag);
 
-        let mut hasher = S::Shake256Impl::new();
-        hasher.update(&self.key_buffer[CHAINING_KEY_RANGE]);
-        hasher.update(plaintext_and_pad);
-
-        hasher.finish(&mut self.key_buffer[..]);
+        self.mix(step_no, plaintext_and_pad);
     }
 
-    pub fn decrypt_and_mix(&mut self, ciphertext_and_tag: &mut [u8]) -> Result<(), Error> {
-        let mut hasher = S::Shake256Impl::new();
-
-        hasher.update(&self.key_buffer[CHAINING_KEY_RANGE]);
-        hasher.update(ciphertext_and_tag);
+    pub fn decrypt_and_mix(&mut self, step_no: u8, ciphertext_and_tag: &mut [u8]) -> Result<(), Error> {
+        let hasher = self.hash3(step_no, ciphertext_and_tag);
 
         let (ciphertext, tag) = ciphertext_and_tag.split_at_mut(ciphertext_and_tag.len() - TAG_LEN);
 
         let auth = S::ColdPathCipher::decrypt_in_place(
             (&self.key_buffer[AES_KEY_RANGE]).try_into().unwrap(),
-            domain::AES_GCM_FIXED_FIELD_HANDSHAKE,
+            domain::to_handshake_nonce(step_no),
             ciphertext,
             tag.try_into().unwrap(),
         );
@@ -84,12 +79,10 @@ impl<S: SessionLayer> SymmetricState<S> {
         self.key_buffer[CHANNEL_BINDING_RANGE].try_into().unwrap()
     }
 
-    pub fn split(self) -> SymmetricKeys {
-        let mut key_buffer = Zeroizing::new([0u8; SHAKE256_SPLIT_OUTPUT_LEN]);
-        let mut hasher = S::Shake256Impl::new();
+    pub fn split(self, step_no: u8) -> SymmetricKeys {
+        let mut key_buffer = Zeroizing::new([0u8; _]);
 
-        hasher.update(&self.key_buffer[CHAINING_KEY_RANGE]);
-        hasher.finish(&mut key_buffer[..]);
+        self.hash3(step_no, &[]).finish(&mut key_buffer[..]);
 
         SymmetricKeys { key_buffer }
     }

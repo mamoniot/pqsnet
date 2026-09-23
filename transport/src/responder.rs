@@ -59,7 +59,7 @@ impl<S: SessionLayer> ReplyState<S> {
 
             let has_resumption_token = init_message.len() >= RESUMPTION_TOKEN_END;
             let resumption = if has_resumption_token {
-                symmetric.mix(&init_message[..RESUMPTION_TOKEN_END]);
+                symmetric.mix(9, &init_message[..RESUMPTION_TOKEN_END]);
 
                 let resumption_token = (&init_message[RESUMPTION_TOKEN_RANGE]).try_into().unwrap();
                 sl.lookup_resumption_key(resumption_token)
@@ -76,7 +76,7 @@ impl<S: SessionLayer> ReplyState<S> {
             if let Some((resumption_key, remote_key_bundle)) = resumption {
                 expected_offline_hash = Some(remote_key_bundle.offline_hash);
 
-                symmetric.mix(&resumption_key[..]);
+                symmetric.mix(10, &resumption_key[..]);
 
                 /* RESUMPTION HANDLING */
 
@@ -93,7 +93,7 @@ impl<S: SessionLayer> ReplyState<S> {
 
                 let checksum_channel_binding = symmetric.channel_binding();
 
-                symmetric.decrypt_and_mix(&mut init_message[KEY_BUNDLE_CHECKSUM_START..payload_tag_end])?;
+                symmetric.decrypt_and_mix(11, &mut init_message[KEY_BUNDLE_CHECKSUM_START..payload_tag_end])?;
 
                 recv_payload = Some(PAYLOAD_START..payload_end);
 
@@ -117,7 +117,7 @@ impl<S: SessionLayer> ReplyState<S> {
 
                 let signature_channel_binding = symmetric.channel_binding();
 
-                symmetric.decrypt_and_mix(&mut init_message[online_sign_start..online_sign_tag_end])?;
+                symmetric.decrypt_and_mix(12, &mut init_message[online_sign_start..online_sign_tag_end])?;
 
                 /* Authentication of the initiator's signature is skipped when doing a
                 full handshake if the initiator has the incorrect keys. A full handshake
@@ -138,17 +138,15 @@ impl<S: SessionLayer> ReplyState<S> {
             } else if has_resumption_token {
                 /* FALLBACK */
 
-                symmetric.mix(&init_message[RESUMPTION_TOKEN_END..]);
+                symmetric.mix(14, &init_message[RESUMPTION_TOKEN_END..]);
 
                 handshake_type = reply::HANDSHAKE_TYPE_FALLBACK;
             } else {
                 /* FULL HANDSHAKE */
 
-                symmetric.mix(&init_message[..]);
+                symmetric.mix(1, &init_message[..]);
                 handshake_type = reply::HANDSHAKE_TYPE_FULL;
             }
-
-            symmetric.mix(init_message);
         }
         /* REPLY MESSAGE SHARED SECTION */
 
@@ -165,8 +163,8 @@ impl<S: SessionLayer> ReplyState<S> {
 
             reply_message[EPHEMERAL_CIPHERTEXT_RANGE].copy_from_slice(&ciphertext);
 
-            symmetric.mix(&reply_message[..EPHEMERAL_CIPHERTEXT_END]);
-            symmetric.mix(&shared_secret[..]);
+            symmetric.mix(2, &reply_message[..EPHEMERAL_CIPHERTEXT_END]);
+            symmetric.mix(3, &shared_secret[..]);
 
             /* PAYLOAD HANDLING */
 
@@ -187,14 +185,14 @@ impl<S: SessionLayer> ReplyState<S> {
             let online_sign_end = reply_message.len() - ONLINE_SIGN_REV_START;
             let online_sign_tag_end = reply_message.len() - ONLINE_SIGN_TAG_REV_START;
 
-            symmetric.encrypt_and_mix(&mut reply_message[PAYLOAD_START..payload_tag_end]);
+            symmetric.encrypt_and_mix(4, &mut reply_message[PAYLOAD_START..payload_tag_end]);
 
             /* ONLINE SIGNATURE HANDLING */
 
             let signature = private_key_bundle.sign(domain::REPLY_BINDING, &symmetric.channel_binding());
             reply_message[online_sign_start..online_sign_end].copy_from_slice(&signature);
 
-            symmetric.encrypt_and_mix(&mut reply_message[online_sign_start..online_sign_tag_end]);
+            symmetric.encrypt_and_mix(5, &mut reply_message[online_sign_start..online_sign_tag_end]);
 
             if handshake_type != HANDSHAKE_TYPE_RESUME {
                 Ok(ResponseOk::Incomplete(
@@ -204,7 +202,7 @@ impl<S: SessionLayer> ReplyState<S> {
             } else {
                 Ok(ResponseOk::Complete(
                     reply_message,
-                    symmetric.split(),
+                    symmetric.split(13),
                     &mut init_message[recv_payload.unwrap()],
                 ))
             }
@@ -229,7 +227,7 @@ impl<S: SessionLayer> ReplyState<S> {
 
             /* PAYLOAD AND KEY BUNDLE HANDLING */
 
-            symmetric.decrypt_and_mix(&mut confirm_message[PAYLOAD_START..payload_tag_end])?;
+            symmetric.decrypt_and_mix(6, &mut confirm_message[PAYLOAD_START..payload_tag_end])?;
 
             let (key_bundle, key_bundle_len) = AuthenticBundle::<S::PublicSigningKeyImpl>::authenticate::<
                 S::Shake256Impl,
@@ -249,7 +247,7 @@ impl<S: SessionLayer> ReplyState<S> {
 
             let channel_binding = symmetric.channel_binding();
 
-            symmetric.decrypt_and_mix(&mut confirm_message[online_sign_start..online_sign_tag_end])?;
+            symmetric.decrypt_and_mix(7, &mut confirm_message[online_sign_start..online_sign_tag_end])?;
 
             key_bundle
                 .verify(
@@ -264,6 +262,6 @@ impl<S: SessionLayer> ReplyState<S> {
             recv_payload = &mut confirm_message[key_bundle_end..payload_end];
         }
 
-        Ok((symmetric.split(), recv_payload))
+        Ok((symmetric.split(8), recv_payload))
     }
 }

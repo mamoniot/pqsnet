@@ -4,8 +4,8 @@ use crate::crypto::*;
 use crate::key_bundle::{AuthenticBundle, PrivateBundle};
 use crate::protocol::*;
 
-pub type ResumptionToken = [u8; initialize::RESUMPTION_TOKEN_LEN];
-pub type ResumptionKey = [u8; initialize::RESUMPTION_KEY_LEN];
+pub type ResumptionToken = [u8; symmetric_state::RESUMPTION_TOKEN_LEN];
+pub type ResumptionKey = [u8; symmetric_state::RESUMPTION_KEY_LEN];
 pub type SocketKey = [u8; aes256::KEY_LEN];
 
 #[derive(Default)]

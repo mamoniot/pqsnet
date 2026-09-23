@@ -3,6 +3,7 @@ pub mod session_layer;
 pub mod crypto;
 
 pub(crate) mod protocol;
+pub use protocol::domain::to_data_nonce;
 
 pub mod initiator;
 
