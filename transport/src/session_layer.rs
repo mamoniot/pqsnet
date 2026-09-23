@@ -8,18 +8,6 @@ pub type ResumptionToken = [u8; symmetric_state::RESUMPTION_TOKEN_LEN];
 pub type ResumptionKey = [u8; symmetric_state::RESUMPTION_KEY_LEN];
 pub type SocketKey = [u8; aes256::KEY_LEN];
 
-#[derive(Default)]
-pub enum ResumptionAction<S: SessionLayer> {
-    ResumeWithKey {
-        key: ResumptionKey,
-        allow_fallback: bool,
-        online_public_key: S::PublicSigningKeyImpl,
-    },
-    #[default]
-    ReplyUnknown,
-    Reject,
-}
-
 pub trait SessionLayer: Sized {
     type HotPathDuplexCipherImpl: aes256::HotPathDuplexCipher;
     type ColdPathCipher: aes256::ColdPathCipher;
@@ -32,7 +20,7 @@ pub trait SessionLayer: Sized {
     fn lookup_resumption_key(
         &mut self,
         resumption_token: &ResumptionToken,
-    ) -> Option<(ResumptionKey, AuthenticBundle<Self::PublicSigningKeyImpl>)>;
+    ) -> Option<(ResumptionKey, Arc<AuthenticBundle<Self::PublicSigningKeyImpl>>)>;
 
     fn private_key_bundle(&mut self) -> Arc<PrivateBundle<Self::PublicSigningKeyImpl, Self::PrivateSigningKeyImpl>>;
     // fn sign_with_online_key(&mut self, ctx: &[u8], data: &[u8]) -> [u8; mldsa87::SIGNATURE_LEN];

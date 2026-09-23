@@ -6,7 +6,7 @@ use zeroize::Zeroizing;
 use crate::{
     crypto::prelude::*,
     error::{Error, ReplyError},
-    key_bundle::{AuthenticBundle, OfflineHash},
+    key_bundle::{AuthenticBundle, OfflineHash, PrivateBundle},
     protocol::*,
     session_layer::SessionLayer,
     symmetric_state::{SymmetricKeys, SymmetricState},
@@ -14,11 +14,17 @@ use crate::{
 
 pub struct ReplyState<S: SessionLayer> {
     symmetric: SymmetricState<S>,
-    expected_offline_hash: Option<OfflineHash>,
+    remote_offline_hash: Option<OfflineHash>,
+    reject_if_remote_has_reliable_storage: bool,
 }
 
 pub enum ResponseOk<'a, S: SessionLayer> {
-    Complete(Vec<u8>, SymmetricKeys, &'a mut [u8]),
+    Complete(
+        Vec<u8>,
+        SymmetricKeys,
+        Arc<AuthenticBundle<S::PublicSigningKeyImpl>>,
+        &'a mut [u8],
+    ),
     Incomplete(Vec<u8>, ReplyState<S>),
 }
 
@@ -28,14 +34,14 @@ impl<S: SessionLayer> ReplyState<S> {
         aad: &[u8],
         init_message: &'a mut [u8],
         require_resumption: bool,
+        private_key_bundle: &PrivateBundle<S::PublicSigningKeyImpl, S::PrivateSigningKeyImpl>,
         create_payload: impl FnOnce(&mut Vec<u8>),
     ) -> Result<ResponseOk<'a, S>, ReplyError> {
         let shared_secret;
         let ciphertext;
-        let private_key_bundle;
         let handshake_type;
-        let mut recv_payload = None;
-        let mut expected_offline_hash = None;
+        let mut resume = None;
+        let mut remote_offline_hash = None;
         let mut symmetric;
         {
             use initialize::*;
@@ -62,18 +68,14 @@ impl<S: SessionLayer> ReplyState<S> {
 
                 let resumption_token = (&init_message[RESUMPTION_TOKEN_RANGE]).try_into().unwrap();
                 sl.lookup_resumption_key(resumption_token)
-            } else if require_resumption {
-                return Err(ReplyError::Inauthentic);
             } else if init_message.len() == EPHEMERAL_ENC_KEY_END {
                 None
             } else {
                 return Err(ReplyError::Invalid);
             };
 
-            private_key_bundle = sl.private_key_bundle();
-
-            if let Some((resumption_key, remote_key_bundle)) = resumption {
-                expected_offline_hash = Some(*remote_key_bundle.offline_hash());
+            if let Some((resumption_key, key_bundle)) = resumption {
+                remote_offline_hash = Some(*key_bundle.offline_hash());
 
                 symmetric.mix(10, &resumption_key[..]);
 
@@ -94,13 +96,11 @@ impl<S: SessionLayer> ReplyState<S> {
 
                 symmetric.decrypt_and_mix(11, &mut init_message[KEY_BUNDLE_CHECKSUM_START..payload_tag_end])?;
 
-                recv_payload = Some(PAYLOAD_START..payload_end);
-
                 /* KEY BUNDLE CHECKSUM HANDLING */
 
                 let mut bundle_hasher = S::Shake256Impl::new();
                 bundle_hasher.update(&checksum_channel_binding);
-                bundle_hasher.update(remote_key_bundle.bundle_hash());
+                bundle_hasher.update(key_bundle.bundle_hash());
                 bundle_hasher.update(private_key_bundle.bundle_hash());
 
                 let mut local_checksum = [0; KEY_BUNDLE_CHECKSUM_LEN];
@@ -109,7 +109,7 @@ impl<S: SessionLayer> ReplyState<S> {
                 let remote_checksum = &init_message[KEY_BUNDLE_CHECKSUM_RANGE];
                 /* An incorrect bundle checksum indicates one party currently has an
                 outdated or incorrect public key of the other party. So we need to do a
-                fallback handshake to re-exchange public keys. */
+                full handshake to re-exchange public keys. */
                 let has_correct_bundle = constant_time_eq_16(&local_checksum, remote_checksum.try_into().unwrap());
 
                 /* ONLINE SIGNATURE HANDLING */
@@ -123,14 +123,17 @@ impl<S: SessionLayer> ReplyState<S> {
                 will force the initiator to send a second, better signature later. */
                 if has_correct_bundle {
                     let sign = (&init_message[online_sign_start..online_sign_end]).try_into().unwrap();
-                    remote_key_bundle
+                    key_bundle
                         .verify(domain::INITIALIZE_BINDING, &signature_channel_binding, sign)
                         .map_err(|_| ReplyError::Inauthentic)?;
 
                     handshake_type = reply::HANDSHAKE_TYPE_RESUME;
+                    resume = Some((key_bundle, PAYLOAD_START..payload_end));
                 } else {
                     handshake_type = reply::HANDSHAKE_TYPE_FULL;
                 }
+            } else if require_resumption {
+                return Err(ReplyError::Invalid);
             } else if has_resumption_token {
                 /* FALLBACK */
 
@@ -190,16 +193,22 @@ impl<S: SessionLayer> ReplyState<S> {
 
             symmetric.encrypt_and_mix(5, &mut reply_message[online_sign_start..online_sign_tag_end]);
 
-            if handshake_type != HANDSHAKE_TYPE_RESUME {
-                Ok(ResponseOk::Incomplete(
-                    reply_message,
-                    ReplyState { symmetric, expected_offline_hash },
-                ))
-            } else {
+            if let Some((remote_key_bundle, recv_payload_range)) = resume {
                 Ok(ResponseOk::Complete(
                     reply_message,
                     symmetric.split(13),
-                    &mut init_message[recv_payload.unwrap()],
+                    remote_key_bundle,
+                    &mut init_message[recv_payload_range],
+                ))
+            } else {
+                Ok(ResponseOk::Incomplete(
+                    reply_message,
+                    ReplyState {
+                        symmetric,
+                        remote_offline_hash,
+                        reject_if_remote_has_reliable_storage: handshake_type == HANDSHAKE_TYPE_FALLBACK
+                            && (private_key_bundle.flags() & key_bundle::FLAG_RELIABLE_STORAGE) > 0,
+                    },
                 ))
             }
         }
@@ -241,12 +250,18 @@ impl<S: SessionLayer> ReplyState<S> {
 
         let key_bundle_end = PAYLOAD_START + key_bundle_len;
 
-        if let Some(expected_offline_hash) = self.expected_offline_hash {
+        if let Some(remote_offline_hash) = &self.remote_offline_hash {
             /* If the offline hashes are not equal then we are not connecting with the party we
             intended to connect to. A party's offline key is their id and it must never change. */
-            if !remote_key_bundle.offline_eq_raw(&expected_offline_hash) {
+            if !remote_key_bundle.offline_eq_raw(remote_offline_hash) {
                 return Err(Error::Inauthentic);
             }
+        }
+
+        if self.reject_if_remote_has_reliable_storage
+            && (remote_key_bundle.flags() & key_bundle::FLAG_RELIABLE_STORAGE) > 0
+        {
+            return Err(Error::Inauthentic);
         }
 
         /* ONLINE SIGNATURE HANDLING */

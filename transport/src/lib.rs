@@ -16,8 +16,8 @@ pub mod crypto_impl;
 
 pub(crate) mod symmetric_state;
 
-pub use symmetric_state::SymmetricKeys;
 pub use protocol::domain::to_data_nonce;
+pub use symmetric_state::SymmetricKeys;
 
 pub mod exports {
     pub use constant_time_eq;
