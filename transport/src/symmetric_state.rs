@@ -19,10 +19,7 @@ pub struct SymmetricKeys {
 
 impl<S: SessionLayer> Clone for SymmetricState<S> {
     fn clone(&self) -> Self {
-        Self {
-            key_buffer: self.key_buffer.clone(),
-            _s: Default::default(),
-        }
+        Self { key_buffer: self.key_buffer.clone(), _s: Default::default() }
     }
 }
 
@@ -35,10 +32,7 @@ impl<S: SessionLayer> SymmetricState<S> {
         let mut key_buffer = Zeroizing::new([0u8; SHAKE256_HANDSHAKE_OUTPUT_LEN]);
         hasher.finish(&mut key_buffer[..]);
 
-        Self {
-            key_buffer,
-            _s: Default::default(),
-        }
+        Self { key_buffer, _s: Default::default() }
     }
 
     pub fn mix(&mut self, shared_data: &[u8]) {

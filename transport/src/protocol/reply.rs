@@ -36,6 +36,5 @@ pub const ONLINE_SIGN_TAG_REV_START: usize = 0;
 
 pub const HANDSHAKE_TYPE_FULL: u8 = 0;
 pub const HANDSHAKE_TYPE_FALLBACK: u8 = 1;
-pub const HANDSHAKE_TYPE_RESEND: u8 = 2;
-pub const HANDSHAKE_TYPE_RESUME: u8 = 3;
-pub const HANDSHAKE_TYPE_MAX: u8 = 3;
+pub const HANDSHAKE_TYPE_RESUME: u8 = 2;
+pub const HANDSHAKE_TYPE_MAX: u8 = 2;

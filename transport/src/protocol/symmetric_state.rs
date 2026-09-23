@@ -1,8 +1,6 @@
 use std::ops::Range;
 
-use crate::{
-    crypto::aes256,
-};
+use crate::crypto::aes256;
 
 /* SHAKE256 OUTPUT DEFINITION */
 

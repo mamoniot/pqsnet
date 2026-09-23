@@ -15,6 +15,8 @@ use crate::{
 pub const OFFLINE_HASH_LEN: usize = 48;
 pub const BUNDLE_HASH_LEN: usize = 32;
 
+pub const KEY_BUNDLE_FLAG_RELIABLE_STORAGE: u32 = 0b1;
+
 pub const KEY_BUNDLE_MIN_LEN: usize = 2 * PUBLIC_KEY_LEN + SIGN_LEN + 6;
 
 pub fn get_secs_since_unix_epoch() -> u64 {
@@ -56,6 +58,7 @@ impl<P: PublicSigningKey, S: PrivateSigningKey> std::ops::Deref for PrivateBundl
 
 #[derive(Debug, Clone, Copy, Hash)]
 pub enum AuthError {
+    Invalid,
     Inauthentic,
     ExpiredKey,
     PostdatedKey,
@@ -66,6 +69,7 @@ impl std::error::Error for AuthError {}
 impl std::fmt::Display for AuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            AuthError::Invalid => write!(f, "invalid"),
             AuthError::Inauthentic => write!(f, "inauthentic"),
             AuthError::ExpiredKey => write!(f, "expired key"),
             AuthError::PostdatedKey => write!(f, "postdated key"),
@@ -113,25 +117,17 @@ impl<P: PublicSigningKey> AuthenticBundle<P> {
         todo!()
     }
 
-    pub fn authenticate<H: Shake256>(bundle_bytes: &[u8]) -> Result<Arc<Self>, AuthError> {
-        let (ret, len) = Self::authenticate_and_get_len::<H>(bundle_bytes)?;
-        if bundle_bytes.len() != len {
-            return Err(AuthError::Inauthentic);
-        }
-        Ok(ret)
+    pub fn authenticate<H: Shake256>(bundle_bytes: &[u8]) -> Result<(Arc<Self>, usize), AuthError> {
+        Self::authenticate_with_time::<H>(bundle_bytes, get_secs_since_unix_epoch())
     }
 
-    pub fn authenticate_and_get_len<H: Shake256>(bundle_bytes: &[u8]) -> Result<(Arc<Self>, usize), AuthError> {
-        Self::authenticate_and_get_len_with_time::<H>(bundle_bytes, get_secs_since_unix_epoch())
-    }
-
-    pub fn authenticate_and_get_len_with_time<'a, H: Shake256>(
+    pub fn authenticate_with_time<'a, H: Shake256>(
         bundle_bytes: &'a [u8],
         secs_since_unix_epoch: u64,
     ) -> Result<(Arc<Self>, usize), AuthError> {
         let mut reader = bundle_bytes;
 
-        let bundle: RawKeyBundle = cbor4ii::serde::from_reader(&mut reader).map_err(|_| AuthError::Inauthentic)?;
+        let bundle: RawKeyBundle = cbor4ii::serde::from_reader(&mut reader).map_err(|_| AuthError::Invalid)?;
 
         let signature_start = bundle_bytes.len() - reader.len();
         let Some(signature_end) = signature_start.checked_add(SIGN_LEN) else {
@@ -139,7 +135,7 @@ impl<P: PublicSigningKey> AuthenticBundle<P> {
         };
 
         if signature_end > bundle_bytes.len() {
-            return Err(AuthError::Inauthentic);
+            return Err(AuthError::Invalid);
         } else if secs_since_unix_epoch < bundle.not_before {
             return Err(AuthError::PostdatedKey);
         } else if secs_since_unix_epoch > bundle.not_after {

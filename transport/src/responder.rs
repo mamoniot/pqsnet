@@ -1,7 +1,12 @@
 use zeroize::Zeroizing;
 
 use crate::{
-    crypto::prelude::*, error::{Error, ReplyError}, key_bundle::{AuthenticBundle, OFFLINE_HASH_LEN}, protocol::*, session_layer::SessionLayer, symmetric_state::{SymmetricKeys, SymmetricState},
+    crypto::prelude::*,
+    error::{Error, ReplyError},
+    key_bundle::{AuthenticBundle, OFFLINE_HASH_LEN},
+    protocol::*,
+    session_layer::SessionLayer,
+    symmetric_state::{SymmetricKeys, SymmetricState},
 };
 
 pub struct ReplyState<S: SessionLayer> {
@@ -23,6 +28,7 @@ impl<S: SessionLayer> ReplyState<S> {
         mut sl: S,
         aad: &[u8],
         init_message: &'a mut [u8],
+        require_resumption: bool,
         create_payload: impl FnOnce(&mut Vec<u8>),
     ) -> Result<ResponseOk<'a, S>, ReplyError> {
         let shared_secret;
@@ -47,7 +53,6 @@ impl<S: SessionLayer> ReplyState<S> {
             ciphertext = c;
             shared_secret = Zeroizing::new(ss);
 
-
             /* RESUMPTION TOKEN HANDLING */
 
             symmetric = SymmetricState::<S>::new(aad);
@@ -58,6 +63,8 @@ impl<S: SessionLayer> ReplyState<S> {
 
                 let resumption_token = (&init_message[RESUMPTION_TOKEN_RANGE]).try_into().unwrap();
                 sl.lookup_resumption_key(resumption_token)
+            } else if require_resumption {
+                return Err(ReplyError::Inauthentic);
             } else if init_message.len() == EPHEMERAL_ENC_KEY_END {
                 None
             } else {
@@ -126,7 +133,7 @@ impl<S: SessionLayer> ReplyState<S> {
 
                     handshake_type = reply::HANDSHAKE_TYPE_RESUME;
                 } else {
-                    handshake_type = reply::HANDSHAKE_TYPE_RESEND;
+                    handshake_type = reply::HANDSHAKE_TYPE_FULL;
                 }
             } else if has_resumption_token {
                 /* FALLBACK */
@@ -224,9 +231,9 @@ impl<S: SessionLayer> ReplyState<S> {
 
             symmetric.decrypt_and_mix(&mut confirm_message[PAYLOAD_START..payload_tag_end])?;
 
-            let (key_bundle, key_bundle_len) = AuthenticBundle::<S::PublicSigningKeyImpl>::authenticate_and_get_len::<S::Shake256Impl>(
-                &confirm_message[PAYLOAD_START..payload_end],
-            )
+            let (key_bundle, key_bundle_len) = AuthenticBundle::<S::PublicSigningKeyImpl>::authenticate::<
+                S::Shake256Impl,
+            >(&confirm_message[PAYLOAD_START..payload_end])
             .map_err(|_| Error::Inauthentic)?;
             let key_bundle_end = PAYLOAD_START + key_bundle_len;
 
