@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use crate::crypto::*;
 
-/* START OF MESSAGE DEFINITION */
+/* MESSAGE DEFINITION */
 
 pub const HANDSHAKE_TYPE_START: usize = 0;
 pub const HANDSHAKE_TYPE_LEN: usize = 1;
@@ -16,7 +16,7 @@ pub const EPHEMERAL_CIPHERTEXT_RANGE: Range<usize> = EPHEMERAL_CIPHERTEXT_START.
 
 pub const PAYLOAD_START: usize = EPHEMERAL_CIPHERTEXT_END;
 
-/* START OF MESSAGE TAIL DEFINITION */
+/* MESSAGE TAIL DEFINITION */
 
 pub const PAYLOAD_REV_START: usize = PAYLOAD_TAG_REV_END;
 
@@ -32,7 +32,7 @@ pub const ONLINE_SIGN_TAG_REV_END: usize = ONLINE_SIGN_TAG_REV_START + ONLINE_SI
 pub const ONLINE_SIGN_TAG_LEN: usize = aes256::TAG_LEN;
 pub const ONLINE_SIGN_TAG_REV_START: usize = 0;
 
-/* START OF MISC CONSTANTS */
+/* MISC CONSTANTS */
 
 pub const HANDSHAKE_TYPE_FULL: u8 = 0;
 pub const HANDSHAKE_TYPE_FALLBACK: u8 = 1;

@@ -5,8 +5,8 @@ use zeroize::Zeroizing;
 use crate::{
     crypto::prelude::*,
     error::{Error, InitError},
-    key_bundle::{AuthenticBundle, PrivateBundleSL},
-    protocol::{key_bundle::KEY_BUNDLE_FLAG_RELIABLE_STORAGE, *},
+    key_bundle::{AuthenticBundle, PrivateBundle},
+    protocol::*,
     session_layer::{ResumptionKey, ResumptionToken, SessionLayer},
     symmetric_state::{SymmetricKeys, SymmetricState},
 };
@@ -16,26 +16,24 @@ pub struct InitializeState<S: SessionLayer> {
     fallback: Option<SymmetricState<S>>,
     decapsulation_key: S::DecapsulationKeyImpl,
     payload: Box<[u8]>,
-    private_key_bundle: PrivateBundleSL<S>,
+    private_key_bundle: Arc<PrivateBundle<S::PublicSigningKeyImpl, S::PrivateSigningKeyImpl>>,
     remote_key_bundle: Option<Arc<AuthenticBundle<S::PublicSigningKeyImpl>>>,
 }
 
 impl<S: SessionLayer> InitializeState<S> {
     pub fn initialize(
-        mut sl: S,
         aad: &[u8],
         resumption: Option<(
             &ResumptionToken,
             &ResumptionKey,
             Arc<AuthenticBundle<S::PublicSigningKeyImpl>>,
         )>,
+        private_key_bundle: Arc<PrivateBundle<S::PublicSigningKeyImpl, S::PrivateSigningKeyImpl>>,
         payload: Box<[u8]>,
     ) -> Result<InitializeState<S>, InitError> {
         use initialize::*;
 
         /* HANDSHAKE LEN AND FLAGS HANDLING */
-
-        let private_key_bundle = sl.private_key_bundle();
 
         let mut init_message = Vec::new();
 
@@ -123,7 +121,6 @@ impl<S: SessionLayer> InitializeState<S> {
 
     pub fn process_response<'a>(
         mut self,
-        mut sl: S,
         reply_message: &'a mut [u8],
     ) -> Result<
         (
@@ -192,7 +189,8 @@ impl<S: SessionLayer> InitializeState<S> {
                 key_bundle_end = PAYLOAD_START + key_bundle_len;
 
                 if handshake_type == HANDSHAKE_TYPE_FALLBACK
-                    && (remote_key_bundle.flags() & self.private_key_bundle.flags()) & KEY_BUNDLE_FLAG_RELIABLE_STORAGE
+                    && ((remote_key_bundle.flags() & self.private_key_bundle.flags())
+                        & key_bundle::FLAG_RELIABLE_STORAGE)
                         > 0
                 {
                     return Err(Error::Inauthentic);

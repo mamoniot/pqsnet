@@ -23,11 +23,7 @@ pub enum ResponseOk<'a, S: SessionLayer> {
 }
 
 impl<S: SessionLayer> ReplyState<S> {
-    /// Reserves a socket in the socket table for use.
-    /// Reserved sockets cannot receive packets and cannot be reserved twice simultaneously.
-    /// If this socket is dropped, its socket id is unreserved, preventing a memory leak.
-    /// This guard does not hold any locks and cannot cause a deadlock.
-    pub fn init<'a>(
+    pub fn process_initialize<'a>(
         mut sl: S,
         aad: &[u8],
         init_message: &'a mut [u8],
@@ -209,7 +205,7 @@ impl<S: SessionLayer> ReplyState<S> {
         }
     }
 
-    pub fn confirm<'a>(
+    pub fn process_confirm<'a>(
         self,
         confirm_message: &'a mut [u8],
     ) -> Result<
@@ -220,54 +216,51 @@ impl<S: SessionLayer> ReplyState<S> {
         ),
         Error,
     > {
+        use confirm::*;
+
+        if confirm_message.len() < PAYLOAD_START + PAYLOAD_REV_START {
+            return Err(Error::Invalid);
+        }
+
+        let payload_end = confirm_message.len() - PAYLOAD_REV_START;
+        let payload_tag_end = confirm_message.len() - PAYLOAD_TAG_REV_START;
+        let online_sign_start = confirm_message.len() - ONLINE_SIGN_REV_END;
+        let online_sign_end = confirm_message.len() - ONLINE_SIGN_REV_START;
+        let online_sign_tag_end = confirm_message.len() - ONLINE_SIGN_TAG_REV_START;
+
+        /* PAYLOAD AND KEY BUNDLE HANDLING */
+
         let mut symmetric = self.symmetric;
 
-        let recv_payload;
-        let remote_key_bundle;
-        {
-            use confirm::*;
-            if confirm_message.len() < PAYLOAD_START + PAYLOAD_REV_START {
-                return Err(Error::Invalid);
+        symmetric.decrypt_and_mix(6, &mut confirm_message[PAYLOAD_START..payload_tag_end])?;
+
+        let mixed_payload = &confirm_message[PAYLOAD_START..payload_end];
+        let result = AuthenticBundle::authenticate::<S::Shake256Impl>(mixed_payload);
+        let (key_bundle, key_bundle_len) = result.map_err(|_| Error::Inauthentic)?;
+        let remote_key_bundle = Arc::new(key_bundle);
+
+        let key_bundle_end = PAYLOAD_START + key_bundle_len;
+
+        if let Some(expected_offline_hash) = self.expected_offline_hash {
+            /* If the offline hashes are not equal then we are not connecting with the party we
+            intended to connect to. A party's offline key is their id and it must never change. */
+            if !remote_key_bundle.offline_eq_raw(&expected_offline_hash) {
+                return Err(Error::Inauthentic);
             }
-
-            let payload_end = confirm_message.len() - PAYLOAD_REV_START;
-            let payload_tag_end = confirm_message.len() - PAYLOAD_TAG_REV_START;
-            let online_sign_start = confirm_message.len() - ONLINE_SIGN_REV_END;
-            let online_sign_end = confirm_message.len() - ONLINE_SIGN_REV_START;
-            let online_sign_tag_end = confirm_message.len() - ONLINE_SIGN_TAG_REV_START;
-
-            /* PAYLOAD AND KEY BUNDLE HANDLING */
-
-            symmetric.decrypt_and_mix(6, &mut confirm_message[PAYLOAD_START..payload_tag_end])?;
-
-            let mixed_payload = &confirm_message[PAYLOAD_START..payload_end];
-            let result = AuthenticBundle::authenticate::<S::Shake256Impl>(mixed_payload);
-            let (key_bundle, key_bundle_len) = result.map_err(|_| Error::Inauthentic)?;
-            remote_key_bundle = Arc::new(key_bundle);
-
-            let key_bundle_end = PAYLOAD_START + key_bundle_len;
-
-            if let Some(expected_offline_hash) = self.expected_offline_hash {
-                /* If the offline hashes are not equal then we are not connecting with the party we
-                intended to connect to. A party's offline key is their id and it must never change. */
-                if !remote_key_bundle.offline_eq_raw(&expected_offline_hash) {
-                    return Err(Error::Inauthentic);
-                }
-            }
-
-            /* ONLINE SIGNATURE HANDLING */
-
-            let channel_binding = symmetric.channel_binding();
-
-            symmetric.decrypt_and_mix(7, &mut confirm_message[online_sign_start..online_sign_tag_end])?;
-
-            let sign = &confirm_message[online_sign_start..online_sign_end];
-            remote_key_bundle
-                .verify(domain::CONFIRM_BINDING, &channel_binding, sign.try_into().unwrap())
-                .map_err(|_| Error::Inauthentic)?;
-
-            recv_payload = &mut confirm_message[key_bundle_end..payload_end];
         }
+
+        /* ONLINE SIGNATURE HANDLING */
+
+        let channel_binding = symmetric.channel_binding();
+
+        symmetric.decrypt_and_mix(7, &mut confirm_message[online_sign_start..online_sign_tag_end])?;
+
+        let sign = &confirm_message[online_sign_start..online_sign_end];
+        remote_key_bundle
+            .verify(domain::CONFIRM_BINDING, &channel_binding, sign.try_into().unwrap())
+            .map_err(|_| Error::Inauthentic)?;
+
+        let recv_payload = &mut confirm_message[key_bundle_end..payload_end];
 
         Ok((symmetric.split(8), remote_key_bundle, recv_payload))
     }

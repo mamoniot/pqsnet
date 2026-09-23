@@ -28,6 +28,7 @@ tracing = { version = "*" }
 
 [lints.clippy]
 type_complexity = "allow"
+too_many_arguments = "allow"
 large_enum_variant = "allow"
 absurd_extreme_comparisons = "allow"
 unusual_byte_groupings = "allow"

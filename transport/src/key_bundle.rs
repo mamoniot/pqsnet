@@ -1,5 +1,4 @@
 use std::{
-    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -8,7 +7,6 @@ use constant_time_eq::{constant_time_eq_32, constant_time_eq_n};
 use crate::{
     crypto::{mldsa87::*, shake256::Shake256},
     protocol::{domain, key_bundle::*},
-    session_layer::SessionLayer,
 };
 
 pub mod constants {
@@ -44,8 +42,6 @@ pub struct PrivateBundle<P: PublicSigningKey, S: PrivateSigningKey> {
     public_bundle_bytes: Box<[u8]>,
     public_bundle: AuthenticBundle<P>,
 }
-
-pub type PrivateBundleSL<S: SessionLayer> = Arc<PrivateBundle<S::PublicSigningKeyImpl, S::PrivateSigningKeyImpl>>;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum AuthError {
@@ -187,7 +183,7 @@ impl<P: PublicSigningKey> AuthenticBundle<P> {
         Self::authenticate_with_time::<H>(buf, get_secs_since_unix_epoch())
     }
 
-    pub fn authenticate_with_time<'a, H: Shake256>(
+    pub fn authenticate_with_time<H: Shake256>(
         buf: &[u8],
         secs_since_unix_epoch: u64,
     ) -> Result<(Self, usize), AuthError> {
