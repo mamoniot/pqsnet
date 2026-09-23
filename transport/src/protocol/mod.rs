@@ -10,8 +10,6 @@ pub(crate) mod initialize;
 
 pub(crate) mod reply;
 
-pub(crate) mod resume;
-
 pub(crate) mod confirm;
 
 pub(crate) mod data;

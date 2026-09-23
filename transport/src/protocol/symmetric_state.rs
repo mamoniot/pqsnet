@@ -2,7 +2,6 @@ use std::ops::Range;
 
 use crate::{
     crypto::aes256,
-    protocol::{confirm, reply},
 };
 
 /* SHAKE256 OUTPUT DEFINITION */
@@ -52,9 +51,6 @@ pub const RESPONDER_KEY_END: usize = RESPONDER_KEY_START + RESPONDER_KEY_LEN;
 pub const RESPONDER_KEY_RANGE: Range<usize> = RESPONDER_KEY_START..RESPONDER_KEY_END;
 
 /* MISC CONSTANTS */
-
-pub const AES_GCM_INIT_COUNTER: u32 = 1;
-pub const AES_GCM_RESUME_COUNTER_SKIP: u32 = reply::MESSAGE_GCM_TOTAL + confirm::MESSAGE_GCM_TOTAL;
 
 pub const SHAKE256_HANDSHAKE_OUTPUT_LEN: usize = CHANNEL_BINDING_END;
 pub const SHAKE256_SPLIT_OUTPUT_LEN: usize = RESPONDER_KEY_END;

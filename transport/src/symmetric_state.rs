@@ -9,7 +9,6 @@ use crate::{
 
 pub struct SymmetricState<S: SessionLayer> {
     key_buffer: Zeroizing<[u8; SHAKE256_HANDSHAKE_OUTPUT_LEN]>,
-    counter: u32,
     _s: std::marker::PhantomData<S>,
 }
 
@@ -22,7 +21,6 @@ impl<S: SessionLayer> Clone for SymmetricState<S> {
     fn clone(&self) -> Self {
         Self {
             key_buffer: self.key_buffer.clone(),
-            counter: self.counter,
             _s: Default::default(),
         }
     }
@@ -30,8 +28,6 @@ impl<S: SessionLayer> Clone for SymmetricState<S> {
 
 impl<S: SessionLayer> SymmetricState<S> {
     pub fn new(aad: &[u8]) -> Self {
-        debug_assert_eq!(domain::TRANSPORT_PROTOCOL_SALT.len(), CHAINING_KEY_LEN);
-
         let mut hasher = S::Shake256Impl::new();
         hasher.update(domain::TRANSPORT_PROTOCOL_SALT);
         hasher.update(aad);
@@ -41,13 +37,8 @@ impl<S: SessionLayer> SymmetricState<S> {
 
         Self {
             key_buffer,
-            counter: AES_GCM_INIT_COUNTER,
             _s: Default::default(),
         }
-    }
-
-    pub fn start_resume(&mut self) {
-        self.counter += AES_GCM_RESUME_COUNTER_SKIP;
     }
 
     pub fn mix(&mut self, shared_data: &[u8]) {
@@ -63,10 +54,9 @@ impl<S: SessionLayer> SymmetricState<S> {
 
         let tag = S::ColdPathCipher::encrypt_in_place(
             (&self.key_buffer[AES_KEY_RANGE]).try_into().unwrap(),
-            domain::to_handshake_nonce(self.counter),
+            domain::AES_GCM_FIXED_FIELD_HANDSHAKE,
             plaintext,
         );
-        self.counter += 1;
         pad.copy_from_slice(&tag);
 
         let mut hasher = S::Shake256Impl::new();
@@ -86,11 +76,10 @@ impl<S: SessionLayer> SymmetricState<S> {
 
         let auth = S::ColdPathCipher::decrypt_in_place(
             (&self.key_buffer[AES_KEY_RANGE]).try_into().unwrap(),
-            domain::to_handshake_nonce(self.counter),
+            domain::AES_GCM_FIXED_FIELD_HANDSHAKE,
             ciphertext,
             tag.try_into().unwrap(),
         );
-        self.counter += 1;
 
         hasher.finish(&mut self.key_buffer[..]);
 

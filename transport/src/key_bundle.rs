@@ -146,14 +146,17 @@ impl<P: PublicSigningKey> AuthenticBundle<P> {
             return Err(AuthError::ExpiredKey);
         }
 
-        let offline_key = P::decode(bundle.offline_key.try_into().unwrap());
-        let online_key = P::decode(bundle.online_key.try_into().unwrap());
+        let offline_key = P::decode(bundle.offline_key);
+        let online_key = P::decode(bundle.online_key);
 
-        offline_key.verify(
+        let auth = offline_key.verify(
             domain::OFFLINE_KEY_CERTIFICATION,
             &bundle_bytes[..signature_start],
             (&bundle_bytes[signature_start..signature_end]).try_into().unwrap(),
         );
+        if !auth {
+            return Err(AuthError::Inauthentic);
+        }
 
         let mut hasher = H::new();
 
@@ -186,7 +189,6 @@ impl<P: PublicSigningKey> AuthenticBundle<P> {
 
     /// `secs_since_unix_epoch` must be clamped to zero in the event that this system reports a
     /// time which is earlier than unix epoch.
-    #[must_use]
     pub fn verify_with_time(
         &self,
         ctx: &[u8],
@@ -205,24 +207,9 @@ impl<P: PublicSigningKey> AuthenticBundle<P> {
         }
     }
 
-    #[must_use]
     pub fn verify(&self, ctx: &[u8], data: &[u8], signature: &[u8; SIGN_LEN]) -> Result<(), AuthError> {
         self.verify_with_time(ctx, data, signature, get_secs_since_unix_epoch())
     }
-
-    /// The first 8 bits of the key bundle flags are the handshake variant flags.
-    /// Every handshake must use a handshake variant that is at least as strong as the handshake
-    /// variant flags on both party's key bundles.
-    pub(crate) fn check_handshake_flags(&self, handshake_flags: u8) -> bool {
-        check_handshake_flags(self.flags as u8, handshake_flags)
-    }
-}
-
-pub(crate) fn check_handshake_flags(required_flags: u8, handshake_flags: u8) -> bool {
-    /* If a flag in either our or their key bundle is true, then the corresponding
-    flag in `reply_handshake_flags` must be true. If not, then this handshake is not
-    approved by one of the key bundles and we must abort. */
-    required_flags & handshake_flags == required_flags
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
