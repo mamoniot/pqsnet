@@ -5,32 +5,34 @@ use zeroize::Zeroizing;
 use crate::{
     crypto::prelude::*,
     error::{Error, InitError},
-    key_bundle::{AuthenticBundle, PrivateBundle},
+    key_bundle::{AuthenticBundle, SecretBundle},
     protocol::*,
-    session_layer::{ResumptionKey, ResumptionToken, SessionLayer},
-    symmetric_state::{SymmetricKeys, SymmetricState},
+    symmetric_state::{Resumption, SymmetricKeys, SymmetricState},
 };
 
-pub struct InitializeState<S: SessionLayer> {
-    symmetric: SymmetricState<S>,
-    fallback: Option<SymmetricState<S>>,
-    decapsulation_key: S::DecapsulationKeyImpl,
+pub struct InitializeState<C: Crypto> {
+    symmetric: SymmetricState<C>,
+    fallback: Option<SymmetricState<C>>,
+    decapsulation_key: C::DecapsulationKey,
     payload: Box<[u8]>,
-    private_key_bundle: Arc<PrivateBundle<S::PublicSigningKeyImpl, S::PrivateSigningKeyImpl>>,
-    remote_key_bundle: Option<Arc<AuthenticBundle<S::PublicSigningKeyImpl>>>,
+    secret_key_bundle: Arc<SecretBundle<C::PublicSigningKey, C::SecretSigningKey>>,
+    remote_key_bundle: Option<Arc<AuthenticBundle<C::PublicSigningKey>>>,
 }
 
-impl<S: SessionLayer> InitializeState<S> {
+pub struct HandshakeFinished<'a, C: Crypto> {
+    pub message_to_send: Option<Vec<u8>>,
+    pub keys: SymmetricKeys,
+    pub remote_key_bundle: Arc<AuthenticBundle<C::PublicSigningKey>>,
+    pub recv_payload: &'a mut [u8],
+}
+
+impl<C: Crypto> InitializeState<C> {
     pub fn initialize(
         aad: &[u8],
-        resumption: Option<(
-            &ResumptionToken,
-            &ResumptionKey,
-            Arc<AuthenticBundle<S::PublicSigningKeyImpl>>,
-        )>,
-        private_key_bundle: Arc<PrivateBundle<S::PublicSigningKeyImpl, S::PrivateSigningKeyImpl>>,
+        secret_key_bundle: Arc<SecretBundle<C::PublicSigningKey, C::SecretSigningKey>>,
+        resumption: Option<Resumption<C>>,
         payload: Box<[u8]>,
-    ) -> Result<InitializeState<S>, InitError> {
+    ) -> Result<InitializeState<C>, InitError> {
         use initialize::*;
 
         /* HANDSHAKE LEN AND FLAGS HANDLING */
@@ -47,17 +49,17 @@ impl<S: SessionLayer> InitializeState<S> {
 
         /* MLKEM1024 EPHEMERAL ENCAPSULATION KEY HANDLING */
 
-        let (encapsulation_key, decapsulation_key) = S::DecapsulationKeyImpl::generate();
+        let (encapsulation_key, decapsulation_key) = C::DecapsulationKey::generate();
         init_message[EPHEMERAL_ENC_KEY_RANGE].copy_from_slice(&encapsulation_key);
 
         /* RESUMPTION TOKEN HANDLING */
 
         let mut fallback = None;
         let mut remote_key_bundle = None;
-        let mut symmetric = SymmetricState::<S>::new(aad);
+        let mut symmetric = SymmetricState::<C>::new(aad);
 
-        if let Some((resumption_token, resumption_key, key_bundle)) = resumption {
-            init_message[RESUMPTION_TOKEN_RANGE].copy_from_slice(resumption_token);
+        if let Some(resumption) = resumption {
+            init_message[RESUMPTION_TOKEN_RANGE].copy_from_slice(&resumption.token[..]);
 
             symmetric.mix(9, &init_message[..RESUMPTION_TOKEN_END]);
 
@@ -65,7 +67,7 @@ impl<S: SessionLayer> InitializeState<S> {
             // secret resumption key.
             fallback = Some(symmetric.clone());
 
-            symmetric.mix(10, &resumption_key[..]);
+            symmetric.mix(10, &resumption.key[..]);
 
             /* RESUMPTION HANDLING */
 
@@ -77,10 +79,10 @@ impl<S: SessionLayer> InitializeState<S> {
 
             /* KEY BUNDLE CHECKSUM HANDLING */
 
-            let mut bundle_hasher = S::Shake256Impl::new();
+            let mut bundle_hasher = C::Hasher::new();
             bundle_hasher.update(&symmetric.channel_binding());
-            bundle_hasher.update(private_key_bundle.bundle_hash());
-            bundle_hasher.update(key_bundle.bundle_hash());
+            bundle_hasher.update(secret_key_bundle.bundle_hash());
+            bundle_hasher.update(resumption.remote_key_bundle.bundle_hash());
 
             bundle_hasher.finish(&mut init_message[KEY_BUNDLE_CHECKSUM_RANGE]);
 
@@ -92,7 +94,7 @@ impl<S: SessionLayer> InitializeState<S> {
 
             /* ONLINE SIGNATURE HANDLING */
 
-            let sign = private_key_bundle.sign(domain::INITIALIZE_BINDING, &symmetric.channel_binding());
+            let sign = secret_key_bundle.sign(domain::INITIALIZE_BINDING, &symmetric.channel_binding());
             init_message[online_sign_start..online_sign_end].copy_from_slice(&sign);
 
             symmetric.encrypt_and_mix(12, &mut init_message[online_sign_start..online_sign_tag_end]);
@@ -102,7 +104,7 @@ impl<S: SessionLayer> InitializeState<S> {
                 fallback.mix(14, &init_message[RESUMPTION_TOKEN_END..]);
             }
 
-            remote_key_bundle = Some(key_bundle);
+            remote_key_bundle = Some(resumption.remote_key_bundle);
         } else {
             /* FULL HANDSHAKE HANDLING */
 
@@ -114,23 +116,12 @@ impl<S: SessionLayer> InitializeState<S> {
             fallback,
             decapsulation_key,
             payload,
-            private_key_bundle,
+            secret_key_bundle,
             remote_key_bundle,
         })
     }
 
-    pub fn process_response<'a>(
-        mut self,
-        reply_message: &'a mut [u8],
-    ) -> Result<
-        (
-            Option<Vec<u8>>,
-            Arc<AuthenticBundle<S::PublicSigningKeyImpl>>,
-            SymmetricKeys,
-            &'a mut [u8],
-        ),
-        Error,
-    > {
+    pub fn process_reply<'a>(mut self, reply_message: &'a mut [u8]) -> Result<HandshakeFinished<'a, C>, Error> {
         let handshake_type;
         let remote_key_bundle;
         let recv_payload;
@@ -182,14 +173,14 @@ impl<S: SessionLayer> InitializeState<S> {
                 /* KEY BUNDLE HANDLING */
 
                 let mixed_payload = &reply_message[PAYLOAD_START..payload_end];
-                let result = AuthenticBundle::authenticate::<S::Shake256Impl>(mixed_payload);
+                let result = AuthenticBundle::authenticate::<C::Hasher>(mixed_payload);
                 let (key_bundle, key_bundle_len) = result.map_err(|_| Error::Inauthentic)?;
                 remote_key_bundle = Arc::new(key_bundle);
 
                 key_bundle_end = PAYLOAD_START + key_bundle_len;
 
                 if handshake_type == HANDSHAKE_TYPE_FALLBACK
-                    && ((remote_key_bundle.flags() & self.private_key_bundle.flags())
+                    && ((remote_key_bundle.flags() & self.secret_key_bundle.flags())
                         & key_bundle::FLAG_RELIABLE_STORAGE)
                         > 0
                 {
@@ -223,13 +214,18 @@ impl<S: SessionLayer> InitializeState<S> {
             if handshake_type == HANDSHAKE_TYPE_RESUME {
                 /* SPLIT */
 
-                return Ok((None, remote_key_bundle, symmetric.split(13), recv_payload));
+                return Ok(HandshakeFinished {
+                    message_to_send: None,
+                    keys: symmetric.split(13),
+                    remote_key_bundle,
+                    recv_payload,
+                });
             }
         }
         {
             use confirm::*;
 
-            let local_key_bundle = self.private_key_bundle.public_bundle_bytes();
+            let local_key_bundle = self.secret_key_bundle.public_bundle_bytes();
 
             let key_bundle_end = PAYLOAD_START + local_key_bundle.len();
             let payload_end = key_bundle_end + self.payload.len();
@@ -251,18 +247,25 @@ impl<S: SessionLayer> InitializeState<S> {
             /* ONLINE SIGNATURE HANDLING */
 
             let sign = self
-                .private_key_bundle
+                .secret_key_bundle
                 .sign(domain::CONFIRM_BINDING, &symmetric.channel_binding());
             confirm_message[online_sign_start..online_sign_end].copy_from_slice(&sign);
 
             symmetric.encrypt_and_mix(7, &mut confirm_message[online_sign_start..online_sign_tag_end]);
 
-            Ok((
-                Some(confirm_message),
+            Ok(HandshakeFinished {
+                message_to_send: Some(confirm_message),
+                keys: symmetric.split(8),
                 remote_key_bundle,
-                symmetric.split(8),
                 recv_payload,
-            ))
+            })
         }
+    }
+
+    pub fn secret_key_bundle(&self) -> &Arc<SecretBundle<C::PublicSigningKey, C::SecretSigningKey>> {
+        &self.secret_key_bundle
+    }
+    pub fn remote_key_bundle(&self) -> &AuthenticBundle<C::PublicSigningKey> {
+        &self.secret_key_bundle
     }
 }

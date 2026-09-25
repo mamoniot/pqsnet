@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use constant_time_eq::{constant_time_eq_32, constant_time_eq_n};
 
 use crate::{
-    crypto::{mldsa87::*, shake256::Shake256},
+    crypto::{mldsa87::*, shake256::Hasher},
     protocol::{domain, key_bundle::*},
 };
 
@@ -35,8 +35,8 @@ pub struct AuthenticBundle<P: PublicSigningKey> {
     extensions: Box<[u8]>,
 }
 
-pub struct PrivateBundle<P: PublicSigningKey, S: PrivateSigningKey> {
-    online_private_key: S,
+pub struct SecretBundle<P: PublicSigningKey, S: SecretSigningKey> {
+    online_secret_key: S,
     public_bundle_bytes: Box<[u8]>,
     public_bundle: AuthenticBundle<P>,
 }
@@ -64,7 +64,7 @@ impl std::fmt::Display for AuthError {
     }
 }
 
-fn hash_bundle<H: Shake256>(buf: &[u8]) -> (OfflineHash, BundleHash) {
+fn hash_bundle<H: Hasher>(buf: &[u8]) -> (OfflineHash, BundleHash) {
     let mut hasher = H::new();
     hasher.update(domain::OFFLINE_SALT);
     hasher.update(&buf[OFFLINE_KEY_RANGE]);
@@ -82,7 +82,7 @@ fn hash_bundle<H: Shake256>(buf: &[u8]) -> (OfflineHash, BundleHash) {
     (offline_hash, bundle_hash)
 }
 
-impl<P: PublicSigningKey, S: PrivateSigningKey> std::ops::Deref for PrivateBundle<P, S> {
+impl<P: PublicSigningKey, S: SecretSigningKey> std::ops::Deref for SecretBundle<P, S> {
     type Target = AuthenticBundle<P>;
 
     fn deref(&self) -> &Self::Target {
@@ -90,11 +90,11 @@ impl<P: PublicSigningKey, S: PrivateSigningKey> std::ops::Deref for PrivateBundl
     }
 }
 
-impl<P: PublicSigningKey, S: PrivateSigningKey> PrivateBundle<P, S> {
-    pub fn update<K: PrivateSigningKey, H: Shake256>(
+impl<P: PublicSigningKey, S: SecretSigningKey> SecretBundle<P, S> {
+    pub fn update<K: SecretSigningKey, H: Hasher>(
         &self,
-        offline_private_key: K,
-        online_private_key: S,
+        offline_secret_key: K,
+        online_secret_key: S,
         online_key: P,
         not_before: u64,
         not_after: u64,
@@ -102,8 +102,8 @@ impl<P: PublicSigningKey, S: PrivateSigningKey> PrivateBundle<P, S> {
         extensions: Box<[u8]>,
     ) -> Self {
         Self::new::<K, H>(
-            offline_private_key,
-            online_private_key,
+            offline_secret_key,
+            online_secret_key,
             self.public_bundle_bytes[OFFLINE_KEY_RANGE].try_into().unwrap(),
             online_key,
             not_before,
@@ -114,9 +114,9 @@ impl<P: PublicSigningKey, S: PrivateSigningKey> PrivateBundle<P, S> {
         )
     }
 
-    pub fn new<K: PrivateSigningKey, H: Shake256>(
-        offline_private_key: K,
-        online_private_key: S,
+    pub fn new<K: SecretSigningKey, H: Hasher>(
+        offline_secret_key: K,
+        online_secret_key: S,
         offline_public_key: [u8; PUBLIC_KEY_LEN],
         online_key: P,
         not_before: u64,
@@ -141,13 +141,13 @@ impl<P: PublicSigningKey, S: PrivateSigningKey> PrivateBundle<P, S> {
 
         buf[EXTENSIONS_START..offline_sign_start].copy_from_slice(&extensions);
 
-        let sign = offline_private_key.sign(domain::OFFLINE_KEY_CERTIFICATION, &buf[..offline_sign_start]);
+        let sign = offline_secret_key.sign(domain::OFFLINE_KEY_CERTIFICATION, &buf[..offline_sign_start]);
         buf[offline_sign_start..offline_sign_end].copy_from_slice(&sign);
 
         let (offline_hash, bundle_hash) = hash_bundle::<H>(&buf[..]);
 
         Self {
-            online_private_key,
+            online_secret_key,
             public_bundle_bytes: buf.into(),
             public_bundle: AuthenticBundle {
                 offline_hash,
@@ -164,11 +164,11 @@ impl<P: PublicSigningKey, S: PrivateSigningKey> PrivateBundle<P, S> {
 
     /// This function does not check if this key bundle is expired or post-dated.
     pub fn sign(&self, ctx: &[u8], data: &[u8]) -> [u8; SIGN_LEN] {
-        self.online_private_key.sign(ctx, data)
+        self.online_secret_key.sign(ctx, data)
     }
 
-    pub fn online_private_key(&self) -> &S {
-        &self.online_private_key
+    pub fn online_secret_key(&self) -> &S {
+        &self.online_secret_key
     }
 
     pub fn public_bundle_bytes(&self) -> &[u8] {
@@ -177,11 +177,11 @@ impl<P: PublicSigningKey, S: PrivateSigningKey> PrivateBundle<P, S> {
 }
 
 impl<P: PublicSigningKey> AuthenticBundle<P> {
-    pub fn authenticate<H: Shake256>(buf: &[u8]) -> Result<(Self, usize), AuthError> {
+    pub fn authenticate<H: Hasher>(buf: &[u8]) -> Result<(Self, usize), AuthError> {
         Self::authenticate_with_time::<H>(buf, get_secs_since_unix_epoch())
     }
 
-    pub fn authenticate_with_time<H: Shake256>(
+    pub fn authenticate_with_time<H: Hasher>(
         buf: &[u8],
         secs_since_unix_epoch: u64,
     ) -> Result<(Self, usize), AuthError> {

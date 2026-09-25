@@ -1,5 +1,3 @@
-pub mod session_layer;
-
 pub mod crypto;
 
 pub(crate) mod protocol;

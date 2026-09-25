@@ -1,42 +1,51 @@
 use std::sync::Arc;
 
-use constant_time_eq::constant_time_eq_16;
+use constant_time_eq::{constant_time_eq_16, constant_time_eq_32};
 use zeroize::Zeroizing;
 
 use crate::{
     crypto::prelude::*,
     error::{Error, ReplyError},
-    key_bundle::{AuthenticBundle, OfflineHash, PrivateBundle},
+    initiator::HandshakeFinished,
+    key_bundle::{AuthenticBundle, OfflineHash, SecretBundle},
     protocol::*,
-    session_layer::SessionLayer,
-    symmetric_state::{SymmetricKeys, SymmetricState},
+    symmetric_state::{Resumption, ResumptionToken, SymmetricKeys, SymmetricState},
 };
 
-pub struct ReplyState<S: SessionLayer> {
-    symmetric: SymmetricState<S>,
+pub struct ReplyState<C: Crypto> {
+    symmetric: SymmetricState<C>,
     remote_offline_hash: Option<OfflineHash>,
     reject_if_remote_has_reliable_storage: bool,
 }
 
-pub enum ResponseOk<'a, S: SessionLayer> {
+pub enum ResponseOk<'a, C: Crypto> {
     Complete(
         Vec<u8>,
         SymmetricKeys,
-        Arc<AuthenticBundle<S::PublicSigningKeyImpl>>,
+        Arc<AuthenticBundle<C::PublicSigningKey>>,
         &'a mut [u8],
     ),
-    Incomplete(Vec<u8>, ReplyState<S>),
+    Incomplete(Vec<u8>, ReplyState<C>),
 }
 
-impl<S: SessionLayer> ReplyState<S> {
+impl<C: Crypto> ReplyState<C> {
+    pub fn get_resumption_token(init_message: &mut [u8]) -> Option<ResumptionToken> {
+        use initialize::*;
+
+        if init_message.len() >= RESUMPTION_TOKEN_END {
+            Some(init_message[RESUMPTION_TOKEN_RANGE].try_into().unwrap())
+        } else {
+            None
+        }
+    }
+
     pub fn process_initialize<'a>(
-        mut sl: S,
         aad: &[u8],
         init_message: &'a mut [u8],
-        require_resumption: bool,
-        private_key_bundle: &PrivateBundle<S::PublicSigningKeyImpl, S::PrivateSigningKeyImpl>,
+        secret_key_bundle: &SecretBundle<C::PublicSigningKey, C::SecretSigningKey>,
+        resumption: Option<Resumption<C>>,
         create_payload: impl FnOnce(&mut Vec<u8>),
-    ) -> Result<ResponseOk<'a, S>, ReplyError> {
+    ) -> Result<ResponseOk<'a, C>, ReplyError> {
         let shared_secret;
         let ciphertext;
         let handshake_type;
@@ -53,31 +62,36 @@ impl<S: SessionLayer> ReplyState<S> {
             /* MLKEM1024 EPHEMERAL ENCAPSULATION KEY HANDLING */
 
             let ephemeral_enc_key = &init_message[EPHEMERAL_ENC_KEY_RANGE];
-            let result = S::DecapsulationKeyImpl::encapsulate(ephemeral_enc_key.try_into().unwrap());
+            let result = C::DecapsulationKey::encapsulate(ephemeral_enc_key.try_into().unwrap());
             let (ss, c) = result.ok_or(ReplyError::Inauthentic)?;
             ciphertext = c;
             shared_secret = Zeroizing::new(ss);
 
             /* RESUMPTION TOKEN HANDLING */
 
-            symmetric = SymmetricState::<S>::new(aad);
+            symmetric = SymmetricState::<C>::new(aad);
 
             let has_resumption_token = init_message.len() >= RESUMPTION_TOKEN_END;
-            let resumption = if has_resumption_token {
+            if has_resumption_token {
                 symmetric.mix(9, &init_message[..RESUMPTION_TOKEN_END]);
 
                 let resumption_token = (&init_message[RESUMPTION_TOKEN_RANGE]).try_into().unwrap();
-                sl.lookup_resumption_key(resumption_token)
-            } else if init_message.len() == EPHEMERAL_ENC_KEY_END {
-                None
-            } else {
+
+                if let Some(resumption) = &resumption {
+                    if !constant_time_eq_32(&resumption.token, resumption_token) {
+                        return Err(ReplyError::IncorrectResumption);
+                    }
+                } else {
+                    return Err(ReplyError::IncorrectResumption);
+                }
+            } else if init_message.len() != EPHEMERAL_ENC_KEY_END {
                 return Err(ReplyError::Invalid);
-            };
+            }
 
-            if let Some((resumption_key, key_bundle)) = resumption {
-                remote_offline_hash = Some(*key_bundle.offline_hash());
+            if let Some(resumption) = resumption {
+                remote_offline_hash = Some(*resumption.remote_key_bundle.offline_hash());
 
-                symmetric.mix(10, &resumption_key[..]);
+                symmetric.mix(10, &resumption.key[..]);
 
                 /* RESUMPTION HANDLING */
 
@@ -98,10 +112,10 @@ impl<S: SessionLayer> ReplyState<S> {
 
                 /* KEY BUNDLE CHECKSUM HANDLING */
 
-                let mut bundle_hasher = S::Shake256Impl::new();
+                let mut bundle_hasher = C::Hasher::new();
                 bundle_hasher.update(&checksum_channel_binding);
-                bundle_hasher.update(key_bundle.bundle_hash());
-                bundle_hasher.update(private_key_bundle.bundle_hash());
+                bundle_hasher.update(resumption.remote_key_bundle.bundle_hash());
+                bundle_hasher.update(secret_key_bundle.bundle_hash());
 
                 let mut local_checksum = [0; KEY_BUNDLE_CHECKSUM_LEN];
                 bundle_hasher.finish(&mut local_checksum);
@@ -123,17 +137,16 @@ impl<S: SessionLayer> ReplyState<S> {
                 will force the initiator to send a second, better signature later. */
                 if has_correct_bundle {
                     let sign = (&init_message[online_sign_start..online_sign_end]).try_into().unwrap();
-                    key_bundle
+                    resumption
+                        .remote_key_bundle
                         .verify(domain::INITIALIZE_BINDING, &signature_channel_binding, sign)
                         .map_err(|_| ReplyError::Inauthentic)?;
 
                     handshake_type = reply::HANDSHAKE_TYPE_RESUME;
-                    resume = Some((key_bundle, PAYLOAD_START..payload_end));
+                    resume = Some((resumption.remote_key_bundle, PAYLOAD_START..payload_end));
                 } else {
                     handshake_type = reply::HANDSHAKE_TYPE_FULL;
                 }
-            } else if require_resumption {
-                return Err(ReplyError::Invalid);
             } else if has_resumption_token {
                 /* FALLBACK */
 
@@ -170,7 +183,7 @@ impl<S: SessionLayer> ReplyState<S> {
             if handshake_type != HANDSHAKE_TYPE_RESUME {
                 /* KEY BUNDLE HANDLING */
 
-                reply_message.extend_from_slice(private_key_bundle.public_bundle_bytes());
+                reply_message.extend_from_slice(secret_key_bundle.public_bundle_bytes());
             }
 
             create_payload(&mut reply_message);
@@ -188,7 +201,7 @@ impl<S: SessionLayer> ReplyState<S> {
 
             /* ONLINE SIGNATURE HANDLING */
 
-            let signature = private_key_bundle.sign(domain::REPLY_BINDING, &symmetric.channel_binding());
+            let signature = secret_key_bundle.sign(domain::REPLY_BINDING, &symmetric.channel_binding());
             reply_message[online_sign_start..online_sign_end].copy_from_slice(&signature);
 
             symmetric.encrypt_and_mix(5, &mut reply_message[online_sign_start..online_sign_tag_end]);
@@ -207,24 +220,14 @@ impl<S: SessionLayer> ReplyState<S> {
                         symmetric,
                         remote_offline_hash,
                         reject_if_remote_has_reliable_storage: handshake_type == HANDSHAKE_TYPE_FALLBACK
-                            && (private_key_bundle.flags() & key_bundle::FLAG_RELIABLE_STORAGE) > 0,
+                            && (secret_key_bundle.flags() & key_bundle::FLAG_RELIABLE_STORAGE) > 0,
                     },
                 ))
             }
         }
     }
 
-    pub fn process_confirm<'a>(
-        self,
-        confirm_message: &'a mut [u8],
-    ) -> Result<
-        (
-            SymmetricKeys,
-            Arc<AuthenticBundle<S::PublicSigningKeyImpl>>,
-            &'a mut [u8],
-        ),
-        Error,
-    > {
+    pub fn process_confirm<'a>(self, confirm_message: &'a mut [u8]) -> Result<HandshakeFinished<'a, C>, Error> {
         use confirm::*;
 
         if confirm_message.len() < PAYLOAD_START + PAYLOAD_REV_START {
@@ -244,7 +247,7 @@ impl<S: SessionLayer> ReplyState<S> {
         symmetric.decrypt_and_mix(6, &mut confirm_message[PAYLOAD_START..payload_tag_end])?;
 
         let mixed_payload = &confirm_message[PAYLOAD_START..payload_end];
-        let result = AuthenticBundle::authenticate::<S::Shake256Impl>(mixed_payload);
+        let result = AuthenticBundle::authenticate::<C::Hasher>(mixed_payload);
         let (key_bundle, key_bundle_len) = result.map_err(|_| Error::Inauthentic)?;
         let remote_key_bundle = Arc::new(key_bundle);
 
@@ -277,6 +280,11 @@ impl<S: SessionLayer> ReplyState<S> {
 
         let recv_payload = &mut confirm_message[key_bundle_end..payload_end];
 
-        Ok((symmetric.split(8), remote_key_bundle, recv_payload))
+        Ok(HandshakeFinished {
+            message_to_send: None,
+            keys: symmetric.split(8),
+            remote_key_bundle,
+            recv_payload,
+        })
     }
 }

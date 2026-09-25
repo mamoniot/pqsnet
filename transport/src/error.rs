@@ -20,6 +20,7 @@ pub enum ReplyError {
     /// The message contained in the received packet could not be authenticated.
     Inauthentic,
     InvalidPayload,
+    IncorrectResumption,
 }
 
 impl From<Error> for ReplyError {

@@ -1,13 +1,22 @@
+use std::sync::Arc;
+
 use zeroize::Zeroizing;
 
 use crate::{
-    crypto::{aes256::TAG_LEN, prelude::*},
+    crypto::{
+        aes256::{KEY_LEN, TAG_LEN},
+        prelude::*,
+    },
     error::Error,
+    key_bundle::AuthenticBundle,
     protocol::{domain, symmetric_state::*},
-    session_layer::{ResumptionKey, ResumptionToken, SessionLayer, SocketKey},
 };
 
-pub struct SymmetricState<S: SessionLayer> {
+pub type ResumptionToken = [u8; RESUMPTION_TOKEN_LEN];
+pub type ResumptionKey = [u8; RESUMPTION_KEY_LEN];
+pub type SocketKey = [u8; KEY_LEN];
+
+pub struct SymmetricState<S: Crypto> {
     key_buffer: Zeroizing<[u8; SHAKE256_HANDSHAKE_OUTPUT_LEN]>,
     _s: std::marker::PhantomData<S>,
 }
@@ -17,15 +26,22 @@ pub struct SymmetricKeys {
     key_buffer: Zeroizing<[u8; SHAKE256_SPLIT_OUTPUT_LEN]>,
 }
 
-impl<S: SessionLayer> Clone for SymmetricState<S> {
+#[derive(Clone)]
+pub struct Resumption<S: Crypto> {
+    pub token: ResumptionToken,
+    pub key: Zeroizing<ResumptionKey>,
+    pub remote_key_bundle: Arc<AuthenticBundle<S::PublicSigningKey>>,
+}
+
+impl<S: Crypto> Clone for SymmetricState<S> {
     fn clone(&self) -> Self {
         Self { key_buffer: self.key_buffer.clone(), _s: Default::default() }
     }
 }
 
-impl<S: SessionLayer> SymmetricState<S> {
-    fn hash3(&self, step_no: u8, shared_data: &[u8]) -> S::Shake256Impl {
-        let mut hasher = S::Shake256Impl::new();
+impl<S: Crypto> SymmetricState<S> {
+    fn hash3(&self, step_no: u8, shared_data: &[u8]) -> S::Hasher {
+        let mut hasher = S::Hasher::new();
         hasher.update(&self.key_buffer[CHAINING_KEY_RANGE]);
         hasher.update(&[step_no]);
         hasher.update(shared_data);
@@ -48,7 +64,7 @@ impl<S: SessionLayer> SymmetricState<S> {
     pub fn encrypt_and_mix(&mut self, step_no: u8, plaintext_and_pad: &mut [u8]) {
         let (plaintext, pad) = plaintext_and_pad.split_at_mut(plaintext_and_pad.len() - TAG_LEN);
 
-        let tag = S::ColdPathCipher::encrypt_in_place(
+        let tag = S::Cipher::encrypt_in_place(
             (&self.key_buffer[AES_KEY_RANGE]).try_into().unwrap(),
             domain::to_handshake_nonce(step_no),
             plaintext,
@@ -63,7 +79,7 @@ impl<S: SessionLayer> SymmetricState<S> {
 
         let (ciphertext, tag) = ciphertext_and_tag.split_at_mut(ciphertext_and_tag.len() - TAG_LEN);
 
-        let auth = S::ColdPathCipher::decrypt_in_place(
+        let auth = S::Cipher::decrypt_in_place(
             (&self.key_buffer[AES_KEY_RANGE]).try_into().unwrap(),
             domain::to_handshake_nonce(step_no),
             ciphertext,

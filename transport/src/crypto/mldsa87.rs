@@ -3,7 +3,7 @@ pub const PUBLIC_KEY_LEN: usize = 2592;
 /// The size in bytes of a ML-DSA-87 Public Key.
 pub const SIGN_LEN: usize = 4627;
 
-pub trait PrivateSigningKey {
+pub trait SecretSigningKey {
     fn sign(&self, ctx: &[u8], data: &[u8]) -> [u8; SIGN_LEN];
 }
 
