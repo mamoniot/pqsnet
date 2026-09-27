@@ -10,7 +10,7 @@ use crate::{
     application_layer::Route,
     protocol::*,
     session::{
-        DocMem, DocNo, OpenChannel, RecvDoc, RecvDocInner, RecvDocState, RecvError, ReplyState, Session,
+        DocMem, DocNo, OpenChannel, RecvDoc, RecvDocInner, RecvDocState, RecvError, Session, SpecialReplyState,
         UnfinishedRecvDoc, UnreleasedChannel,
     },
     varint::*,
@@ -103,7 +103,7 @@ impl<R: Route> Session<R> {
                     channel.ready_wakers.pop()
                 }
                 DocMem::ReplyBuf(_) => {
-                    let new_state = ReplyState::Recv(
+                    let new_state = SpecialReplyState::Recv(
                         doc.total_recv,
                         UnreleasedChannel {
                             doc_no,
@@ -111,7 +111,7 @@ impl<R: Route> Session<R> {
                             is_closed,
                         },
                     );
-                    if let ReplyState::Awaiting(_, w) = std::mem::replace(&mut channel.reply_buffer, new_state) {
+                    if let SpecialReplyState::Awaiting(_, w) = std::mem::replace(&mut channel.reply_buffer, new_state) {
                         Some(w)
                     } else {
                         // Since we `take` the pointer range when creating this `ReplyBuf`

@@ -6,10 +6,9 @@ use zeroize::Zeroizing;
 use crate::{
     crypto::prelude::*,
     error::{Error, ReplyError},
-    initiator::HandshakeFinished,
     key_bundle::{AuthenticBundle, OfflineHash, SecretBundle},
     protocol::*,
-    symmetric_state::{Resumption, ResumptionToken, SymmetricKeys, SymmetricState},
+    symmetric_state::{HandshakeComplete, Resumption, ResumptionToken, SymmetricState},
 };
 
 pub struct ReplyState<C: Crypto> {
@@ -18,13 +17,8 @@ pub struct ReplyState<C: Crypto> {
     reject_if_remote_has_reliable_storage: bool,
 }
 
-pub enum ResponseOk<'a, C: Crypto> {
-    Complete(
-        Vec<u8>,
-        SymmetricKeys,
-        Arc<AuthenticBundle<C::PublicSigningKey>>,
-        &'a mut [u8],
-    ),
+pub enum InitOk<'a, C: Crypto> {
+    Complete(HandshakeComplete<'a, C>),
     Incomplete(Vec<u8>, ReplyState<C>),
 }
 
@@ -42,10 +36,10 @@ impl<C: Crypto> ReplyState<C> {
     pub fn process_initialize<'a>(
         aad: &[u8],
         init_message: &'a mut [u8],
-        secret_key_bundle: &SecretBundle<C::PublicSigningKey, C::SecretSigningKey>,
+        secret_key_bundle: &SecretBundle<C::PublicKey, C::SecretKey>,
         resumption: Option<Resumption<C>>,
         create_payload: impl FnOnce(&mut Vec<u8>),
-    ) -> Result<ResponseOk<'a, C>, ReplyError> {
+    ) -> Result<InitOk<'a, C>, ReplyError> {
         let shared_secret;
         let ciphertext;
         let handshake_type;
@@ -77,11 +71,9 @@ impl<C: Crypto> ReplyState<C> {
 
                 let resumption_token = (&init_message[RESUMPTION_TOKEN_RANGE]).try_into().unwrap();
 
-                if let Some(resumption) = &resumption {
-                    if !constant_time_eq_32(&resumption.token, resumption_token) {
-                        return Err(ReplyError::IncorrectResumption);
-                    }
-                } else {
+                if let Some(resumption) = &resumption
+                    && !constant_time_eq_32(&resumption.token, resumption_token)
+                {
                     return Err(ReplyError::IncorrectResumption);
                 }
             } else if init_message.len() != EPHEMERAL_ENC_KEY_END {
@@ -112,7 +104,7 @@ impl<C: Crypto> ReplyState<C> {
 
                 /* KEY BUNDLE CHECKSUM HANDLING */
 
-                let mut bundle_hasher = C::Hasher::new();
+                let mut bundle_hasher = C::Xof::new();
                 bundle_hasher.update(&checksum_channel_binding);
                 bundle_hasher.update(resumption.remote_key_bundle.bundle_hash());
                 bundle_hasher.update(secret_key_bundle.bundle_hash());
@@ -207,14 +199,14 @@ impl<C: Crypto> ReplyState<C> {
             symmetric.encrypt_and_mix(5, &mut reply_message[online_sign_start..online_sign_tag_end]);
 
             if let Some((remote_key_bundle, recv_payload_range)) = resume {
-                Ok(ResponseOk::Complete(
-                    reply_message,
-                    symmetric.split(13),
+                Ok(InitOk::Complete(HandshakeComplete {
+                    message_to_send: Some(reply_message),
+                    keys: symmetric.split(13),
                     remote_key_bundle,
-                    &mut init_message[recv_payload_range],
-                ))
+                    recv_payload: &mut init_message[recv_payload_range],
+                }))
             } else {
-                Ok(ResponseOk::Incomplete(
+                Ok(InitOk::Incomplete(
                     reply_message,
                     ReplyState {
                         symmetric,
@@ -227,7 +219,7 @@ impl<C: Crypto> ReplyState<C> {
         }
     }
 
-    pub fn process_confirm<'a>(self, confirm_message: &'a mut [u8]) -> Result<HandshakeFinished<'a, C>, Error> {
+    pub fn process_confirm<'a>(self, confirm_message: &'a mut [u8]) -> Result<HandshakeComplete<'a, C>, Error> {
         use confirm::*;
 
         if confirm_message.len() < PAYLOAD_START + PAYLOAD_REV_START {
@@ -247,7 +239,7 @@ impl<C: Crypto> ReplyState<C> {
         symmetric.decrypt_and_mix(6, &mut confirm_message[PAYLOAD_START..payload_tag_end])?;
 
         let mixed_payload = &confirm_message[PAYLOAD_START..payload_end];
-        let result = AuthenticBundle::authenticate::<C::Hasher>(mixed_payload);
+        let result = AuthenticBundle::authenticate::<C::Xof>(mixed_payload);
         let (key_bundle, key_bundle_len) = result.map_err(|_| Error::Inauthentic)?;
         let remote_key_bundle = Arc::new(key_bundle);
 
@@ -280,7 +272,7 @@ impl<C: Crypto> ReplyState<C> {
 
         let recv_payload = &mut confirm_message[key_bundle_end..payload_end];
 
-        Ok(HandshakeFinished {
+        Ok(HandshakeComplete {
             message_to_send: None,
             keys: symmetric.split(8),
             remote_key_bundle,

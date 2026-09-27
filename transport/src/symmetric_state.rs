@@ -30,7 +30,14 @@ pub struct SymmetricKeys {
 pub struct Resumption<S: Crypto> {
     pub token: ResumptionToken,
     pub key: Zeroizing<ResumptionKey>,
-    pub remote_key_bundle: Arc<AuthenticBundle<S::PublicSigningKey>>,
+    pub remote_key_bundle: Arc<AuthenticBundle<S::PublicKey>>,
+}
+
+pub struct HandshakeComplete<'a, C: Crypto> {
+    pub message_to_send: Option<Vec<u8>>,
+    pub keys: SymmetricKeys,
+    pub remote_key_bundle: Arc<AuthenticBundle<C::PublicKey>>,
+    pub recv_payload: &'a mut [u8],
 }
 
 impl<S: Crypto> Clone for SymmetricState<S> {
@@ -40,8 +47,8 @@ impl<S: Crypto> Clone for SymmetricState<S> {
 }
 
 impl<S: Crypto> SymmetricState<S> {
-    fn hash3(&self, step_no: u8, shared_data: &[u8]) -> S::Hasher {
-        let mut hasher = S::Hasher::new();
+    fn hash3(&self, step_no: u8, shared_data: &[u8]) -> S::Xof {
+        let mut hasher = S::Xof::new();
         hasher.update(&self.key_buffer[CHAINING_KEY_RANGE]);
         hasher.update(&[step_no]);
         hasher.update(shared_data);

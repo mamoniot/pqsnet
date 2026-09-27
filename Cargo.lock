@@ -277,6 +277,7 @@ dependencies = [
  "cbor4ii",
  "dashmap",
  "hex-literal",
+ "psqnet_transport",
  "rand",
  "rand_core",
  "serde",

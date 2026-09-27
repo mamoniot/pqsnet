@@ -7,7 +7,7 @@ use crate::{
     error::{Error, InitError},
     key_bundle::{AuthenticBundle, SecretBundle},
     protocol::*,
-    symmetric_state::{Resumption, SymmetricKeys, SymmetricState},
+    symmetric_state::{HandshakeComplete, Resumption, SymmetricState},
 };
 
 pub struct InitializeState<C: Crypto> {
@@ -15,21 +15,14 @@ pub struct InitializeState<C: Crypto> {
     fallback: Option<SymmetricState<C>>,
     decapsulation_key: C::DecapsulationKey,
     payload: Box<[u8]>,
-    secret_key_bundle: Arc<SecretBundle<C::PublicSigningKey, C::SecretSigningKey>>,
-    remote_key_bundle: Option<Arc<AuthenticBundle<C::PublicSigningKey>>>,
-}
-
-pub struct HandshakeFinished<'a, C: Crypto> {
-    pub message_to_send: Option<Vec<u8>>,
-    pub keys: SymmetricKeys,
-    pub remote_key_bundle: Arc<AuthenticBundle<C::PublicSigningKey>>,
-    pub recv_payload: &'a mut [u8],
+    secret_key_bundle: Arc<SecretBundle<C::PublicKey, C::SecretKey>>,
+    remote_key_bundle: Option<Arc<AuthenticBundle<C::PublicKey>>>,
 }
 
 impl<C: Crypto> InitializeState<C> {
     pub fn initialize(
         aad: &[u8],
-        secret_key_bundle: Arc<SecretBundle<C::PublicSigningKey, C::SecretSigningKey>>,
+        secret_key_bundle: Arc<SecretBundle<C::PublicKey, C::SecretKey>>,
         resumption: Option<Resumption<C>>,
         payload: Box<[u8]>,
     ) -> Result<InitializeState<C>, InitError> {
@@ -79,7 +72,7 @@ impl<C: Crypto> InitializeState<C> {
 
             /* KEY BUNDLE CHECKSUM HANDLING */
 
-            let mut bundle_hasher = C::Hasher::new();
+            let mut bundle_hasher = C::Xof::new();
             bundle_hasher.update(&symmetric.channel_binding());
             bundle_hasher.update(secret_key_bundle.bundle_hash());
             bundle_hasher.update(resumption.remote_key_bundle.bundle_hash());
@@ -121,7 +114,7 @@ impl<C: Crypto> InitializeState<C> {
         })
     }
 
-    pub fn process_reply<'a>(mut self, reply_message: &'a mut [u8]) -> Result<HandshakeFinished<'a, C>, Error> {
+    pub fn process_reply<'a>(mut self, reply_message: &'a mut [u8]) -> Result<HandshakeComplete<'a, C>, Error> {
         let handshake_type;
         let remote_key_bundle;
         let recv_payload;
@@ -173,7 +166,7 @@ impl<C: Crypto> InitializeState<C> {
                 /* KEY BUNDLE HANDLING */
 
                 let mixed_payload = &reply_message[PAYLOAD_START..payload_end];
-                let result = AuthenticBundle::authenticate::<C::Hasher>(mixed_payload);
+                let result = AuthenticBundle::authenticate::<C::Xof>(mixed_payload);
                 let (key_bundle, key_bundle_len) = result.map_err(|_| Error::Inauthentic)?;
                 remote_key_bundle = Arc::new(key_bundle);
 
@@ -214,7 +207,7 @@ impl<C: Crypto> InitializeState<C> {
             if handshake_type == HANDSHAKE_TYPE_RESUME {
                 /* SPLIT */
 
-                return Ok(HandshakeFinished {
+                return Ok(HandshakeComplete {
                     message_to_send: None,
                     keys: symmetric.split(13),
                     remote_key_bundle,
@@ -253,7 +246,7 @@ impl<C: Crypto> InitializeState<C> {
 
             symmetric.encrypt_and_mix(7, &mut confirm_message[online_sign_start..online_sign_tag_end]);
 
-            Ok(HandshakeFinished {
+            Ok(HandshakeComplete {
                 message_to_send: Some(confirm_message),
                 keys: symmetric.split(8),
                 remote_key_bundle,
@@ -262,10 +255,10 @@ impl<C: Crypto> InitializeState<C> {
         }
     }
 
-    pub fn secret_key_bundle(&self) -> &Arc<SecretBundle<C::PublicSigningKey, C::SecretSigningKey>> {
+    pub fn secret_key_bundle(&self) -> &Arc<SecretBundle<C::PublicKey, C::SecretKey>> {
         &self.secret_key_bundle
     }
-    pub fn remote_key_bundle(&self) -> &AuthenticBundle<C::PublicSigningKey> {
+    pub fn remote_key_bundle(&self) -> &AuthenticBundle<C::PublicKey> {
         &self.secret_key_bundle
     }
 }

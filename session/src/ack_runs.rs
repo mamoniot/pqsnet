@@ -56,7 +56,7 @@ pub fn encode(buf: &mut Vec<u8>, sorted_acks: &[u32], capacity: usize) -> usize 
                     cur_set_run_len = 0;
                     break;
                 }
-                varu32_write(buf, n);
+                varu32_write(&mut *buf, n);
                 cur_set_run_len = 0;
                 if new_len == max_len {
                     // The cur set run is being terminated but there is no room left to encode which
@@ -88,7 +88,7 @@ pub fn encode(buf: &mut Vec<u8>, sorted_acks: &[u32], capacity: usize) -> usize 
                 i -= 1;
                 break;
             }
-            varu32_write(buf, n);
+            varu32_write(&mut *buf, n);
             if new_len == max_len {
                 break;
             }
@@ -99,7 +99,7 @@ pub fn encode(buf: &mut Vec<u8>, sorted_acks: &[u32], capacity: usize) -> usize 
             if new_len > max_len {
                 i -= cur_set_run_len as usize;
             } else {
-                varu32_write(buf, n);
+                varu32_write(&mut *buf, n);
             }
         }
 

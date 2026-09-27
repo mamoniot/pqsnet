@@ -1,13 +1,15 @@
+use std::ops::Range;
+
 pub struct Desegmenter {}
 
-pub enum NewResult<'a> {
+pub enum NewResult {
     Success(Desegmenter),
-    SingleSeg(&'a [u8]),
+    SingleSeg(Range<usize>),
     Failure,
 }
 
 impl Desegmenter {
-    pub fn new<'a>(packet: &'a [u8], idx: &mut usize) -> NewResult<'a> {
+    pub fn new(packet: &[u8], idx: &mut usize) -> NewResult {
         todo!()
     }
 

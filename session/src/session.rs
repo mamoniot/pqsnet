@@ -116,7 +116,7 @@ pub(crate) struct UnfinishedRecvDoc {
 }
 
 #[derive(Default)]
-pub(crate) enum ReplyState {
+pub(crate) enum SpecialReplyState {
     /// This waker is waiting for this channel to recv a new doc into this given pointer range or
     /// it is waiting for this channel to close.
     Awaiting(Option<Range<*mut u8>>, Waker),
@@ -125,7 +125,7 @@ pub(crate) enum ReplyState {
     None,
 }
 
-impl ReplyState {
+impl SpecialReplyState {
     /// If there is a reply buffer awaiting data, this function removes it and returns it.
     /// The reply state will still be awaiting data, but the reply buffer will be gone.
     pub fn try_incoming(&mut self) -> Option<Range<*mut u8>> {
@@ -155,7 +155,7 @@ pub(crate) struct OpenChannel {
     pub(crate) ready_docs: SmallVec<[UnfinishedRecvDoc; 1]>,
     /// TODO: Give this more capabilities. At least ensure that the protocol can handle extended
     /// capabilities.
-    pub(crate) reply_buffer: ReplyState,
+    pub(crate) reply_buffer: SpecialReplyState,
 }
 
 pub(crate) struct RecvDocInner {
@@ -398,7 +398,7 @@ impl<R: Route> Session<R> {
             while let Some(waker) = channel.ready_wakers.pop() {
                 waker.wake();
             }
-            if let ReplyState::Awaiting(_, waker) = std::mem::take(&mut channel.reply_buffer) {
+            if let SpecialReplyState::Awaiting(_, waker) = std::mem::take(&mut channel.reply_buffer) {
                 waker.wake();
             }
         }

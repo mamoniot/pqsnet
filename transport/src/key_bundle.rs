@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use constant_time_eq::{constant_time_eq_32, constant_time_eq_n};
 
 use crate::{
-    crypto::{mldsa87::*, shake256::Hasher},
+    crypto::{mldsa87::*, shake256::Xof},
     protocol::{domain, key_bundle::*},
 };
 
@@ -24,7 +24,7 @@ pub type OfflineHash = [u8; OFFLINE_HASH_LEN];
 
 pub type BundleHash = [u8; BUNDLE_HASH_LEN];
 
-pub struct AuthenticBundle<P: PublicSigningKey> {
+pub struct AuthenticBundle<P: PublicKey> {
     offline_hash: OfflineHash,
     bundle_hash: BundleHash,
     online_key: P,
@@ -35,7 +35,7 @@ pub struct AuthenticBundle<P: PublicSigningKey> {
     extensions: Box<[u8]>,
 }
 
-pub struct SecretBundle<P: PublicSigningKey, S: SecretSigningKey> {
+pub struct SecretBundle<P: PublicKey, S: SecretKey> {
     online_secret_key: S,
     public_bundle_bytes: Box<[u8]>,
     public_bundle: AuthenticBundle<P>,
@@ -64,7 +64,7 @@ impl std::fmt::Display for AuthError {
     }
 }
 
-fn hash_bundle<H: Hasher>(buf: &[u8]) -> (OfflineHash, BundleHash) {
+fn hash_bundle<H: Xof>(buf: &[u8]) -> (OfflineHash, BundleHash) {
     let mut hasher = H::new();
     hasher.update(domain::OFFLINE_SALT);
     hasher.update(&buf[OFFLINE_KEY_RANGE]);
@@ -82,7 +82,7 @@ fn hash_bundle<H: Hasher>(buf: &[u8]) -> (OfflineHash, BundleHash) {
     (offline_hash, bundle_hash)
 }
 
-impl<P: PublicSigningKey, S: SecretSigningKey> std::ops::Deref for SecretBundle<P, S> {
+impl<P: PublicKey, S: SecretKey> std::ops::Deref for SecretBundle<P, S> {
     type Target = AuthenticBundle<P>;
 
     fn deref(&self) -> &Self::Target {
@@ -90,12 +90,13 @@ impl<P: PublicSigningKey, S: SecretSigningKey> std::ops::Deref for SecretBundle<
     }
 }
 
-impl<P: PublicSigningKey, S: SecretSigningKey> SecretBundle<P, S> {
-    pub fn update<K: SecretSigningKey, H: Hasher>(
+impl<P: PublicKey, S: SecretKey> SecretBundle<P, S> {
+    pub fn update<K: SecretKey, H: Xof>(
         &self,
         offline_secret_key: K,
         online_secret_key: S,
-        online_key: P,
+        new_online_public_key: P,
+        new_online_public_key_bytes: [u8; PUBLIC_KEY_LEN],
         not_before: u64,
         not_after: u64,
         flags: u32,
@@ -105,7 +106,8 @@ impl<P: PublicSigningKey, S: SecretSigningKey> SecretBundle<P, S> {
             offline_secret_key,
             online_secret_key,
             self.public_bundle_bytes[OFFLINE_KEY_RANGE].try_into().unwrap(),
-            online_key,
+            new_online_public_key,
+            new_online_public_key_bytes,
             not_before,
             not_after,
             self.counter + 1,
@@ -114,11 +116,12 @@ impl<P: PublicSigningKey, S: SecretSigningKey> SecretBundle<P, S> {
         )
     }
 
-    pub fn new<K: SecretSigningKey, H: Hasher>(
+    pub fn new<K: SecretKey, H: Xof>(
         offline_secret_key: K,
         online_secret_key: S,
-        offline_public_key: [u8; PUBLIC_KEY_LEN],
-        online_key: P,
+        offline_public_key_bytes: [u8; PUBLIC_KEY_LEN],
+        online_public_key: P,
+        online_public_key_bytes: [u8; PUBLIC_KEY_LEN],
         not_before: u64,
         not_after: u64,
         counter: u32,
@@ -131,8 +134,8 @@ impl<P: PublicSigningKey, S: SecretSigningKey> SecretBundle<P, S> {
         let mut buf = vec![0; offline_sign_end];
 
         buf[VERSION_IDX] = VERSION_VALUE;
-        buf[OFFLINE_KEY_RANGE].copy_from_slice(&offline_public_key);
-        buf[ONLINE_KEY_RANGE].copy_from_slice(&online_key.encode());
+        buf[OFFLINE_KEY_RANGE].copy_from_slice(&offline_public_key_bytes);
+        buf[ONLINE_KEY_RANGE].copy_from_slice(&online_public_key_bytes);
         buf[NOT_BEFORE_RANGE].copy_from_slice(&not_before.to_be_bytes());
         buf[NOT_AFTER_RANGE].copy_from_slice(&not_after.to_be_bytes());
         buf[COUNTER_RANGE].copy_from_slice(&counter.to_be_bytes());
@@ -152,7 +155,7 @@ impl<P: PublicSigningKey, S: SecretSigningKey> SecretBundle<P, S> {
             public_bundle: AuthenticBundle {
                 offline_hash,
                 bundle_hash,
-                online_key,
+                online_key: online_public_key,
                 counter,
                 not_before,
                 not_after,
@@ -176,15 +179,12 @@ impl<P: PublicSigningKey, S: SecretSigningKey> SecretBundle<P, S> {
     }
 }
 
-impl<P: PublicSigningKey> AuthenticBundle<P> {
-    pub fn authenticate<H: Hasher>(buf: &[u8]) -> Result<(Self, usize), AuthError> {
+impl<P: PublicKey> AuthenticBundle<P> {
+    pub fn authenticate<H: Xof>(buf: &[u8]) -> Result<(Self, usize), AuthError> {
         Self::authenticate_with_time::<H>(buf, get_secs_since_unix_epoch())
     }
 
-    pub fn authenticate_with_time<H: Hasher>(
-        buf: &[u8],
-        secs_since_unix_epoch: u64,
-    ) -> Result<(Self, usize), AuthError> {
+    pub fn authenticate_with_time<H: Xof>(buf: &[u8], secs_since_unix_epoch: u64) -> Result<(Self, usize), AuthError> {
         if buf[VERSION_IDX] != VERSION_VALUE {
             return Err(AuthError::UnrecognizedVersion);
         }
@@ -203,7 +203,7 @@ impl<P: PublicSigningKey> AuthenticBundle<P> {
             return Err(AuthError::ExpiredKey);
         }
 
-        let offline_key = P::decode(buf[OFFLINE_KEY_RANGE].try_into().unwrap());
+        let offline_key = P::decode(buf[OFFLINE_KEY_RANGE].try_into().unwrap()).ok_or(AuthError::Inauthentic)?;
 
         let auth = offline_key.verify(
             domain::OFFLINE_KEY_CERTIFICATION,
@@ -214,7 +214,7 @@ impl<P: PublicSigningKey> AuthenticBundle<P> {
             return Err(AuthError::Inauthentic);
         }
 
-        let online_key = P::decode(buf[ONLINE_KEY_RANGE].try_into().unwrap());
+        let online_key = P::decode(buf[ONLINE_KEY_RANGE].try_into().unwrap()).ok_or(AuthError::Inauthentic)?;
 
         let extensions = Box::from(&buf[EXTENSIONS_START..offline_sign_start]);
 

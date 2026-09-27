@@ -6,28 +6,26 @@
 
 ## Transport
 ### Core
-- Send handshake messages
 - Add session-level approval or rejection of offline key
-- Allow for dynamic length payloads
-- Handshake resends
 - Resumption API
-- Socket coherency after resumption
 - Handshake and socket expiration
 ### Extraneous
-- Structure init_table as a cache with strict upper limits
 - Come up with a better name
 - Update protocol full name with new name
 - Zeroize stack
-- Input sanitize mtu
 - Improve desegmentation API
-- Improve key bundle timestamp handling
 - API for determining maximum allowable payload length
 - Implement Debug for all public types
+- Improve key bundle timestamp handling
 - Add improved timestamp checking API for key bundles
+- Add builder API for creating secret key bundles
 
 ## Session
 Secure, flow controlled, asynchronous, hierarchical document transfer protocol
 ### Core
+- Structure handshake_table as a cache with strict upper limits
+- Socket coherency after resumption
+- Handshake resends
 - Add TTL options for channels and sessions
 - Implement PLPMTUD
 - Implement phi accural keep alives

@@ -8,9 +8,9 @@ pub mod mldsa87;
 
 pub trait Crypto {
     type Cipher: aes256::Cipher;
-    type Hasher: shake256::Hasher;
-    type SecretSigningKey: mldsa87::SecretSigningKey;
-    type PublicSigningKey: mldsa87::PublicSigningKey;
+    type Xof: shake256::Xof;
+    type SecretKey: mldsa87::SecretKey;
+    type PublicKey: mldsa87::PublicKey;
     type DecapsulationKey: mlkem1024::DecapsulationKey;
 }
 
@@ -19,13 +19,13 @@ pub mod prelude {
 
     pub use aes256::Cipher;
 
-    pub use shake256::Hasher;
+    pub use shake256::Xof;
 
     pub use mlkem1024::DecapsulationKey;
 
-    pub use mldsa87::PublicSigningKey;
+    pub use mldsa87::PublicKey;
 
-    pub use mldsa87::SecretSigningKey;
+    pub use mldsa87::SecretKey;
 
     pub use super::Crypto;
 }

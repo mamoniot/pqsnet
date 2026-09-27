@@ -10,7 +10,7 @@ use smallvec::SmallVec;
 use crate::{
     application_layer::Route,
     protocol::*,
-    session::{DocNo, OpenChannel, RecvDocState, ReplyState, SendDoc, Session},
+    session::{DocNo, OpenChannel, RecvDocState, SendDoc, Session, SpecialReplyState},
 };
 
 const FLAG_IS_CLOSED: u64 = 1u64.reverse_bits();
@@ -128,7 +128,11 @@ impl<R: Route> Channel<R> {
         SendFuture { channel: self, doc: Some(doc), has_waited: false }.await
     }
 
-    fn try_send_any(&self, doc: Bytes, f: impl FnOnce() -> ReplyState) -> Result<Channel<R>, (TrySendError, Bytes)> {
+    fn try_send_any(
+        &self,
+        doc: Bytes,
+        f: impl FnOnce() -> SpecialReplyState,
+    ) -> Result<Channel<R>, (TrySendError, Bytes)> {
         let session = &self.session;
         // Verify and update sending limits.
         let send_total = session.send_total.fetch_add(1, Ordering::Relaxed);
@@ -493,7 +497,7 @@ impl<'a, R: Route> Future for SendReplyFuture<'a, R> {
                 state: SendReplyState::Sending(doc, has_waited),
             } => {
                 match channel.try_send_any(doc.take().unwrap(), || {
-                    ReplyState::Awaiting(Some(buffer.as_mut_ptr_range()), cx.waker().clone())
+                    SpecialReplyState::Awaiting(Some(buffer.as_mut_ptr_range()), cx.waker().clone())
                 }) {
                     Ok(reply_channel) => {
                         if *has_waited {
@@ -526,12 +530,12 @@ impl<'a, R: Route> Future for SendReplyFuture<'a, R> {
                 reply_channel.session.update_channel(reply_channel.doc_no(), |channel| {
                     // TODO: Analyze this section for errors.
                     match std::mem::take(&mut channel.reply_buffer) {
-                        ReplyState::Awaiting(buffer, _) => {
+                        SpecialReplyState::Awaiting(buffer, _) => {
                             // This can only occur due to a spurious wake up.
-                            channel.reply_buffer = ReplyState::Awaiting(buffer, cx.waker().clone());
+                            channel.reply_buffer = SpecialReplyState::Awaiting(buffer, cx.waker().clone());
                             ret = Poll::Pending;
                         }
-                        ReplyState::Recv(len, channel) => {
+                        SpecialReplyState::Recv(len, channel) => {
                             ret = Poll::Ready(Ok((
                                 len,
                                 Channel::new(
@@ -542,7 +546,7 @@ impl<'a, R: Route> Future for SendReplyFuture<'a, R> {
                                 ),
                             )));
                         }
-                        ReplyState::None => {}
+                        SpecialReplyState::None => {}
                     }
                 });
                 ret

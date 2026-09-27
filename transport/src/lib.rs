@@ -2,19 +2,18 @@ pub mod crypto;
 
 pub(crate) mod protocol;
 
+pub(crate) mod symmetric_state;
+
+pub mod key_bundle;
+
 pub mod initiator;
 
 pub mod responder;
 
 pub mod error;
 
-pub mod key_bundle;
-
-pub mod crypto_impl;
-
-pub(crate) mod symmetric_state;
-
 pub use protocol::domain::to_data_nonce;
+pub use symmetric_state::HandshakeComplete;
 pub use symmetric_state::SymmetricKeys;
 
 pub mod exports {
