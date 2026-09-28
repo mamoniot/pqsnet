@@ -1,3 +1,4 @@
+#[derive(Debug)]
 pub enum Error {
     /// The packet received was invalidly encoded.
     Invalid,
@@ -5,6 +6,7 @@ pub enum Error {
     Inauthentic,
 }
 
+#[derive(Debug)]
 pub enum InitError {
     /// The packet received was invalidly encoded.
     Invalid,
@@ -14,6 +16,7 @@ pub enum InitError {
     ResumptionKeyRequired,
 }
 
+#[derive(Debug)]
 pub enum ReplyError {
     /// The packet received was invalidly encoded.
     Invalid,

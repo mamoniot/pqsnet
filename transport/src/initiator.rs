@@ -10,7 +10,7 @@ use crate::{
     symmetric_state::{HandshakeComplete, Resumption, SymmetricState},
 };
 
-pub struct InitializeState<C: Crypto> {
+pub struct InitState<C: Crypto> {
     symmetric: SymmetricState<C>,
     fallback: Option<SymmetricState<C>>,
     decapsulation_key: C::DecapsulationKey,
@@ -19,13 +19,13 @@ pub struct InitializeState<C: Crypto> {
     remote_key_bundle: Option<Arc<AuthenticBundle<C::PublicKey>>>,
 }
 
-impl<C: Crypto> InitializeState<C> {
+impl<C: Crypto> InitState<C> {
     pub fn initialize(
         aad: &[u8],
         secret_key_bundle: Arc<SecretBundle<C::PublicKey, C::SecretKey>>,
         resumption: Option<Resumption<C>>,
         payload: Box<[u8]>,
-    ) -> Result<InitializeState<C>, InitError> {
+    ) -> Result<InitState<C>, InitError> {
         use initialize::*;
 
         /* HANDSHAKE LEN AND FLAGS HANDLING */
@@ -104,7 +104,7 @@ impl<C: Crypto> InitializeState<C> {
             symmetric.mix(1, &init_message[..]);
         }
 
-        Ok(InitializeState {
+        Ok(InitState {
             symmetric,
             fallback,
             decapsulation_key,

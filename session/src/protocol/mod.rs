@@ -63,7 +63,7 @@ pub const SOCKET_ID_RESPONSE_MESSAGE: SocketId = 1;
 pub const SOCKET_ID_CONFIRM_MESSAGE: SocketId = 2;
 pub const SOCKET_ID_RESERVED_MAX: SocketId = VARINT_U8_MAX as SocketId;
 
-pub const HANDSHAKE_HEADER_LEN: usize = u128::BITS as usize / 8;
+pub const HANDSHAKE_NO_LEN: usize = u128::BITS as usize / 8;
 pub const HANDSHAKE_HEADER_SOCKET_ID_INC: u128 = 1 << (u128::BITS - 8);
 
 // TODO: Keep alive, explicit congestion, data blocked, connection close.

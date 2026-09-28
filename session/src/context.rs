@@ -1,14 +1,9 @@
-use std::{
-    borrow::Cow,
-    cell::UnsafeCell,
-    sync::{Arc, OnceLock, Weak},
-};
+use std::sync::{Arc, OnceLock, Weak};
 
 use cbor4ii::serde::to_writer;
 use dashmap::{DashMap, Entry};
 use psqnet_transport::{
-    key_bundle::SecretBundle,
-    responder::{InitOk, ReplyState},
+    HandshakeComplete, error::Error, initiator::InitState, key_bundle::SecretBundle, responder::{InitOk, ReplyState},
 };
 use tracing::*;
 
@@ -19,9 +14,9 @@ use crate::{
         mldsa::{MlDsa87PublicKey, MlDsa87SecretKey},
         transport::Crypto,
     },
-    desegmenter::{Desegmenter, NewResult},
+    desegmenter::{Desegmenter, NewResult, SegError},
     protocol::*,
-    session::{Session, SessionInner},
+    session::SessionInner,
     varint::*,
 };
 
@@ -36,7 +31,7 @@ pub(crate) enum HandshakeEntry {
     Init(Desegmenter),
     Reply {
         reserved_socket_id: SocketId,
-        desegmenter: OnceLock<Desegmenter>,
+        desegmenter: Option<Desegmenter>,
         cur_message: Vec<u8>,
         state: ReplyState<Crypto>,
     },
@@ -48,24 +43,17 @@ pub struct Context<R: Route> {
     secret_bundle: Arc<SecretBundle<MlDsa87PublicKey, MlDsa87SecretKey>>,
 }
 
-impl HandshakeEntry {
-    pub fn recv_mut<'a>(&mut self, packet: &'a [u8], idx: &mut usize) -> Option<Cow<'a, [u8]>> {
-        match self {
-            HandshakeEntry::Init(desegmenter) => desegmenter.recv_mut(packet, idx).map(Cow::Owned),
-            HandshakeEntry::CoolDown => None,
-            HandshakeEntry::Reply { reserved_socket_id, desegmenter, cur_message, state } => todo!(),
-        }
-    }
-}
-
 impl<R: Route> Context<R> {
-    pub async fn open_session(&self, packet: &mut [u8], route: R) -> Result<Channel<R>, ()> {
+    pub async fn open(&self, route: R) -> Result<Channel<R>, ()> {
+        let mut handshake_id: u128 = rand::random();
+        handshake_id >>= 8;
+        debug_assert_eq!(SOCKET_ID_INIT_MESSAGE, 0);
         todo!()
     }
 
     pub fn drive(&self, packet: &mut [u8], route: R) {}
 
-    pub fn recv_init_message(&self, handshake_header: u128, message: &mut [u8]) -> Option<Channel<R>> {
+    fn recv_init_message(&self, handshake_header: u128, message: &mut [u8]) -> Option<Channel<R>> {
         trace!(handshake_header, "recv initial message");
         // If `reserved_socket_id` is `Some` then it is a key in `socket_table`
         // and needs to eventually be removed from it.
@@ -122,12 +110,7 @@ impl<R: Route> Context<R> {
 
                 self.hanshake_table.insert(
                     confirm_header,
-                    HandshakeEntry::Reply {
-                        desegmenter: OnceLock::new(),
-                        reserved_socket_id,
-                        cur_message,
-                        state,
-                    },
+                    HandshakeEntry::Reply { desegmenter: None, reserved_socket_id, cur_message, state },
                 );
                 // TODO: send reply message and queue it to be resent.
             }
@@ -153,46 +136,100 @@ impl<R: Route> Context<R> {
         };
 
         if socket_id <= SOCKET_ID_RESERVED_MAX {
-            if packet.len() < HANDSHAKE_HEADER_LEN {
+            if packet.len() < HANDSHAKE_NO_LEN {
                 warn!("received invalid handshake id");
                 return None;
             };
-            if socket_id != SOCKET_ID_INIT_MESSAGE {
+            if socket_id > SOCKET_ID_CONFIRM_MESSAGE {
                 warn!(socket_id, "received unrecognized socket id in reserved range");
                 return None;
             };
 
-            let handshake_header = u128::from_be_bytes(packet[..HANDSHAKE_HEADER_LEN].try_into().unwrap());
-            *idx = HANDSHAKE_HEADER_LEN;
-            debug_assert_eq!(socket_id, (handshake_header >> (u128::BITS - 8)) as u64);
+            let handshake_no = u128::from_be_bytes(packet[..HANDSHAKE_NO_LEN].try_into().unwrap());
+            *idx = HANDSHAKE_NO_LEN;
+            debug_assert_eq!(socket_id, (handshake_no >> (u128::BITS - 8)) as u64);
 
-            match self.hanshake_table.entry(handshake_header) {
+            match self.hanshake_table.entry(handshake_no) {
                 Entry::Occupied(mut entry) => {
-                    let Some(message) = entry.get().recv_mut(packet, idx) else {
-                        trace!("received handshake initial message fragment");
-                        return None;
+                    let mut _message_mem = None;
+                    let message = match entry.get_mut() {
+                        HandshakeEntry::CoolDown => {
+                            debug!(handshake_no, "ignored handshake fragment while on cooldown");
+                            return None;
+                        }
+                        HandshakeEntry::Init(desegmenter)
+                        | HandshakeEntry::Reply { desegmenter: Some(desegmenter), .. } => {
+                            match desegmenter.recv_mut(packet, idx) {
+                                Ok(m) => _message_mem.insert(m),
+                                Err(SegError::Segmented) => {
+                                    trace!(handshake_no, "received handshake fragment");
+                                    return None;
+                                }
+                                Err(SegError::Invalid) => {
+                                    warn!("received invalid segmentation data");
+                                    return None;
+                                }
+                            }
+                        }
+                        HandshakeEntry::Reply { desegmenter, .. } => {
+                            debug_assert_eq!(socket_id, SOCKET_ID_CONFIRM_MESSAGE);
+
+                            match Desegmenter::new(packet, idx) {
+                                NewResult::Segmented(d) => {
+                                    trace!(handshake_no, "received handshake fragment");
+                                    *desegmenter = Some(d);
+                                    return None;
+                                }
+                                NewResult::SingleSeg(message_range) => &mut packet[message_range],
+                                NewResult::Invalid => {
+                                    warn!(handshake_no, "received invalid segmentation data");
+                                    return None;
+                                }
+                            }
+                        }
                     };
 
                     match entry.insert(HandshakeEntry::CoolDown) {
                         HandshakeEntry::CoolDown => unreachable!(),
                         HandshakeEntry::Init(_) => {
-                            return self.recv_init_message(handshake_header, &mut message[..]);
+                            return self.recv_init_message(handshake_no, message);
                         }
-                        HandshakeEntry::Reply { reserved_socket_id, desegmenter, cur_message, state } => todo!(),
+                        HandshakeEntry::Reply { reserved_socket_id, desegmenter, cur_message, state } => {
+                            match state.process_confirm(message) {
+                                Ok(HandshakeComplete { message_to_send, keys, remote_key_bundle, recv_payload }) => {
+                                    todo!()
+                                }
+                                Err(error) => {
+                                    warn!(handshake_no, error = ?error, "could not authenticate handshake confirmation");
+                                }
+                            }
+                        }
                     }
                 }
-                Entry::Vacant(entry) => match Desegmenter::new(packet, idx) {
-                    NewResult::Success(desegmenter) => {
-                        entry.insert(HandshakeEntry::Init(desegmenter));
+                Entry::Vacant(entry) => {
+                    if socket_id != SOCKET_ID_INIT_MESSAGE {
+                        debug!(
+                            handshake_no,
+                            "received non-init handshake fragment on an unused handshake no"
+                        );
+                        return None;
                     }
-                    NewResult::SingleSeg(message_range) => {
-                        drop(entry);
-                        return self.recv_init_message(handshake_header, &mut packet[message_range]);
+
+                    match Desegmenter::new(packet, idx) {
+                        NewResult::Segmented(desegmenter) => {
+                            entry.insert(HandshakeEntry::Init(desegmenter));
+                            return None;
+                        }
+                        NewResult::SingleSeg(message_range) => {
+                            entry.insert(HandshakeEntry::CoolDown);
+                            return self.recv_init_message(handshake_no, &mut packet[message_range]);
+                        }
+                        NewResult::Invalid => {
+                            warn!(handshake_no, "received invalid segmentation data on an unused handshake no");
+                            return None;
+                        }
                     }
-                    NewResult::Failure => {
-                        warn!("received invalid segmentation data");
-                    }
-                },
+                }
             }
         } else {
             let session = self
