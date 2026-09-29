@@ -4,7 +4,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     crypto::prelude::*,
-    error::{Error, InitError},
+    error::Error,
     key_bundle::{AuthenticBundle, SecretBundle},
     protocol::*,
     symmetric_state::{HandshakeComplete, Resumption, SymmetricState},
@@ -25,7 +25,7 @@ impl<C: Crypto> InitState<C> {
         secret_key_bundle: Arc<SecretBundle<C::PublicKey, C::SecretKey>>,
         resumption: Option<Resumption<C>>,
         payload: Box<[u8]>,
-    ) -> Result<InitState<C>, InitError> {
+    ) -> (Vec<u8>, InitState<C>) {
         use initialize::*;
 
         /* HANDSHAKE LEN AND FLAGS HANDLING */
@@ -104,14 +104,17 @@ impl<C: Crypto> InitState<C> {
             symmetric.mix(1, &init_message[..]);
         }
 
-        Ok(InitState {
-            symmetric,
-            fallback,
-            decapsulation_key,
-            payload,
-            secret_key_bundle,
-            remote_key_bundle,
-        })
+        (
+            init_message,
+            InitState {
+                symmetric,
+                fallback,
+                decapsulation_key,
+                payload,
+                secret_key_bundle,
+                remote_key_bundle,
+            },
+        )
     }
 
     pub fn process_reply<'a>(mut self, reply_message: &'a mut [u8]) -> Result<HandshakeComplete<'a, C>, Error> {

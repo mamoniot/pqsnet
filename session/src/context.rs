@@ -3,7 +3,11 @@ use std::sync::{Arc, OnceLock, Weak};
 use cbor4ii::serde::to_writer;
 use dashmap::{DashMap, Entry};
 use psqnet_transport::{
-    HandshakeComplete, error::Error, initiator::InitState, key_bundle::SecretBundle, responder::{InitOk, ReplyState},
+    HandshakeComplete,
+    error::Error,
+    initiator::InitState,
+    key_bundle::SecretBundle,
+    responder::{InitOk, ReplyState},
 };
 use tracing::*;
 
@@ -29,6 +33,12 @@ pub(crate) struct Socket<R: Route> {
 pub(crate) enum HandshakeEntry {
     CoolDown,
     Init(Desegmenter),
+    Open {
+        reserved_socket_id: SocketId,
+        desegmenter: Option<Desegmenter>,
+        cur_message: Vec<u8>,
+        state: InitState<Crypto>,
+    },
     Reply {
         reserved_socket_id: SocketId,
         desegmenter: Option<Desegmenter>,
@@ -44,17 +54,73 @@ pub struct Context<R: Route> {
 }
 
 impl<R: Route> Context<R> {
+    fn create_payload(&self, writer: impl std::io::Write) -> SocketId {
+        let mut i = 0;
+        loop {
+            i += 1;
+            let new_socket_id = if i <= 2 {
+                rand::random_range(SOCKET_ID_RESERVED_MAX + 1..VARINT_U16_MAX as u64)
+            } else {
+                rand::random_range(SOCKET_ID_RESERVED_MAX + 1..VARINT_U32_MAX as u64)
+            };
+            if !self.socket_table.contains_key(&new_socket_id) {
+                // Without this match there would be a race condition from chance `socket_id` collisions.
+                match self.socket_table.entry(new_socket_id) {
+                    Entry::Occupied(_) => {
+                        continue;
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(None);
+                    }
+                }
+
+                to_writer(
+                    writer,
+                    &HandshakePayload {
+                        major_version: CUR_MAJOR_VERSION,
+                        minor_version: CUR_MINOR_VERSION,
+                        socket_id: new_socket_id,
+                    },
+                );
+                return new_socket_id;
+            }
+        }
+    }
+
     pub async fn open(&self, route: R) -> Result<Channel<R>, ()> {
-        let mut handshake_id: u128 = rand::random();
-        handshake_id >>= 8;
+        let mut handshake_no: u128 = rand::random();
+        handshake_no >>= 8;
         debug_assert_eq!(SOCKET_ID_INIT_MESSAGE, 0);
+
+        let reply_no = handshake_no + HANDSHAKE_NO_SOCKET_ID_INC;
+
+        let mut payload = Vec::new();
+        let reserved_socket_id = self.create_payload(&mut payload);
+
+        let (cur_message, state) = InitState::initialize(
+            &handshake_no.to_be_bytes(),
+            self.secret_bundle.clone(),
+            None,
+            payload.into(),
+        );
+
+        self.hanshake_table.insert(
+            reply_no,
+            HandshakeEntry::Open {
+                reserved_socket_id,
+                desegmenter: None,
+                cur_message,
+                state,
+            },
+        );
+
         todo!()
     }
 
     pub fn drive(&self, packet: &mut [u8], route: R) {}
 
-    fn recv_init_message(&self, handshake_header: u128, message: &mut [u8]) -> Option<Channel<R>> {
-        trace!(handshake_header, "recv initial message");
+    fn recv_init_message(&self, handshake_no: u128, message: &mut [u8]) -> Option<Channel<R>> {
+        trace!(handshake_no, "recv initial message");
         // If `reserved_socket_id` is `Some` then it is a key in `socket_table`
         // and needs to eventually be removed from it.
         let mut reserved_socket_id = None;
@@ -93,7 +159,7 @@ impl<R: Route> Context<R> {
         };
 
         match ReplyState::process_initialize(
-            &handshake_header.to_be_bytes(),
+            &handshake_no.to_be_bytes(),
             message,
             &self.secret_bundle,
             None,
@@ -105,11 +171,11 @@ impl<R: Route> Context<R> {
             Ok(InitOk::Incomplete(cur_message, state)) => {
                 let reserved_socket_id = reserved_socket_id.expect("reserved socket id was absent");
 
-                let response_header = handshake_header + HANDSHAKE_HEADER_SOCKET_ID_INC;
-                let confirm_header = response_header + HANDSHAKE_HEADER_SOCKET_ID_INC;
+                let reply_no = handshake_no + HANDSHAKE_NO_SOCKET_ID_INC;
+                let confirm_no = reply_no + HANDSHAKE_NO_SOCKET_ID_INC;
 
                 self.hanshake_table.insert(
-                    confirm_header,
+                    confirm_no,
                     HandshakeEntry::Reply { desegmenter: None, reserved_socket_id, cur_message, state },
                 );
                 // TODO: send reply message and queue it to be resent.
@@ -225,7 +291,10 @@ impl<R: Route> Context<R> {
                             return self.recv_init_message(handshake_no, &mut packet[message_range]);
                         }
                         NewResult::Invalid => {
-                            warn!(handshake_no, "received invalid segmentation data on an unused handshake no");
+                            warn!(
+                                handshake_no,
+                                "received invalid segmentation data on an unused handshake no"
+                            );
                             return None;
                         }
                     }
