@@ -16,8 +16,8 @@ pub trait CryptoAndMem {
     type DecapsulationKey: mlkem1024::DecapsulationKey;
 
     type BundleMem: mem::Mem;
-    type MessageMem: mem::Mem;
     type PayloadMem: mem::Mem;
+    type MessageMem: mem::Mem;
 }
 
 pub mod prelude {

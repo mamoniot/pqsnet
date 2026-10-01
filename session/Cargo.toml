@@ -9,7 +9,7 @@ path = "src/lib.rs"
 
 
 [dependencies]
-psqnet_transport = { path = "../transport" }
+psqnet_transport = { path = "../transport", features = ["std"]}
 arrayvec = { features = ["std", "serde"], version = "*"}
 smallvec = { features = ["union", "serde"], version = "*"}
 rand_core = "*"

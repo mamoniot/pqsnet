@@ -1,6 +1,6 @@
 use std::sync::{Arc, Weak};
 
-use cbor4ii::serde::to_writer;
+use cbor4ii::serde::{to_vec, to_writer};
 use dashmap::{DashMap, Entry};
 use psqnet_transport::{
     HandshakeComplete,
@@ -13,10 +13,7 @@ use tracing::*;
 use crate::{
     application_layer::Route,
     channel::Channel,
-    crypto::{
-        mldsa::{MlDsa87PublicKey, MlDsa87SecretKey},
-        transport::Crypto,
-    },
+    crypto::transport::Crypto,
     desegmenter::{Desegmenter, NewResult, SegError},
     protocol::*,
     session::SessionInner,
@@ -36,7 +33,7 @@ pub(crate) enum HandshakeEntry {
         reserved_socket_id: SocketId,
         desegmenter: Option<Desegmenter>,
         cur_message: Vec<u8>,
-        state: InitState<Crypto>,
+        state: InitState<Crypto, Arc<SecretBundle<Crypto>>>,
     },
     ResponderSent {
         reserved_socket_id: SocketId,
@@ -49,11 +46,15 @@ pub(crate) enum HandshakeEntry {
 pub struct Context<R: Route> {
     socket_table: DashMap<SocketId, Option<Socket<R>>>,
     hanshake_table: DashMap<u128, HandshakeEntry>,
-    secret_bundle: Arc<SecretBundle<MlDsa87PublicKey, MlDsa87SecretKey>>,
+    secret_bundle: Arc<SecretBundle<Crypto>>,
+}
+
+pub fn secs_since_unix_epoch() -> u64 {
+    std::time::SystemTime::UNIX_EPOCH.elapsed().expect("todo").as_secs()
 }
 
 impl<R: Route> Context<R> {
-    fn create_payload(&self, writer: impl std::io::Write) -> SocketId {
+    fn create_payload(&self) -> (Vec<u8>, SocketId) {
         let mut i = 0;
         loop {
             i += 1;
@@ -73,15 +74,18 @@ impl<R: Route> Context<R> {
                     }
                 }
 
-                to_writer(
-                    writer,
-                    &HandshakePayload {
-                        major_version: CUR_MAJOR_VERSION,
-                        minor_version: CUR_MINOR_VERSION,
-                        socket_id: new_socket_id,
-                    },
+                return (
+                    to_vec(
+                        Vec::new(),
+                        &HandshakePayload {
+                            major_version: CUR_MAJOR_VERSION,
+                            minor_version: CUR_MINOR_VERSION,
+                            socket_id: new_socket_id,
+                        },
+                    )
+                    .expect("memory limit error"),
+                    new_socket_id,
                 );
-                return new_socket_id;
             }
         }
     }
@@ -93,8 +97,7 @@ impl<R: Route> Context<R> {
 
         let reply_no = handshake_no + HANDSHAKE_NO_SOCKET_ID_INC;
 
-        let mut payload = Vec::new();
-        let reserved_socket_id = self.create_payload(&mut payload);
+        let (payload, reserved_socket_id) = self.create_payload();
 
         let (cur_message, state) = InitState::initialize(
             &handshake_no.to_be_bytes(),
@@ -122,38 +125,10 @@ impl<R: Route> Context<R> {
         // If `reserved_socket_id` is `Some` then it is a key in `socket_table`
         // and needs to eventually be removed from it.
         let mut reserved_socket_id = None;
-        let create_payload = |writer: &mut Vec<u8>| {
-            let mut i = 0;
-            loop {
-                i += 1;
-                let new_socket_id = if i <= 2 {
-                    rand::random_range(SOCKET_ID_RESERVED_MAX + 1..VARINT_U16_MAX as u64)
-                } else {
-                    rand::random_range(SOCKET_ID_RESERVED_MAX + 1..VARINT_U32_MAX as u64)
-                };
-                if !self.socket_table.contains_key(&new_socket_id) {
-                    // Without this match there would be a race condition from chance `socket_id` collisions.
-                    match self.socket_table.entry(new_socket_id) {
-                        Entry::Occupied(_) => {
-                            continue;
-                        }
-                        Entry::Vacant(entry) => {
-                            entry.insert(None);
-                        }
-                    }
-                    reserved_socket_id = Some(new_socket_id);
-
-                    to_writer(
-                        writer,
-                        &HandshakePayload {
-                            major_version: CUR_MAJOR_VERSION,
-                            minor_version: CUR_MINOR_VERSION,
-                            socket_id: new_socket_id,
-                        },
-                    );
-                    return;
-                }
-            }
+        let create_payload = || {
+            let (p, s) = self.create_payload();
+            reserved_socket_id = Some(s);
+            p
         };
 
         match ReplyState::process_initialize(
@@ -162,6 +137,7 @@ impl<R: Route> Context<R> {
             &self.secret_bundle,
             None,
             create_payload,
+            secs_since_unix_epoch(),
         ) {
             Ok(InitOk::Complete(complete)) => {
                 let reserved_socket_id = reserved_socket_id.expect("reserved socket id was absent");
@@ -274,7 +250,7 @@ impl<R: Route> Context<R> {
                             return self.recv_init_message(handshake_no, message);
                         }
                         HandshakeEntry::InitiatorSent { reserved_socket_id, state, .. } => {
-                            match state.process_reply(message) {
+                            match state.process_reply(message, secs_since_unix_epoch()) {
                                 Ok(complete) => {
                                     return self.handshake_complete(reserved_socket_id, complete);
                                 }
@@ -286,7 +262,7 @@ impl<R: Route> Context<R> {
                             }
                         }
                         HandshakeEntry::ResponderSent { reserved_socket_id, state, .. } => {
-                            match state.process_confirm(message) {
+                            match state.process_confirm(message, secs_since_unix_epoch()) {
                                 Ok(complete) => {
                                     return self.handshake_complete(reserved_socket_id, complete);
                                 }

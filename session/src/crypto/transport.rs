@@ -1,8 +1,10 @@
+use psqnet_transport::crypto::CryptoAndMem;
+
 use super::*;
 
 pub struct Crypto {}
 
-impl psqnet_transport::crypto::CryptoAndMem for Crypto {
+impl CryptoAndMem for Crypto {
     type Cipher = aes::ColdAesGcm;
 
     type Xof = sha3::Shake256Hasher;
@@ -12,4 +14,10 @@ impl psqnet_transport::crypto::CryptoAndMem for Crypto {
     type PublicKey = mldsa::MlDsa87PublicKey;
 
     type DecapsulationKey = mlkem::Mlkem1024Key;
+
+    type BundleMem = Box<[u8]>;
+
+    type PayloadMem = Vec<u8>;
+
+    type MessageMem = Vec<u8>;
 }

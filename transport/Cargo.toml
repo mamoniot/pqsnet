@@ -12,6 +12,9 @@ path = "src/lib.rs"
 zeroize = { version = "*" }
 constant_time_eq = { version = "*" }
 
+[features]
+std = []
+
 [lints.clippy]
 type_complexity = "allow"
 too_many_arguments = "allow"

@@ -1,3 +1,5 @@
+use core::ops::Deref;
+
 use zeroize::Zeroizing;
 
 use crate::{
@@ -8,22 +10,22 @@ use crate::{
     symmetric_state::{HandshakeComplete, Resumption, SymmetricState},
 };
 
-pub struct InitState<C: CryptoAndMem> {
+pub struct InitState<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> {
     symmetric: SymmetricState<C>,
     fallback: Option<SymmetricState<C>>,
     decapsulation_key: C::DecapsulationKey,
     payload: C::PayloadMem,
-    secret_key_bundle: SecretBundle<C>,
+    secret_key_bundle: S,
     remote_key_bundle: Option<AuthenticBundle<C>>,
 }
 
-impl<C: CryptoAndMem> InitState<C> {
+impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
     pub fn initialize(
         aad: &[u8],
-        secret_key_bundle: SecretBundle<C>,
+        secret_key_bundle: S,
         resumption: Option<Resumption<C>>,
         payload: C::PayloadMem,
-    ) -> (C::MessageMem, InitState<C>) {
+    ) -> (C::MessageMem, InitState<C, S>) {
         use initialize::*;
 
         /* HANDSHAKE LEN AND FLAGS HANDLING */
