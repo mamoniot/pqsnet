@@ -1,10 +1,9 @@
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 
 use cbor4ii::serde::to_writer;
 use dashmap::{DashMap, Entry};
 use psqnet_transport::{
     HandshakeComplete,
-    error::Error,
     initiator::InitState,
     key_bundle::SecretBundle,
     responder::{InitOk, ReplyState},
@@ -32,14 +31,14 @@ pub(crate) struct Socket<R: Route> {
 
 pub(crate) enum HandshakeEntry {
     CoolDown,
-    Init(Desegmenter),
-    Open {
+    ResponderRecv(Desegmenter),
+    InitiatorSent {
         reserved_socket_id: SocketId,
         desegmenter: Option<Desegmenter>,
         cur_message: Vec<u8>,
         state: InitState<Crypto>,
     },
-    Reply {
+    ResponderSent {
         reserved_socket_id: SocketId,
         desegmenter: Option<Desegmenter>,
         cur_message: Vec<u8>,
@@ -104,20 +103,19 @@ impl<R: Route> Context<R> {
             payload.into(),
         );
 
-        self.hanshake_table.insert(
+        let a = self.hanshake_table.insert(
             reply_no,
-            HandshakeEntry::Open {
-                reserved_socket_id,
-                desegmenter: None,
-                cur_message,
-                state,
-            },
+            HandshakeEntry::InitiatorSent { reserved_socket_id, desegmenter: None, cur_message, state },
         );
 
         todo!()
     }
 
     pub fn drive(&self, packet: &mut [u8], route: R) {}
+
+    fn handshake_complete(&self, new_socket_id: SocketId, complete: HandshakeComplete<Crypto>) -> Option<Channel<R>> {
+        None
+    }
 
     fn recv_init_message(&self, handshake_no: u128, message: &mut [u8]) -> Option<Channel<R>> {
         trace!(handshake_no, "recv initial message");
@@ -166,7 +164,9 @@ impl<R: Route> Context<R> {
             create_payload,
         ) {
             Ok(InitOk::Complete(complete)) => {
-                todo!()
+                let reserved_socket_id = reserved_socket_id.expect("reserved socket id was absent");
+
+                return self.handshake_complete(reserved_socket_id, complete);
             }
             Ok(InitOk::Incomplete(cur_message, state)) => {
                 let reserved_socket_id = reserved_socket_id.expect("reserved socket id was absent");
@@ -174,17 +174,28 @@ impl<R: Route> Context<R> {
                 let reply_no = handshake_no + HANDSHAKE_NO_SOCKET_ID_INC;
                 let confirm_no = reply_no + HANDSHAKE_NO_SOCKET_ID_INC;
 
-                self.hanshake_table.insert(
-                    confirm_no,
-                    HandshakeEntry::Reply { desegmenter: None, reserved_socket_id, cur_message, state },
-                );
+                let responder_sent =
+                    HandshakeEntry::ResponderSent { desegmenter: None, reserved_socket_id, cur_message, state };
+
+                match self.hanshake_table.entry(confirm_no) {
+                    Entry::Occupied(_) => {
+                        // Cancel this handshake due to lack of unique `handshake_no`. This should
+                        // never happen with a well behaved peer since the `handshake_no` is
+                        // supposed to be randomized.
+                        let _e = self.socket_table.remove(&reserved_socket_id);
+                        debug_assert!(matches!(_e, Some((_, None))));
+                        warn!(handshake_no, "handshake failed due to handshake no collision")
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(responder_sent);
+                    }
+                }
                 // TODO: send reply message and queue it to be resent.
             }
-            Err(e) => {
+            Err(error) => {
                 if let Some(socket_id) = reserved_socket_id {
-                    self.socket_table
-                        .remove(&socket_id)
-                        .expect("reserved socket id was absent");
+                    let _e = self.socket_table.remove(&socket_id);
+                    debug_assert!(matches!(_e, Some((_, None))));
                 }
                 todo!();
             }
@@ -223,8 +234,9 @@ impl<R: Route> Context<R> {
                             debug!(handshake_no, "ignored handshake fragment while on cooldown");
                             return None;
                         }
-                        HandshakeEntry::Init(desegmenter)
-                        | HandshakeEntry::Reply { desegmenter: Some(desegmenter), .. } => {
+                        HandshakeEntry::ResponderRecv(desegmenter)
+                        | HandshakeEntry::InitiatorSent { desegmenter: Some(desegmenter), .. }
+                        | HandshakeEntry::ResponderSent { desegmenter: Some(desegmenter), .. } => {
                             match desegmenter.recv_mut(packet, idx) {
                                 Ok(m) => _message_mem.insert(m),
                                 Err(SegError::Segmented) => {
@@ -237,7 +249,8 @@ impl<R: Route> Context<R> {
                                 }
                             }
                         }
-                        HandshakeEntry::Reply { desegmenter, .. } => {
+                        HandshakeEntry::InitiatorSent { desegmenter, .. }
+                        | HandshakeEntry::ResponderSent { desegmenter, .. } => {
                             debug_assert_eq!(socket_id, SOCKET_ID_CONFIRM_MESSAGE);
 
                             match Desegmenter::new(packet, idx) {
@@ -257,16 +270,30 @@ impl<R: Route> Context<R> {
 
                     match entry.insert(HandshakeEntry::CoolDown) {
                         HandshakeEntry::CoolDown => unreachable!(),
-                        HandshakeEntry::Init(_) => {
+                        HandshakeEntry::ResponderRecv(_) => {
                             return self.recv_init_message(handshake_no, message);
                         }
-                        HandshakeEntry::Reply { reserved_socket_id, desegmenter, cur_message, state } => {
+                        HandshakeEntry::InitiatorSent { reserved_socket_id, state, .. } => {
+                            match state.process_reply(message) {
+                                Ok(complete) => {
+                                    return self.handshake_complete(reserved_socket_id, complete);
+                                }
+                                Err(error) => {
+                                    warn!(handshake_no, error = ?error, "could not authenticate handshake reply");
+                                    let _e = self.socket_table.remove(&reserved_socket_id);
+                                    debug_assert!(matches!(_e, Some((_, None))));
+                                }
+                            }
+                        }
+                        HandshakeEntry::ResponderSent { reserved_socket_id, state, .. } => {
                             match state.process_confirm(message) {
-                                Ok(HandshakeComplete { message_to_send, keys, remote_key_bundle, recv_payload }) => {
-                                    todo!()
+                                Ok(complete) => {
+                                    return self.handshake_complete(reserved_socket_id, complete);
                                 }
                                 Err(error) => {
                                     warn!(handshake_no, error = ?error, "could not authenticate handshake confirmation");
+                                    let _e = self.socket_table.remove(&reserved_socket_id);
+                                    debug_assert!(matches!(_e, Some((_, None))));
                                 }
                             }
                         }
@@ -283,7 +310,7 @@ impl<R: Route> Context<R> {
 
                     match Desegmenter::new(packet, idx) {
                         NewResult::Segmented(desegmenter) => {
-                            entry.insert(HandshakeEntry::Init(desegmenter));
+                            entry.insert(HandshakeEntry::ResponderRecv(desegmenter));
                             return None;
                         }
                         NewResult::SingleSeg(message_range) => {

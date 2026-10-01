@@ -11,11 +11,7 @@ impl SecretKey for MlDsa87SecretKey {
 }
 
 impl PublicKey for MlDsa87PublicKey {
-    fn decode(public_key: [u8; PUBLIC_KEY_LEN]) -> Self {
-        todo!()
-    }
-
-    fn encode(&self) -> [u8; PUBLIC_KEY_LEN] {
+    fn decode(public_key: [u8; PUBLIC_KEY_LEN]) -> Option<Self> {
         todo!()
     }
 
