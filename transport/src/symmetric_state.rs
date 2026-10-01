@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use core::marker::PhantomData;
 
 use zeroize::Zeroizing;
 
@@ -16,9 +16,9 @@ pub type ResumptionToken = [u8; RESUMPTION_TOKEN_LEN];
 pub type ResumptionKey = [u8; RESUMPTION_KEY_LEN];
 pub type SocketKey = [u8; KEY_LEN];
 
-pub struct SymmetricState<S: Crypto> {
+pub struct SymmetricState<S: CryptoAndMem> {
     key_buffer: Zeroizing<[u8; SHAKE256_HANDSHAKE_OUTPUT_LEN]>,
-    _s: std::marker::PhantomData<S>,
+    _s: PhantomData<S>,
 }
 
 #[derive(Clone)]
@@ -26,29 +26,28 @@ pub struct SymmetricKeys {
     key_buffer: Zeroizing<[u8; SHAKE256_SPLIT_OUTPUT_LEN]>,
 }
 
-#[derive(Clone)]
-pub struct Resumption<S: Crypto> {
+pub struct Resumption<C: CryptoAndMem> {
     pub token: ResumptionToken,
     pub key: Zeroizing<ResumptionKey>,
-    pub remote_key_bundle: Arc<AuthenticBundle<S::PublicKey>>,
+    pub remote_key_bundle: AuthenticBundle<C>,
 }
 
-pub struct HandshakeComplete<'a, C: Crypto> {
-    pub message_to_send: Option<Vec<u8>>,
+pub struct HandshakeComplete<'a, C: CryptoAndMem> {
+    pub message_to_send: Option<C::MessageMem>,
     pub keys: SymmetricKeys,
-    pub remote_key_bundle: Arc<AuthenticBundle<C::PublicKey>>,
+    pub remote_key_bundle: AuthenticBundle<C>,
     pub recv_payload: &'a mut [u8],
 }
 
-impl<S: Crypto> Clone for SymmetricState<S> {
+impl<C: CryptoAndMem> Clone for SymmetricState<C> {
     fn clone(&self) -> Self {
         Self { key_buffer: self.key_buffer.clone(), _s: Default::default() }
     }
 }
 
-impl<S: Crypto> SymmetricState<S> {
-    fn hash3(&self, step_no: u8, shared_data: &[u8]) -> S::Xof {
-        let mut hasher = S::Xof::new();
+impl<C: CryptoAndMem> SymmetricState<C> {
+    fn hash3(&self, step_no: u8, shared_data: &[u8]) -> C::Xof {
+        let mut hasher = C::Xof::new();
         hasher.update(&self.key_buffer[CHAINING_KEY_RANGE]);
         hasher.update(&[step_no]);
         hasher.update(shared_data);
@@ -71,7 +70,7 @@ impl<S: Crypto> SymmetricState<S> {
     pub fn encrypt_and_mix(&mut self, step_no: u8, plaintext_and_pad: &mut [u8]) {
         let (plaintext, pad) = plaintext_and_pad.split_at_mut(plaintext_and_pad.len() - TAG_LEN);
 
-        let tag = S::Cipher::encrypt_in_place(
+        let tag = C::Cipher::encrypt_in_place(
             (&self.key_buffer[AES_KEY_RANGE]).try_into().unwrap(),
             domain::to_handshake_nonce(step_no),
             plaintext,
@@ -86,7 +85,7 @@ impl<S: Crypto> SymmetricState<S> {
 
         let (ciphertext, tag) = ciphertext_and_tag.split_at_mut(ciphertext_and_tag.len() - TAG_LEN);
 
-        let auth = S::Cipher::decrypt_in_place(
+        let auth = C::Cipher::decrypt_in_place(
             (&self.key_buffer[AES_KEY_RANGE]).try_into().unwrap(),
             domain::to_handshake_nonce(step_no),
             ciphertext,

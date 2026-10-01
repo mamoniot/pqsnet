@@ -2,7 +2,7 @@ use super::*;
 
 pub struct Crypto {}
 
-impl psqnet_transport::crypto::Crypto for Crypto {
+impl psqnet_transport::crypto::CryptoAndMem for Crypto {
     type Cipher = aes::ColdAesGcm;
 
     type Xof = sha3::Shake256Hasher;

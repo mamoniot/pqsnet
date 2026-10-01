@@ -6,12 +6,18 @@ pub mod mlkem1024;
 
 pub mod mldsa87;
 
-pub trait Crypto {
+pub mod mem;
+
+pub trait CryptoAndMem {
     type Cipher: aes256::Cipher;
     type Xof: shake256::Xof;
     type SecretKey: mldsa87::SecretKey;
     type PublicKey: mldsa87::PublicKey;
     type DecapsulationKey: mlkem1024::DecapsulationKey;
+
+    type BundleMem: mem::Mem;
+    type MessageMem: mem::Mem;
+    type PayloadMem: mem::Mem;
 }
 
 pub mod prelude {
@@ -27,5 +33,7 @@ pub mod prelude {
 
     pub use mldsa87::SecretKey;
 
-    pub use super::Crypto;
+    pub use mem::Mem;
+
+    pub use super::CryptoAndMem;
 }

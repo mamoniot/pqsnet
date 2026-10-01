@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use zeroize::Zeroizing;
 
 use crate::{
@@ -10,35 +8,33 @@ use crate::{
     symmetric_state::{HandshakeComplete, Resumption, SymmetricState},
 };
 
-pub struct InitState<C: Crypto> {
+pub struct InitState<C: CryptoAndMem> {
     symmetric: SymmetricState<C>,
     fallback: Option<SymmetricState<C>>,
     decapsulation_key: C::DecapsulationKey,
-    payload: Box<[u8]>,
-    secret_key_bundle: Arc<SecretBundle<C::PublicKey, C::SecretKey>>,
-    remote_key_bundle: Option<Arc<AuthenticBundle<C::PublicKey>>>,
+    payload: C::PayloadMem,
+    secret_key_bundle: SecretBundle<C>,
+    remote_key_bundle: Option<AuthenticBundle<C>>,
 }
 
-impl<C: Crypto> InitState<C> {
+impl<C: CryptoAndMem> InitState<C> {
     pub fn initialize(
         aad: &[u8],
-        secret_key_bundle: Arc<SecretBundle<C::PublicKey, C::SecretKey>>,
+        secret_key_bundle: SecretBundle<C>,
         resumption: Option<Resumption<C>>,
-        payload: Box<[u8]>,
-    ) -> (Vec<u8>, InitState<C>) {
+        payload: C::PayloadMem,
+    ) -> (C::MessageMem, InitState<C>) {
         use initialize::*;
 
         /* HANDSHAKE LEN AND FLAGS HANDLING */
 
-        let mut init_message = Vec::new();
-
-        if resumption.is_some() {
+        let mut init_message = if resumption.is_some() {
             // In this case, we want to use the resumption key to resume this socket with 1-rtt.
-            init_message.resize(PAYLOAD_START + payload.len() + PAYLOAD_REV_START, 0);
+            C::MessageMem::new(PAYLOAD_START + payload.len() + PAYLOAD_REV_START)
         } else {
             // In this case, we have no resumption key and want to start from scratch with 2-rtt.
-            init_message.resize(EPHEMERAL_ENC_KEY_END, 0);
-        }
+            C::MessageMem::new(EPHEMERAL_ENC_KEY_END)
+        };
 
         /* MLKEM1024 EPHEMERAL ENCAPSULATION KEY HANDLING */
 
@@ -117,7 +113,11 @@ impl<C: Crypto> InitState<C> {
         )
     }
 
-    pub fn process_reply<'a>(mut self, reply_message: &'a mut [u8]) -> Result<HandshakeComplete<'a, C>, Error> {
+    pub fn process_reply<'a>(
+        mut self,
+        reply_message: &'a mut [u8],
+        secs_since_unix_epoch: u64,
+    ) -> Result<HandshakeComplete<'a, C>, Error> {
         let handshake_type;
         let remote_key_bundle;
         let recv_payload;
@@ -169,11 +169,10 @@ impl<C: Crypto> InitState<C> {
                 /* KEY BUNDLE HANDLING */
 
                 let mixed_payload = &reply_message[PAYLOAD_START..payload_end];
-                let result = AuthenticBundle::authenticate::<C::Xof>(mixed_payload);
-                let (key_bundle, key_bundle_len) = result.map_err(|_| Error::Inauthentic)?;
-                remote_key_bundle = Arc::new(key_bundle);
+                let result = AuthenticBundle::authenticate(mixed_payload, secs_since_unix_epoch);
+                remote_key_bundle = result.map_err(|_| Error::Inauthentic)?;
 
-                key_bundle_end = PAYLOAD_START + key_bundle_len;
+                key_bundle_end = PAYLOAD_START + remote_key_bundle.public_bytes().len();
 
                 if handshake_type == HANDSHAKE_TYPE_FALLBACK
                     && ((remote_key_bundle.flags() & self.secret_key_bundle.flags())
@@ -203,7 +202,12 @@ impl<C: Crypto> InitState<C> {
 
             let sign = (&reply_message[online_sign_start..online_sign_end]).try_into().unwrap();
             remote_key_bundle
-                .verify(domain::REPLY_BINDING, &symmetric.channel_binding(), sign)
+                .verify(
+                    domain::REPLY_BINDING,
+                    &symmetric.channel_binding(),
+                    sign,
+                    secs_since_unix_epoch,
+                )
                 .map_err(|_| Error::Inauthentic)?;
 
             recv_payload = &mut reply_message[key_bundle_end..payload_end];
@@ -221,7 +225,7 @@ impl<C: Crypto> InitState<C> {
         {
             use confirm::*;
 
-            let local_key_bundle = self.secret_key_bundle.public_bundle_bytes();
+            let local_key_bundle = self.secret_key_bundle.public_bytes();
 
             let key_bundle_end = PAYLOAD_START + local_key_bundle.len();
             let payload_end = key_bundle_end + self.payload.len();
@@ -230,7 +234,7 @@ impl<C: Crypto> InitState<C> {
             let online_sign_end = online_sign_start + ONLINE_SIGN_LEN;
             let online_sign_tag_end = online_sign_end + ONLINE_SIGN_TAG_LEN;
 
-            let mut confirm_message = vec![0; online_sign_tag_end];
+            let mut confirm_message = C::MessageMem::new(online_sign_tag_end);
 
             /* PAYLOAD HANDLING */
 
@@ -258,10 +262,7 @@ impl<C: Crypto> InitState<C> {
         }
     }
 
-    pub fn secret_key_bundle(&self) -> &Arc<SecretBundle<C::PublicKey, C::SecretKey>> {
-        &self.secret_key_bundle
-    }
-    pub fn remote_key_bundle(&self) -> &AuthenticBundle<C::PublicKey> {
+    pub fn secret_key_bundle(&self) -> &SecretBundle<C> {
         &self.secret_key_bundle
     }
 }

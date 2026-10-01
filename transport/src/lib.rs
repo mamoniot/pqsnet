@@ -1,3 +1,4 @@
+#![no_std]
 pub mod crypto;
 
 pub(crate) mod protocol;

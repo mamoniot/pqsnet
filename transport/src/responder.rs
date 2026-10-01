@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use constant_time_eq::{constant_time_eq_16, constant_time_eq_32};
 use zeroize::Zeroizing;
 
@@ -11,18 +9,18 @@ use crate::{
     symmetric_state::{HandshakeComplete, Resumption, ResumptionToken, SymmetricState},
 };
 
-pub struct ReplyState<C: Crypto> {
+pub struct ReplyState<C: CryptoAndMem> {
     symmetric: SymmetricState<C>,
     remote_offline_hash: Option<OfflineHash>,
     reject_if_remote_has_reliable_storage: bool,
 }
 
-pub enum InitOk<'a, C: Crypto> {
+pub enum InitOk<'a, C: CryptoAndMem> {
     Complete(HandshakeComplete<'a, C>),
-    Incomplete(Vec<u8>, ReplyState<C>),
+    Incomplete(C::MessageMem, ReplyState<C>),
 }
 
-impl<C: Crypto> ReplyState<C> {
+impl<C: CryptoAndMem> ReplyState<C> {
     pub fn get_resumption_token(init_message: &mut [u8]) -> Option<ResumptionToken> {
         use initialize::*;
 
@@ -36,9 +34,10 @@ impl<C: Crypto> ReplyState<C> {
     pub fn process_initialize<'a>(
         aad: &[u8],
         init_message: &'a mut [u8],
-        secret_key_bundle: &SecretBundle<C::PublicKey, C::SecretKey>,
+        secret_key_bundle: &SecretBundle<C>,
         resumption: Option<Resumption<C>>,
-        create_payload: impl FnOnce(&mut Vec<u8>),
+        create_payload: impl FnOnce() -> C::PayloadMem,
+        secs_since_unix_epoch: u64,
     ) -> Result<InitOk<'a, C>, ReplyError> {
         let shared_secret;
         let ciphertext;
@@ -131,7 +130,12 @@ impl<C: Crypto> ReplyState<C> {
                     let sign = (&init_message[online_sign_start..online_sign_end]).try_into().unwrap();
                     resumption
                         .remote_key_bundle
-                        .verify(domain::INITIALIZE_BINDING, &signature_channel_binding, sign)
+                        .verify(
+                            domain::INITIALIZE_BINDING,
+                            &signature_channel_binding,
+                            sign,
+                            secs_since_unix_epoch,
+                        )
                         .map_err(|_| ReplyError::Inauthentic)?;
 
                     handshake_type = reply::HANDSHAKE_TYPE_RESUME;
@@ -154,10 +158,17 @@ impl<C: Crypto> ReplyState<C> {
         }
         /* REPLY MESSAGE SHARED SECTION */
 
-        let mut reply_message = Vec::new();
+        let mut reply_message;
         {
             use reply::*;
-            reply_message.resize(PAYLOAD_START, 0);
+
+            let payload = create_payload();
+            let message_len = if handshake_type == HANDSHAKE_TYPE_RESUME {
+                PAYLOAD_START + payload.len() + PAYLOAD_REV_START
+            } else {
+                PAYLOAD_START + secret_key_bundle.public_bytes().len() + payload.len() + PAYLOAD_REV_START
+            };
+            reply_message = C::MessageMem::new(message_len);
 
             /* HANDSHAKE TYPE HANDLING */
 
@@ -175,19 +186,21 @@ impl<C: Crypto> ReplyState<C> {
             if handshake_type != HANDSHAKE_TYPE_RESUME {
                 /* KEY BUNDLE HANDLING */
 
-                reply_message.extend_from_slice(secret_key_bundle.public_bundle_bytes());
+                let key_bundle_end = PAYLOAD_START + secret_key_bundle.public_bytes().len();
+
+                reply_message[PAYLOAD_START..key_bundle_end].clone_from_slice(secret_key_bundle.public_bytes());
             }
 
-            create_payload(&mut reply_message);
-
-            reply_message.resize(reply_message.len() + PAYLOAD_REV_START, 0);
-
-            /* PAYLOAD ENCRYPTION */
-
+            let payload_start = reply_message.len() - PAYLOAD_REV_START - payload.len();
+            let payload_end = reply_message.len() - PAYLOAD_REV_START;
             let payload_tag_end = reply_message.len() - PAYLOAD_TAG_REV_START;
             let online_sign_start = reply_message.len() - ONLINE_SIGN_REV_END;
             let online_sign_end = reply_message.len() - ONLINE_SIGN_REV_START;
             let online_sign_tag_end = reply_message.len() - ONLINE_SIGN_TAG_REV_START;
+
+            reply_message[payload_start..payload_end].clone_from_slice(&payload);
+
+            /* PAYLOAD ENCRYPTION */
 
             symmetric.encrypt_and_mix(4, &mut reply_message[PAYLOAD_START..payload_tag_end]);
 
@@ -219,7 +232,11 @@ impl<C: Crypto> ReplyState<C> {
         }
     }
 
-    pub fn process_confirm<'a>(self, confirm_message: &'a mut [u8]) -> Result<HandshakeComplete<'a, C>, Error> {
+    pub fn process_confirm<'a>(
+        self,
+        confirm_message: &'a mut [u8],
+        secs_since_unix_epoch: u64,
+    ) -> Result<HandshakeComplete<'a, C>, Error> {
         use confirm::*;
 
         if confirm_message.len() < PAYLOAD_START + PAYLOAD_REV_START {
@@ -239,11 +256,10 @@ impl<C: Crypto> ReplyState<C> {
         symmetric.decrypt_and_mix(6, &mut confirm_message[PAYLOAD_START..payload_tag_end])?;
 
         let mixed_payload = &confirm_message[PAYLOAD_START..payload_end];
-        let result = AuthenticBundle::authenticate::<C::Xof>(mixed_payload);
-        let (key_bundle, key_bundle_len) = result.map_err(|_| Error::Inauthentic)?;
-        let remote_key_bundle = Arc::new(key_bundle);
+        let result = AuthenticBundle::authenticate(mixed_payload, secs_since_unix_epoch);
+        let remote_key_bundle = result.map_err(|_| Error::Inauthentic)?;
 
-        let key_bundle_end = PAYLOAD_START + key_bundle_len;
+        let key_bundle_end = PAYLOAD_START + remote_key_bundle.public_bytes().len();
 
         if let Some(remote_offline_hash) = &self.remote_offline_hash {
             /* If the offline hashes are not equal then we are not connecting with the party we
@@ -267,7 +283,12 @@ impl<C: Crypto> ReplyState<C> {
 
         let sign = &confirm_message[online_sign_start..online_sign_end];
         remote_key_bundle
-            .verify(domain::CONFIRM_BINDING, &channel_binding, sign.try_into().unwrap())
+            .verify(
+                domain::CONFIRM_BINDING,
+                &channel_binding,
+                sign.try_into().unwrap(),
+                secs_since_unix_epoch,
+            )
             .map_err(|_| Error::Inauthentic)?;
 
         let recv_payload = &mut confirm_message[key_bundle_end..payload_end];
