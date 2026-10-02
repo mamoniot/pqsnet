@@ -11,3 +11,12 @@ impl Cipher for ColdAesGcm {
         todo!()
     }
 }
+
+pub struct HotAesGcmDecryptor {}
+
+impl HotAesGcmDecryptor {
+    #[must_use]
+    pub fn decrypt_in_place(&self, counter: u32, data: &mut [u8]) -> bool {
+        todo!()
+    }
+}

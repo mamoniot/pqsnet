@@ -1,8 +1,7 @@
-use core::{fmt, ops::Deref};
+use core::ops::Deref;
 
 use crate::{
-    crypto::{mldsa87::*, prelude::*},
-    protocol::{domain, key_bundle::*},
+    crypto::{mldsa87::*, prelude::*}, error::AuthError, protocol::{domain, key_bundle::*},
 };
 use constant_time_eq::{constant_time_eq_32, constant_time_eq_n};
 
@@ -29,29 +28,6 @@ pub struct SecretBundle<C: CryptoAndMem> {
     online_secret_key: C::SecretKey,
     public_bundle: AuthenticBundle<C>,
 }
-
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-pub enum AuthError {
-    Invalid,
-    Inauthentic,
-    ExpiredKey,
-    PostdatedKey,
-    UnrecognizedVersion,
-}
-
-impl fmt::Display for AuthError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AuthError::Invalid => write!(f, "invalid"),
-            AuthError::Inauthentic => write!(f, "inauthentic"),
-            AuthError::ExpiredKey => write!(f, "expired key"),
-            AuthError::PostdatedKey => write!(f, "postdated key"),
-            AuthError::UnrecognizedVersion => write!(f, "unrecognized key version"),
-        }
-    }
-}
-
-impl core::error::Error for AuthError {}
 
 pub fn hash_bundle<H: Xof>(buf: &[u8]) -> (OfflineHash, BundleHash) {
     let mut hasher = H::new();
@@ -80,31 +56,6 @@ impl<C: CryptoAndMem> Deref for SecretBundle<C> {
 }
 
 impl<C: CryptoAndMem> SecretBundle<C> {
-    pub fn update<K: SecretKey>(
-        &self,
-        offline_secret_key: K,
-        online_secret_key: C::SecretKey,
-        new_online_public_key: C::PublicKey,
-        new_online_public_key_bytes: [u8; PUBLIC_KEY_LEN],
-        not_before: u64,
-        not_after: u64,
-        flags: u32,
-        extensions: &[u8],
-    ) -> Self {
-        Self::new::<K>(
-            offline_secret_key,
-            online_secret_key,
-            self.public_bytes[OFFLINE_KEY_RANGE].try_into().unwrap(),
-            new_online_public_key,
-            new_online_public_key_bytes,
-            not_before,
-            not_after,
-            self.counter + 1,
-            flags,
-            extensions,
-        )
-    }
-
     pub fn new<K: SecretKey>(
         offline_secret_key: K,
         online_secret_key: C::SecretKey,
@@ -116,11 +67,12 @@ impl<C: CryptoAndMem> SecretBundle<C> {
         counter: u32,
         flags: u32,
         extensions: &[u8],
+        alloc: <C::BundleMem as Mem>::Alloc
     ) -> Self {
         let offline_sign_start = EXTENSIONS_START + extensions.len();
         let offline_sign_end = offline_sign_start + OFFLINE_SIGN_LEN;
 
-        let mut buf = C::BundleMem::new(offline_sign_end);
+        let mut buf = C::BundleMem::malloc(alloc, offline_sign_end).expect("memory allocation failed");
 
         buf[VERSION_IDX] = VERSION_VALUE;
         buf[OFFLINE_KEY_RANGE].copy_from_slice(&offline_public_key_bytes);
@@ -164,7 +116,7 @@ impl<C: CryptoAndMem> SecretBundle<C> {
 }
 
 impl<C: CryptoAndMem> AuthenticBundle<C> {
-    pub fn authenticate(buf: &[u8], secs_since_unix_epoch: u64) -> Result<Self, AuthError> {
+    pub fn authenticate(buf: &[u8], secs_since_unix_epoch: u64, alloc: <C::BundleMem as Mem>::Alloc) -> Result<Self, AuthError> {
         if buf[VERSION_IDX] != VERSION_VALUE {
             return Err(AuthError::UnrecognizedVersion);
         }
@@ -200,7 +152,7 @@ impl<C: CryptoAndMem> AuthenticBundle<C> {
 
         let (offline_hash, bundle_hash) = hash_bundle::<C::Xof>(&buf[..offline_sign_end]);
 
-        let mut bundle_bytes = C::BundleMem::new(offline_sign_end);
+        let mut bundle_bytes = C::BundleMem::malloc(alloc, offline_sign_end).ok_or(AuthError::AllocFailure)?;
         bundle_bytes.copy_from_slice(&buf[..offline_sign_end]);
 
         Ok(AuthenticBundle {

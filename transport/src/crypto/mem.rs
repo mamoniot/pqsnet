@@ -1,19 +1,22 @@
 use core::ops::DerefMut;
 
-pub trait Mem: DerefMut<Target = [u8]> {
-    fn new(len: usize) -> Self;
+pub trait Mem: Sized + DerefMut<Target = [u8]> {
+    type Alloc;
+    fn malloc(alloc: Self::Alloc, len: usize) -> Option<Self>;
 }
 
 #[cfg(feature = "std")]
 impl Mem for Vec<u8> {
-    fn new(len: usize) -> Self {
-        vec![0; len]
+    type Alloc = ();
+    fn malloc(_: (), len: usize) -> Option<Self> {
+        Some(vec![0; len])
     }
 }
 
 #[cfg(feature = "std")]
 impl Mem for Box<[u8]> {
-    fn new(len: usize) -> Self {
-        vec![0; len].into()
+    type Alloc = ();
+    fn malloc(_: (), len: usize) -> Option<Self> {
+        Some(vec![0; len].into())
     }
 }

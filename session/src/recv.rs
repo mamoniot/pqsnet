@@ -453,18 +453,18 @@ impl<R: Route> Session<R> {
         }
     }
 
-    pub(crate) fn recv(&self, packet: &mut [u8], i: &mut usize, route: R) {
-        // TODO: Decrypt packet.``
+    pub(crate) fn recv(&self, packet: &mut [u8], idx: &mut usize, route: R) {
+        // TODO: Decrypt packet.
 
         let mut ack_eliciting = false;
-        while *i < packet.len() {
-            let variant = packet[*i];
-            *i += 1;
+        while *idx < packet.len() {
+            let variant = packet[*idx];
+            *idx += 1;
             match variant {
                 VARIANT_NULL_TERMINATOR => break,
                 VARIANT_SEG_MIN..=VARIANT_SEG_MAX => {
                     ack_eliciting = true;
-                    let ret = self.recv_seg(variant, packet, i);
+                    let ret = self.recv_seg(variant, packet, idx);
                     if ret.is_err() {
                         self.abandon();
                         return;

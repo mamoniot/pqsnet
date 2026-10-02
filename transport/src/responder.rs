@@ -2,11 +2,7 @@ use constant_time_eq::{constant_time_eq_16, constant_time_eq_32};
 use zeroize::Zeroizing;
 
 use crate::{
-    crypto::prelude::*,
-    error::{Error, ReplyError},
-    key_bundle::{AuthenticBundle, OfflineHash, SecretBundle},
-    protocol::*,
-    symmetric_state::{HandshakeComplete, Resumption, ResumptionToken, SymmetricState},
+    crypto::prelude::*, error::{Error, ReplyError}, key_bundle::{AuthenticBundle, OfflineHash, SecretBundle}, protocol::*, symmetric_state::{HandshakeComplete, Resumption, ResumptionToken, SymmetricState},
 };
 
 pub struct ReplyState<C: CryptoAndMem> {
@@ -38,6 +34,7 @@ impl<C: CryptoAndMem> ReplyState<C> {
         resumption: Option<Resumption<C>>,
         create_payload: impl FnOnce() -> C::PayloadMem,
         secs_since_unix_epoch: u64,
+        alloc: <C::MessageMem as Mem>::Alloc
     ) -> Result<InitOk<'a, C>, ReplyError> {
         let shared_secret;
         let ciphertext;
@@ -168,7 +165,7 @@ impl<C: CryptoAndMem> ReplyState<C> {
             } else {
                 PAYLOAD_START + secret_key_bundle.public_bytes().len() + payload.len() + PAYLOAD_REV_START
             };
-            reply_message = C::MessageMem::new(message_len);
+            reply_message = C::MessageMem::malloc(alloc, message_len).ok_or(ReplyError::AllocFailure)?;
 
             /* HANDSHAKE TYPE HANDLING */
 
@@ -236,6 +233,7 @@ impl<C: CryptoAndMem> ReplyState<C> {
         self,
         confirm_message: &'a mut [u8],
         secs_since_unix_epoch: u64,
+        alloc: <C::BundleMem as Mem>::Alloc
     ) -> Result<HandshakeComplete<'a, C>, Error> {
         use confirm::*;
 
@@ -256,8 +254,7 @@ impl<C: CryptoAndMem> ReplyState<C> {
         symmetric.decrypt_and_mix(6, &mut confirm_message[PAYLOAD_START..payload_tag_end])?;
 
         let mixed_payload = &confirm_message[PAYLOAD_START..payload_end];
-        let result = AuthenticBundle::authenticate(mixed_payload, secs_since_unix_epoch);
-        let remote_key_bundle = result.map_err(|_| Error::Inauthentic)?;
+        let remote_key_bundle = AuthenticBundle::authenticate(mixed_payload, secs_since_unix_epoch, alloc)?;
 
         let key_bundle_end = PAYLOAD_START + remote_key_bundle.public_bytes().len();
 

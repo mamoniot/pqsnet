@@ -25,18 +25,20 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
         secret_key_bundle: S,
         resumption: Option<Resumption<C>>,
         payload: C::PayloadMem,
+        alloc: <C::MessageMem as Mem>::Alloc
     ) -> (C::MessageMem, InitState<C, S>) {
         use initialize::*;
 
         /* HANDSHAKE LEN AND FLAGS HANDLING */
 
-        let mut init_message = if resumption.is_some() {
+        let init_message = if resumption.is_some() {
             // In this case, we want to use the resumption key to resume this socket with 1-rtt.
-            C::MessageMem::new(PAYLOAD_START + payload.len() + PAYLOAD_REV_START)
+            C::MessageMem::malloc(alloc, PAYLOAD_START + payload.len() + PAYLOAD_REV_START)
         } else {
             // In this case, we have no resumption key and want to start from scratch with 2-rtt.
-            C::MessageMem::new(EPHEMERAL_ENC_KEY_END)
+            C::MessageMem::malloc(alloc, EPHEMERAL_ENC_KEY_END)
         };
+        let mut init_message = init_message.expect("memory allocation failed");
 
         /* MLKEM1024 EPHEMERAL ENCAPSULATION KEY HANDLING */
 
@@ -119,6 +121,8 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
         mut self,
         reply_message: &'a mut [u8],
         secs_since_unix_epoch: u64,
+        bundle_alloc: <C::BundleMem as Mem>::Alloc,
+        message_alloc: <C::MessageMem as Mem>::Alloc
     ) -> Result<HandshakeComplete<'a, C>, Error> {
         let handshake_type;
         let remote_key_bundle;
@@ -171,7 +175,7 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
                 /* KEY BUNDLE HANDLING */
 
                 let mixed_payload = &reply_message[PAYLOAD_START..payload_end];
-                let result = AuthenticBundle::authenticate(mixed_payload, secs_since_unix_epoch);
+                let result = AuthenticBundle::authenticate(mixed_payload, secs_since_unix_epoch, bundle_alloc);
                 remote_key_bundle = result.map_err(|_| Error::Inauthentic)?;
 
                 key_bundle_end = PAYLOAD_START + remote_key_bundle.public_bytes().len();
@@ -236,7 +240,7 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
             let online_sign_end = online_sign_start + ONLINE_SIGN_LEN;
             let online_sign_tag_end = online_sign_end + ONLINE_SIGN_TAG_LEN;
 
-            let mut confirm_message = C::MessageMem::new(online_sign_tag_end);
+            let mut confirm_message = C::MessageMem::malloc(message_alloc, online_sign_tag_end).ok_or(Error::AllocFailure)?;
 
             /* PAYLOAD HANDLING */
 

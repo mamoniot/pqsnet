@@ -1,6 +1,6 @@
 use std::sync::{Arc, Weak};
 
-use cbor4ii::serde::{to_vec, to_writer};
+use cbor4ii::serde::to_vec;
 use dashmap::{DashMap, Entry};
 use psqnet_transport::{
     HandshakeComplete,
@@ -11,33 +11,28 @@ use psqnet_transport::{
 use tracing::*;
 
 use crate::{
-    application_layer::Route,
-    channel::Channel,
-    crypto::transport::Crypto,
-    desegmenter::{Desegmenter, NewResult, SegError},
-    protocol::*,
-    session::SessionInner,
-    varint::*,
+    application_layer::Route, channel::Channel, crypto::{aes::HotAesGcmDecryptor, transport::Crypto}, desegmenter::{Desegmenter, NewResult, SegError}, protocol::*, session::{Session, SessionInner}, varint::*,
 };
 
 pub(crate) type SocketId = u64;
 
 pub(crate) struct Socket<R: Route> {
     session: Weak<SessionInner<R>>,
+    decryptor: HotAesGcmDecryptor,
 }
 
 pub(crate) enum HandshakeEntry {
     CoolDown,
-    ResponderRecv(Desegmenter),
+    ResponderRecv(Desegmenter<Box<[u8]>>),
     InitiatorSent {
         reserved_socket_id: SocketId,
-        desegmenter: Option<Desegmenter>,
+        desegmenter: Option<Desegmenter<Box<[u8]>>>,
         cur_message: Vec<u8>,
         state: InitState<Crypto, Arc<SecretBundle<Crypto>>>,
     },
     ResponderSent {
         reserved_socket_id: SocketId,
-        desegmenter: Option<Desegmenter>,
+        desegmenter: Option<Desegmenter<Box<[u8]>>>,
         cur_message: Vec<u8>,
         state: ReplyState<Crypto>,
     },
@@ -63,6 +58,7 @@ impl<R: Route> Context<R> {
             } else {
                 rand::random_range(SOCKET_ID_RESERVED_MAX + 1..VARINT_U32_MAX as u64)
             };
+
             if !self.socket_table.contains_key(&new_socket_id) {
                 // Without this match there would be a race condition from chance `socket_id` collisions.
                 match self.socket_table.entry(new_socket_id) {
@@ -99,17 +95,14 @@ impl<R: Route> Context<R> {
 
         let (payload, reserved_socket_id) = self.create_payload();
 
-        let (cur_message, state) = InitState::initialize(
-            &handshake_no.to_be_bytes(),
-            self.secret_bundle.clone(),
-            None,
-            payload.into(),
-        );
+        let (cur_message, state) =
+            InitState::initialize(&handshake_no.to_be_bytes(), self.secret_bundle.clone(), None, payload, ());
 
-        let a = self.hanshake_table.insert(
+        let pre_entry = self.hanshake_table.insert(
             reply_no,
             HandshakeEntry::InitiatorSent { reserved_socket_id, desegmenter: None, cur_message, state },
         );
+        debug_assert!(pre_entry.is_none());
 
         todo!()
     }
@@ -138,6 +131,7 @@ impl<R: Route> Context<R> {
             None,
             create_payload,
             secs_since_unix_epoch(),
+            ()
         ) {
             Ok(InitOk::Complete(complete)) => {
                 let reserved_socket_id = reserved_socket_id.expect("reserved socket id was absent");
@@ -213,7 +207,7 @@ impl<R: Route> Context<R> {
                         HandshakeEntry::ResponderRecv(desegmenter)
                         | HandshakeEntry::InitiatorSent { desegmenter: Some(desegmenter), .. }
                         | HandshakeEntry::ResponderSent { desegmenter: Some(desegmenter), .. } => {
-                            match desegmenter.recv_mut(packet, idx) {
+                            match desegmenter.recv_mut(packet, idx, true, true, true) {
                                 Ok(m) => _message_mem.insert(m),
                                 Err(SegError::Segmented) => {
                                     trace!(handshake_no, "received handshake fragment");
@@ -227,9 +221,9 @@ impl<R: Route> Context<R> {
                         }
                         HandshakeEntry::InitiatorSent { desegmenter, .. }
                         | HandshakeEntry::ResponderSent { desegmenter, .. } => {
-                            debug_assert_eq!(socket_id, SOCKET_ID_CONFIRM_MESSAGE);
+                            debug_assert!(desegmenter.is_none());
 
-                            match Desegmenter::new(packet, idx) {
+                            match Desegmenter::try_new(packet, idx, true, true, true, ()) {
                                 NewResult::Segmented(d) => {
                                     trace!(handshake_no, "received handshake fragment");
                                     *desegmenter = Some(d);
@@ -240,6 +234,7 @@ impl<R: Route> Context<R> {
                                     warn!(handshake_no, "received invalid segmentation data");
                                     return None;
                                 }
+                                NewResult::MissingLen | NewResult::AllocFailure => unreachable!(),
                             }
                         }
                     };
@@ -250,7 +245,7 @@ impl<R: Route> Context<R> {
                             return self.recv_init_message(handshake_no, message);
                         }
                         HandshakeEntry::InitiatorSent { reserved_socket_id, state, .. } => {
-                            match state.process_reply(message, secs_since_unix_epoch()) {
+                            match state.process_reply(message, secs_since_unix_epoch(), (), ()) {
                                 Ok(complete) => {
                                     return self.handshake_complete(reserved_socket_id, complete);
                                 }
@@ -262,7 +257,7 @@ impl<R: Route> Context<R> {
                             }
                         }
                         HandshakeEntry::ResponderSent { reserved_socket_id, state, .. } => {
-                            match state.process_confirm(message, secs_since_unix_epoch()) {
+                            match state.process_confirm(message, secs_since_unix_epoch(), ()) {
                                 Ok(complete) => {
                                     return self.handshake_complete(reserved_socket_id, complete);
                                 }
@@ -284,7 +279,7 @@ impl<R: Route> Context<R> {
                         return None;
                     }
 
-                    match Desegmenter::new(packet, idx) {
+                    match Desegmenter::try_new(packet, idx, true, true, true, ()) {
                         NewResult::Segmented(desegmenter) => {
                             entry.insert(HandshakeEntry::ResponderRecv(desegmenter));
                             return None;
@@ -300,34 +295,39 @@ impl<R: Route> Context<R> {
                             );
                             return None;
                         }
+                        NewResult::MissingLen | NewResult::AllocFailure => unreachable!(),
                     }
                 }
             }
         } else {
-            let session = self
-                .socket_table
-                .get(&socket_id)
-                .and_then(|s| s.as_ref().map(|s| s.session.upgrade()))
-                .flatten();
-            let Some(session) = session else {
+            let Some(entry) = self.socket_table.get(&socket_id) else {
                 info!(socket_id, "received unrecognized socket id");
                 return None;
             };
+            let Some(socket) = entry.value() else {
+                info!(socket_id, "received unrecognized socket id");
+                return None;
+            };
+            let Some(session) = socket.session.upgrade().map(Session) else {
+                info!(socket_id, "received unrecognized socket id");
+                return None;
+            };
+
             let j = *idx + 4;
             if j > packet.len() {
-                warn!("received invalid counter");
+                warn!(socket_id, "received invalid counter");
                 return None;
             }
+            let counter = u32::from_be_bytes(packet[*idx..j].try_into().unwrap());
             *idx = j;
 
-            let (crypto_header, ciphertext) = packet.split_at_mut(*idx);
-            todo!("antireplay");
-            // if !entry.decryptor.decrypt_in_place(crypto_header, ciphertext) {
-            //     info!("received corrupted or inauthentic packet");
-            //     return None;
-            // }
+            // TODO: anti-replay
+            if !socket.decryptor.decrypt_in_place(counter, &mut packet[*idx..]) {
+                info!(socket_id, "received corrupted or inauthentic packet");
+                return None;
+            }
 
-            // session.recv(packet, idx, route);
+            session.recv(packet, idx, route);
         }
         todo!()
     }
