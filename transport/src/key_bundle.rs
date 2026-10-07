@@ -1,7 +1,9 @@
 use core::ops::Deref;
 
 use crate::{
-    crypto::{mldsa87::*, prelude::*}, error::AuthError, protocol::{domain, key_bundle::*},
+    crypto::{mldsa87::*, prelude::*},
+    error::AuthError,
+    protocol::{domain, key_bundle::*},
 };
 use constant_time_eq::{constant_time_eq_32, constant_time_eq_n};
 
@@ -67,7 +69,7 @@ impl<C: CryptoAndMem> SecretBundle<C> {
         counter: u32,
         flags: u32,
         extensions: &[u8],
-        alloc: <C::BundleMem as Mem>::Alloc
+        alloc: <C::BundleMem as Mem>::Alloc,
     ) -> Self {
         let offline_sign_start = EXTENSIONS_START + extensions.len();
         let offline_sign_end = offline_sign_start + OFFLINE_SIGN_LEN;
@@ -116,7 +118,11 @@ impl<C: CryptoAndMem> SecretBundle<C> {
 }
 
 impl<C: CryptoAndMem> AuthenticBundle<C> {
-    pub fn authenticate(buf: &[u8], secs_since_unix_epoch: u64, alloc: <C::BundleMem as Mem>::Alloc) -> Result<Self, AuthError> {
+    pub fn authenticate(
+        buf: &[u8],
+        secs_since_unix_epoch: u64,
+        alloc: <C::BundleMem as Mem>::Alloc,
+    ) -> Result<Self, AuthError> {
         if buf[VERSION_IDX] != VERSION_VALUE {
             return Err(AuthError::UnrecognizedVersion);
         }

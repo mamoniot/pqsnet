@@ -70,11 +70,11 @@ macro_rules! impl_try_read {
             }
             Some(match buf[i] >> 6 {
                 0b00 => {
-                    *idx += 1;
+                    *idx = idx.checked_add(1)?;
                     buf[i] as $t
                 }
                 0b01 => {
-                    let j = *idx + 2;
+                    let j = idx.checked_add(2)?;
                     if j > buf.len() {
                         return None;
                     }
@@ -82,7 +82,7 @@ macro_rules! impl_try_read {
                     (u16::from_be_bytes(buf[i..j].try_into().unwrap()) & VARINT_U16_MAX) as $t
                 }
                 0b10 => {
-                    let j = *idx + 4;
+                    let j = idx.checked_add(4)?;
                     if j > buf.len() {
                         return None;
                     }
@@ -90,7 +90,7 @@ macro_rules! impl_try_read {
                     (u32::from_be_bytes(buf[i..j].try_into().unwrap()) & VARINT_U32_MAX) as $t
                 }
                 0b11 => {
-                    let j = *idx + 8;
+                    let j = idx.checked_add(8)?;
                     if j > buf.len() {
                         return None;
                     }
@@ -114,11 +114,11 @@ pub fn varu30_try_read(buf: &[u8], idx: &mut usize) -> Option<u32> {
     }
     match buf[i] >> 6 {
         0b00 => {
-            *idx += 1;
+            *idx = idx.checked_add(1)?;
             Some(buf[i] as u32)
         }
         0b01 => {
-            let j = *idx + 2;
+            let j = idx.checked_add(2)?;
             if j > buf.len() {
                 return None;
             }
@@ -126,7 +126,7 @@ pub fn varu30_try_read(buf: &[u8], idx: &mut usize) -> Option<u32> {
             Some((u16::from_be_bytes(buf[i..j].try_into().unwrap()) & VARINT_U16_MAX) as u32)
         }
         0b10 => {
-            let j = *idx + 4;
+            let j = idx.checked_add(4)?;
             if j > buf.len() {
                 return None;
             }

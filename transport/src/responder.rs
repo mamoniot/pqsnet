@@ -2,7 +2,11 @@ use constant_time_eq::{constant_time_eq_16, constant_time_eq_32};
 use zeroize::Zeroizing;
 
 use crate::{
-    crypto::prelude::*, error::{Error, ReplyError}, key_bundle::{AuthenticBundle, OfflineHash, SecretBundle}, protocol::*, symmetric_state::{HandshakeComplete, Resumption, ResumptionToken, SymmetricState},
+    crypto::prelude::*,
+    error::{Error, ReplyError},
+    key_bundle::{AuthenticBundle, OfflineHash, SecretBundle},
+    protocol::*,
+    symmetric_state::{HandshakeComplete, Resumption, ResumptionToken, SymmetricState},
 };
 
 pub struct ReplyState<C: CryptoAndMem> {
@@ -34,7 +38,7 @@ impl<C: CryptoAndMem> ReplyState<C> {
         resumption: Option<Resumption<C>>,
         create_payload: impl FnOnce() -> C::PayloadMem,
         secs_since_unix_epoch: u64,
-        alloc: <C::MessageMem as Mem>::Alloc
+        alloc: <C::MessageMem as Mem>::Alloc,
     ) -> Result<InitOk<'a, C>, ReplyError> {
         let shared_secret;
         let ciphertext;
@@ -233,7 +237,7 @@ impl<C: CryptoAndMem> ReplyState<C> {
         self,
         confirm_message: &'a mut [u8],
         secs_since_unix_epoch: u64,
-        alloc: <C::BundleMem as Mem>::Alloc
+        alloc: <C::BundleMem as Mem>::Alloc,
     ) -> Result<HandshakeComplete<'a, C>, Error> {
         use confirm::*;
 

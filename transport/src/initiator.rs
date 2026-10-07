@@ -25,7 +25,7 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
         secret_key_bundle: S,
         resumption: Option<Resumption<C>>,
         payload: C::PayloadMem,
-        alloc: <C::MessageMem as Mem>::Alloc
+        alloc: <C::MessageMem as Mem>::Alloc,
     ) -> (C::MessageMem, InitState<C, S>) {
         use initialize::*;
 
@@ -122,7 +122,7 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
         reply_message: &'a mut [u8],
         secs_since_unix_epoch: u64,
         bundle_alloc: <C::BundleMem as Mem>::Alloc,
-        message_alloc: <C::MessageMem as Mem>::Alloc
+        message_alloc: <C::MessageMem as Mem>::Alloc,
     ) -> Result<HandshakeComplete<'a, C>, Error> {
         let handshake_type;
         let remote_key_bundle;
@@ -240,7 +240,8 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
             let online_sign_end = online_sign_start + ONLINE_SIGN_LEN;
             let online_sign_tag_end = online_sign_end + ONLINE_SIGN_TAG_LEN;
 
-            let mut confirm_message = C::MessageMem::malloc(message_alloc, online_sign_tag_end).ok_or(Error::AllocFailure)?;
+            let mut confirm_message =
+                C::MessageMem::malloc(message_alloc, online_sign_tag_end).ok_or(Error::AllocFailure)?;
 
             /* PAYLOAD HANDLING */
 

@@ -11,7 +11,13 @@ use psqnet_transport::{
 use tracing::*;
 
 use crate::{
-    application_layer::Route, channel::Channel, crypto::{aes::HotAesGcmDecryptor, transport::Crypto}, desegmenter::{Desegmenter, NewResult, SegError}, protocol::*, session::{Session, SessionInner}, varint::*,
+    application_layer::Route,
+    channel::Channel,
+    crypto::{aes::HotAesGcmDecryptor, transport::Crypto},
+    desegmenter::{Desegmenter, NewResult, SegError},
+    protocol::*,
+    session::{Session, SessionInner},
+    varint::*,
 };
 
 pub(crate) type SocketId = u64;
@@ -95,8 +101,13 @@ impl<R: Route> Context<R> {
 
         let (payload, reserved_socket_id) = self.create_payload();
 
-        let (cur_message, state) =
-            InitState::initialize(&handshake_no.to_be_bytes(), self.secret_bundle.clone(), None, payload, ());
+        let (cur_message, state) = InitState::initialize(
+            &handshake_no.to_be_bytes(),
+            self.secret_bundle.clone(),
+            None,
+            payload,
+            (),
+        );
 
         let pre_entry = self.hanshake_table.insert(
             reply_no,
@@ -131,7 +142,7 @@ impl<R: Route> Context<R> {
             None,
             create_payload,
             secs_since_unix_epoch(),
-            ()
+            (),
         ) {
             Ok(InitOk::Complete(complete)) => {
                 let reserved_socket_id = reserved_socket_id.expect("reserved socket id was absent");
