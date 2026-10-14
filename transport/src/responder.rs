@@ -1,12 +1,13 @@
-use constant_time_eq::{constant_time_eq_16, constant_time_eq_32};
-use zeroize::Zeroizing;
+use constant_time_eq::constant_time_eq_32;
 
 use crate::{
+    HandshakeComplete,
+    api::{Resumption, ResumptionToken},
     crypto::prelude::*,
     error::{Error, ReplyError},
     key_bundle::{AuthenticBundle, OfflineHash, SecretBundle},
     protocol::*,
-    symmetric_state::{HandshakeComplete, Resumption, ResumptionToken, SymmetricState},
+    symmetric_state::SymmetricState,
 };
 
 pub struct ReplyState<C: CryptoAndMem> {
@@ -36,16 +37,18 @@ impl<C: CryptoAndMem> ReplyState<C> {
         init_message: &'a mut [u8],
         secret_key_bundle: &SecretBundle<C>,
         resumption: Option<Resumption<C>>,
-        create_payload: impl FnOnce() -> C::PayloadMem,
         secs_since_unix_epoch: u64,
         alloc: <C::MessageMem as Mem>::Alloc,
+        create_payload: impl FnOnce() -> C::PayloadMem,
     ) -> Result<InitOk<'a, C>, ReplyError> {
+        /* INITIALIZE MESSAGE DECODING */
+
         let shared_secret;
         let ciphertext;
         let handshake_type;
+        let mut symmetric;
         let mut resume = None;
         let mut remote_offline_hash = None;
-        let mut symmetric;
         {
             use initialize::*;
 
@@ -57,13 +60,11 @@ impl<C: CryptoAndMem> ReplyState<C> {
 
             let ephemeral_enc_key = &init_message[EPHEMERAL_ENC_KEY_RANGE];
             let result = C::DecapsulationKey::encapsulate(ephemeral_enc_key.try_into().unwrap());
-            let (ss, c) = result.ok_or(ReplyError::Inauthentic)?;
-            ciphertext = c;
-            shared_secret = Zeroizing::new(ss);
+            (shared_secret, ciphertext) = result.ok_or(ReplyError::Inauthentic)?;
 
             /* RESUMPTION TOKEN HANDLING */
 
-            symmetric = SymmetricState::<C>::new(aad);
+            symmetric = SymmetricState::new(aad);
 
             let has_resumption_token = init_message.len() >= RESUMPTION_TOKEN_END;
             if has_resumption_token {
@@ -93,52 +94,38 @@ impl<C: CryptoAndMem> ReplyState<C> {
                 let payload_end = init_message.len() - PAYLOAD_REV_START;
                 let payload_tag_end = init_message.len() - PAYLOAD_TAG_REV_START;
                 let online_sign_start = init_message.len() - ONLINE_SIGN_REV_END;
-                let online_sign_end = init_message.len() - ONLINE_SIGN_REV_START;
                 let online_sign_tag_end = init_message.len() - ONLINE_SIGN_TAG_REV_START;
 
                 /* PAYLOAD HANDLING */
 
-                let checksum_channel_binding = symmetric.channel_binding();
+                let mut local_checksum = [0; KEY_BUNDLE_CHECKSUM_LEN];
+                symmetric.checksum(
+                    resumption.remote_key_bundle.bundle_hash(),
+                    secret_key_bundle.bundle_hash(),
+                    &mut local_checksum,
+                );
 
                 symmetric.decrypt_and_mix(11, &mut init_message[KEY_BUNDLE_CHECKSUM_START..payload_tag_end])?;
 
-                /* KEY BUNDLE CHECKSUM HANDLING */
-
-                let mut bundle_hasher = C::Xof::new();
-                bundle_hasher.update(&checksum_channel_binding);
-                bundle_hasher.update(resumption.remote_key_bundle.bundle_hash());
-                bundle_hasher.update(secret_key_bundle.bundle_hash());
-
-                let mut local_checksum = [0; KEY_BUNDLE_CHECKSUM_LEN];
-                bundle_hasher.finish(&mut local_checksum);
-
-                let remote_checksum = &init_message[KEY_BUNDLE_CHECKSUM_RANGE];
+                let remote_checksum = &init_message[KEY_BUNDLE_CHECKSUM_RANGE].try_into().unwrap();
                 /* An incorrect bundle checksum indicates one party currently has an
                 outdated or incorrect public key of the other party. So we need to do a
                 full handshake to re-exchange public keys. */
-                let has_correct_bundle = constant_time_eq_16(&local_checksum, remote_checksum.try_into().unwrap());
+                let has_correct_bundle = constant_time_eq_32(&local_checksum, remote_checksum);
 
                 /* ONLINE SIGNATURE HANDLING */
 
-                let signature_channel_binding = symmetric.channel_binding();
-
-                symmetric.decrypt_and_mix(12, &mut init_message[online_sign_start..online_sign_tag_end])?;
+                symmetric.verify(
+                    12,
+                    has_correct_bundle.then_some(&resumption.remote_key_bundle),
+                    &mut init_message[online_sign_start..online_sign_tag_end],
+                    secs_since_unix_epoch,
+                )?;
 
                 /* Authentication of the initiator's signature is skipped when doing a
                 full handshake if the initiator has the incorrect keys. A full handshake
                 will force the initiator to send a second, better signature later. */
                 if has_correct_bundle {
-                    let sign = (&init_message[online_sign_start..online_sign_end]).try_into().unwrap();
-                    resumption
-                        .remote_key_bundle
-                        .verify(
-                            domain::INITIALIZE_BINDING,
-                            &signature_channel_binding,
-                            sign,
-                            secs_since_unix_epoch,
-                        )
-                        .map_err(|_| ReplyError::Inauthentic)?;
-
                     handshake_type = reply::HANDSHAKE_TYPE_RESUME;
                     resume = Some((resumption.remote_key_bundle, PAYLOAD_START..payload_end));
                 } else {
@@ -154,12 +141,11 @@ impl<C: CryptoAndMem> ReplyState<C> {
                 /* FULL HANDSHAKE */
 
                 symmetric.mix(1, &init_message[..]);
+
                 handshake_type = reply::HANDSHAKE_TYPE_FULL;
             }
         }
-        /* REPLY MESSAGE SHARED SECTION */
-
-        let mut reply_message;
+        /* REPLY MESSAGE ENCODING */
         {
             use reply::*;
 
@@ -169,7 +155,7 @@ impl<C: CryptoAndMem> ReplyState<C> {
             } else {
                 PAYLOAD_START + secret_key_bundle.public_bytes().len() + payload.len() + PAYLOAD_REV_START
             };
-            reply_message = C::MessageMem::malloc(alloc, message_len).ok_or(ReplyError::AllocFailure)?;
+            let mut reply_message = C::MessageMem::malloc(alloc, message_len).ok_or(ReplyError::AllocFailure)?;
 
             /* HANDSHAKE TYPE HANDLING */
 
@@ -196,21 +182,19 @@ impl<C: CryptoAndMem> ReplyState<C> {
             let payload_end = reply_message.len() - PAYLOAD_REV_START;
             let payload_tag_end = reply_message.len() - PAYLOAD_TAG_REV_START;
             let online_sign_start = reply_message.len() - ONLINE_SIGN_REV_END;
-            let online_sign_end = reply_message.len() - ONLINE_SIGN_REV_START;
             let online_sign_tag_end = reply_message.len() - ONLINE_SIGN_TAG_REV_START;
 
             reply_message[payload_start..payload_end].clone_from_slice(&payload);
-
-            /* PAYLOAD ENCRYPTION */
 
             symmetric.encrypt_and_mix(4, &mut reply_message[PAYLOAD_START..payload_tag_end]);
 
             /* ONLINE SIGNATURE HANDLING */
 
-            let signature = secret_key_bundle.sign(domain::REPLY_BINDING, &symmetric.channel_binding());
-            reply_message[online_sign_start..online_sign_end].copy_from_slice(&signature);
-
-            symmetric.encrypt_and_mix(5, &mut reply_message[online_sign_start..online_sign_tag_end]);
+            symmetric.sign(
+                5,
+                secret_key_bundle,
+                &mut reply_message[online_sign_start..online_sign_tag_end],
+            );
 
             if let Some((remote_key_bundle, recv_payload_range)) = resume {
                 Ok(InitOk::Complete(HandshakeComplete {
@@ -239,6 +223,8 @@ impl<C: CryptoAndMem> ReplyState<C> {
         secs_since_unix_epoch: u64,
         alloc: <C::BundleMem as Mem>::Alloc,
     ) -> Result<HandshakeComplete<'a, C>, Error> {
+        /* CONFIRM MESSAGE DECODING */
+
         use confirm::*;
 
         if confirm_message.len() < PAYLOAD_START + PAYLOAD_REV_START {
@@ -248,7 +234,6 @@ impl<C: CryptoAndMem> ReplyState<C> {
         let payload_end = confirm_message.len() - PAYLOAD_REV_START;
         let payload_tag_end = confirm_message.len() - PAYLOAD_TAG_REV_START;
         let online_sign_start = confirm_message.len() - ONLINE_SIGN_REV_END;
-        let online_sign_end = confirm_message.len() - ONLINE_SIGN_REV_START;
         let online_sign_tag_end = confirm_message.len() - ONLINE_SIGN_TAG_REV_START;
 
         /* PAYLOAD AND KEY BUNDLE HANDLING */
@@ -278,19 +263,12 @@ impl<C: CryptoAndMem> ReplyState<C> {
 
         /* ONLINE SIGNATURE HANDLING */
 
-        let channel_binding = symmetric.channel_binding();
-
-        symmetric.decrypt_and_mix(7, &mut confirm_message[online_sign_start..online_sign_tag_end])?;
-
-        let sign = &confirm_message[online_sign_start..online_sign_end];
-        remote_key_bundle
-            .verify(
-                domain::CONFIRM_BINDING,
-                &channel_binding,
-                sign.try_into().unwrap(),
-                secs_since_unix_epoch,
-            )
-            .map_err(|_| Error::Inauthentic)?;
+        symmetric.verify(
+            7,
+            Some(&remote_key_bundle),
+            &mut confirm_message[online_sign_start..online_sign_tag_end],
+            secs_since_unix_epoch,
+        )?;
 
         let recv_payload = &mut confirm_message[key_bundle_end..payload_end];
 

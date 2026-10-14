@@ -107,7 +107,8 @@ impl<R: Route> Context<R> {
             None,
             payload,
             (),
-        );
+        )
+        .expect("infallible memory allocation failed");
 
         let pre_entry = self.hanshake_table.insert(
             reply_no,
@@ -140,9 +141,9 @@ impl<R: Route> Context<R> {
             message,
             &self.secret_bundle,
             None,
-            create_payload,
             secs_since_unix_epoch(),
             (),
+            create_payload,
         ) {
             Ok(InitOk::Complete(complete)) => {
                 let reserved_socket_id = reserved_socket_id.expect("reserved socket id was absent");

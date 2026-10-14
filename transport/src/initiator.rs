@@ -1,13 +1,13 @@
 use core::ops::Deref;
 
-use zeroize::Zeroizing;
-
 use crate::{
+    HandshakeComplete,
+    api::Resumption,
     crypto::prelude::*,
     error::Error,
     key_bundle::{AuthenticBundle, SecretBundle},
     protocol::*,
-    symmetric_state::{HandshakeComplete, Resumption, SymmetricState},
+    symmetric_state::SymmetricState,
 };
 
 pub struct InitState<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> {
@@ -26,19 +26,20 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
         resumption: Option<Resumption<C>>,
         payload: C::PayloadMem,
         alloc: <C::MessageMem as Mem>::Alloc,
-    ) -> (C::MessageMem, InitState<C, S>) {
+    ) -> Option<(C::MessageMem, InitState<C, S>)> {
+        /* INITIALIZE MESSAGE ENCODING */
+
         use initialize::*;
 
         /* HANDSHAKE LEN AND FLAGS HANDLING */
 
-        let init_message = if resumption.is_some() {
+        let mut init_message = if resumption.is_some() {
             // In this case, we want to use the resumption key to resume this socket with 1-rtt.
-            C::MessageMem::malloc(alloc, PAYLOAD_START + payload.len() + PAYLOAD_REV_START)
+            C::MessageMem::malloc(alloc, PAYLOAD_START + payload.len() + PAYLOAD_REV_START)?
         } else {
             // In this case, we have no resumption key and want to start from scratch with 2-rtt.
-            C::MessageMem::malloc(alloc, EPHEMERAL_ENC_KEY_END)
+            C::MessageMem::malloc(alloc, EPHEMERAL_ENC_KEY_END)?
         };
-        let mut init_message = init_message.expect("memory allocation failed");
 
         /* MLKEM1024 EPHEMERAL ENCAPSULATION KEY HANDLING */
 
@@ -49,7 +50,7 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
 
         let mut fallback = None;
         let mut remote_key_bundle = None;
-        let mut symmetric = SymmetricState::<C>::new(aad);
+        let mut symmetric = SymmetricState::new(aad);
 
         if let Some(resumption) = resumption {
             init_message[RESUMPTION_TOKEN_RANGE].copy_from_slice(&resumption.token[..]);
@@ -67,19 +68,15 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
             let payload_end = init_message.len() - PAYLOAD_REV_START;
             let payload_tag_end = init_message.len() - PAYLOAD_TAG_REV_START;
             let online_sign_start = init_message.len() - ONLINE_SIGN_REV_END;
-            let online_sign_end = init_message.len() - ONLINE_SIGN_REV_START;
             let online_sign_tag_end = init_message.len() - ONLINE_SIGN_TAG_REV_END;
 
-            /* KEY BUNDLE CHECKSUM HANDLING */
+            /* PAYLOAD HANDLING */
 
-            let mut bundle_hasher = C::Xof::new();
-            bundle_hasher.update(&symmetric.channel_binding());
-            bundle_hasher.update(secret_key_bundle.bundle_hash());
-            bundle_hasher.update(resumption.remote_key_bundle.bundle_hash());
-
-            bundle_hasher.finish(&mut init_message[KEY_BUNDLE_CHECKSUM_RANGE]);
-
-            /* PAYLOAD ENCODING */
+            symmetric.checksum(
+                secret_key_bundle.bundle_hash(),
+                resumption.remote_key_bundle.bundle_hash(),
+                &mut init_message[KEY_BUNDLE_CHECKSUM_RANGE],
+            );
 
             init_message[PAYLOAD_START..payload_end].copy_from_slice(&payload[..]);
 
@@ -87,10 +84,11 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
 
             /* ONLINE SIGNATURE HANDLING */
 
-            let sign = secret_key_bundle.sign(domain::INITIALIZE_BINDING, &symmetric.channel_binding());
-            init_message[online_sign_start..online_sign_end].copy_from_slice(&sign);
-
-            symmetric.encrypt_and_mix(12, &mut init_message[online_sign_start..online_sign_tag_end]);
+            symmetric.sign(
+                12,
+                &secret_key_bundle,
+                &mut init_message[online_sign_start..online_sign_tag_end],
+            );
 
             if let Some(fallback) = &mut fallback {
                 // A fallback handshake must still authenticate the entire init message.
@@ -104,7 +102,7 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
             symmetric.mix(1, &init_message[..]);
         }
 
-        (
+        Some((
             init_message,
             InitState {
                 symmetric,
@@ -114,7 +112,7 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
                 secret_key_bundle,
                 remote_key_bundle,
             },
-        )
+        ))
     }
 
     pub fn process_reply<'a>(
@@ -124,6 +122,8 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
         bundle_alloc: <C::BundleMem as Mem>::Alloc,
         message_alloc: <C::MessageMem as Mem>::Alloc,
     ) -> Result<HandshakeComplete<'a, C>, Error> {
+        /* REPLY MESSAGE DECODING */
+
         let handshake_type;
         let remote_key_bundle;
         let recv_payload;
@@ -150,12 +150,10 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
             /* MLKEM1024 CIPHERTEXT HANDLING */
 
             let ciphertext = (&reply_message[EPHEMERAL_CIPHERTEXT_RANGE]).try_into().unwrap();
-
-            let shared_secret = Zeroizing::new(
-                self.decapsulation_key
-                    .decapsulate(ciphertext)
-                    .ok_or(Error::Inauthentic)?,
-            );
+            let shared_secret = self
+                .decapsulation_key
+                .decapsulate(ciphertext)
+                .ok_or(Error::Inauthentic)?;
 
             symmetric.mix(2, &reply_message[..EPHEMERAL_CIPHERTEXT_END]);
             symmetric.mix(3, &shared_secret[..]);
@@ -165,7 +163,6 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
             let payload_end = reply_message.len() - PAYLOAD_REV_START;
             let payload_tag_end = reply_message.len() - PAYLOAD_TAG_REV_START;
             let online_sign_start = reply_message.len() - ONLINE_SIGN_REV_END;
-            let online_sign_end = reply_message.len() - ONLINE_SIGN_REV_START;
             let online_sign_tag_end = reply_message.len() - ONLINE_SIGN_TAG_REV_START;
 
             symmetric.decrypt_and_mix(4, &mut reply_message[PAYLOAD_START..payload_tag_end])?;
@@ -204,17 +201,12 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
 
             /* ONLINE SIGNATURE HANDLING */
 
-            symmetric.decrypt_and_mix(5, &mut reply_message[online_sign_start..online_sign_tag_end])?;
-
-            let sign = (&reply_message[online_sign_start..online_sign_end]).try_into().unwrap();
-            remote_key_bundle
-                .verify(
-                    domain::REPLY_BINDING,
-                    &symmetric.channel_binding(),
-                    sign,
-                    secs_since_unix_epoch,
-                )
-                .map_err(|_| Error::Inauthentic)?;
+            symmetric.verify(
+                5,
+                Some(&remote_key_bundle),
+                &mut reply_message[online_sign_start..online_sign_tag_end],
+                secs_since_unix_epoch,
+            )?;
 
             recv_payload = &mut reply_message[key_bundle_end..payload_end];
             if handshake_type == HANDSHAKE_TYPE_RESUME {
@@ -228,6 +220,7 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
                 });
             }
         }
+        /* CONFIRM MESSAGE ENCODING */
         {
             use confirm::*;
 
@@ -253,12 +246,11 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
 
             /* ONLINE SIGNATURE HANDLING */
 
-            let sign = self
-                .secret_key_bundle
-                .sign(domain::CONFIRM_BINDING, &symmetric.channel_binding());
-            confirm_message[online_sign_start..online_sign_end].copy_from_slice(&sign);
-
-            symmetric.encrypt_and_mix(7, &mut confirm_message[online_sign_start..online_sign_tag_end]);
+            symmetric.sign(
+                7,
+                &self.secret_key_bundle,
+                &mut confirm_message[online_sign_start..online_sign_tag_end],
+            );
 
             Ok(HandshakeComplete {
                 message_to_send: Some(confirm_message),

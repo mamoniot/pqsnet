@@ -40,16 +40,32 @@ impl From<Error> for ReplyError {
     }
 }
 
+impl From<Error> for AuthError {
+    fn from(value: Error) -> Self {
+        match value {
+            Error::Invalid => Self::Invalid,
+            Error::Inauthentic => Self::Inauthentic,
+            Error::AllocFailure => Self::AllocFailure,
+        }
+    }
+}
+
 impl From<AuthError> for Error {
     fn from(value: AuthError) -> Self {
         match value {
-            AuthError::Invalid => Error::Invalid,
-            AuthError::Inauthentic => Error::Inauthentic,
-            AuthError::ExpiredKey => Error::Invalid,
-            AuthError::PostdatedKey => Error::Invalid,
-            AuthError::UnrecognizedVersion => Error::Invalid,
-            AuthError::AllocFailure => Error::AllocFailure,
+            AuthError::Invalid => Self::Invalid,
+            AuthError::Inauthentic => Self::Inauthentic,
+            AuthError::ExpiredKey => Self::Invalid,
+            AuthError::PostdatedKey => Self::Invalid,
+            AuthError::UnrecognizedVersion => Self::Invalid,
+            AuthError::AllocFailure => Self::AllocFailure,
         }
+    }
+}
+
+impl From<AuthError> for ReplyError {
+    fn from(value: AuthError) -> Self {
+        Error::from(value).into()
     }
 }
 

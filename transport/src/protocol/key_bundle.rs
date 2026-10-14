@@ -59,7 +59,7 @@ pub const OFFLINE_SIGN_REV_START: usize = 0;
 
 pub const FLAG_RELIABLE_STORAGE: u32 = 0b1;
 
-pub const OFFLINE_HASH_LEN: usize = 48;
-pub const BUNDLE_HASH_LEN: usize = 32;
+pub const OFFLINE_HASH_LEN: usize = shake256::COLLISION_RESISITANCE_NIST5_LEN;
+pub const BUNDLE_HASH_LEN: usize = shake256::COLLISION_RESISITANCE_NIST5_LEN;
 
 pub const MIN_LEN: usize = EXTENSIONS_START + EXTENSIONS_REV_START;

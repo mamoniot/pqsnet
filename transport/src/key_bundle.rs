@@ -5,7 +5,7 @@ use crate::{
     error::AuthError,
     protocol::{domain, key_bundle::*},
 };
-use constant_time_eq::{constant_time_eq_32, constant_time_eq_n};
+use constant_time_eq::constant_time_eq_64;
 
 pub mod constants {
     pub use crate::protocol::key_bundle::*;
@@ -194,10 +194,10 @@ impl<C: CryptoAndMem> AuthenticBundle<C> {
     }
 
     pub fn offline_eq_raw(&self, other: &OfflineHash) -> bool {
-        constant_time_eq_n(&self.offline_hash, other)
+        constant_time_eq_64(&self.offline_hash, other)
     }
     pub fn bundle_eq_raw(&self, other: &BundleHash) -> bool {
-        constant_time_eq_32(&self.bundle_hash, other)
+        constant_time_eq_64(&self.bundle_hash, other)
     }
 
     pub fn offline_eq(&self, other: &Self) -> bool {
