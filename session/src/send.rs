@@ -11,7 +11,7 @@ use crate::{
     application_layer::Route,
     packet_builder::{ElicitingFrame, PacketBuilder, Segment},
     protocol::*,
-    session::{RecvError, SendDocInner, Session, Work, WorkInner},
+    session::{RecvError, SendDocMutable, Session, Work, WorkInner},
 };
 
 pub struct SentPayload {
@@ -176,7 +176,7 @@ impl<R: Route> Session<R> {
                     continue;
                 }
 
-                if let SendDocInner { doc: Some(doc), channel, .. } = &mut *entry {
+                if let SendDocMutable { doc: Some(doc), channel, .. } = &mut *entry {
                     match Segment::try_new(doc_no, doc, channel.is_none(), packet.remaining_cap()) {
                         Ok(seg) => {
                             // This segment contains a close signal so none others need to be sent.
@@ -219,7 +219,7 @@ impl<R: Route> Session<R> {
                             packet = PacketBuilder::new(mtu);
 
                             let mut entry = self.send_table[send_idx].lock.lock().unwrap();
-                            if let SendDocInner { doc: Some(doc), channel, .. } = &mut *entry {
+                            if let SendDocMutable { doc: Some(doc), channel, .. } = &mut *entry {
                                 let Ok(seg) = Segment::try_new(doc_no, doc, channel.is_none(), packet.remaining_cap())
                                 else {
                                     // If the document had no data, continue. It should not be

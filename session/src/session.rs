@@ -1,41 +1,137 @@
 use std::{
-    collections::VecDeque,
-    mem::MaybeUninit,
-    ops::Range,
-    ptr::copy_nonoverlapping,
-    sync::{
+    collections::VecDeque, ops::{Deref, DerefMut, Range}, ptr::{NonNull, copy_nonoverlapping}, sync::{
         Arc, Condvar, Mutex, RwLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
-    },
-    task::Waker,
+    }, task::Waker,
 };
 
 use arrayvec::ArrayVec;
-use bytes::{Bytes, buf::UninitSlice};
+use bytes::Bytes;
+use psqnet_transport::crypto::mem::Mem;
 use smallvec::SmallVec;
 
 use crate::{
-    application_layer::Route, congestion::CongestionControl, packet_builder::PacketBuilder, protocol::*,
-    send::TransmissionQueue, stats::Stats,
+    application_layer::Route, congestion::CongestionControl, desegmenter::Desegmenter, doc_no::DocNo, protocol::*, send::TransmissionQueue, stats::Stats,
 };
 
-pub type DocNo = u64;
-pub type SocketId = u32;
-
-pub struct Session<R: Route>(pub Arc<SessionInner<R>>);
-
-impl<R: Route> std::ops::Deref for Session<R> {
-    type Target = Arc<SessionInner<R>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+pub(crate) struct SocketData {
+    /// Ack numbers must be added in sorted order from smallest to largest.
+    pub(crate) acks: Mutex<Vec<u32>>,
 }
 
-impl<R: Route> Clone for Session<R> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
+pub(crate) struct OpenSockets {
+    pub(crate) cur_idx: bool,
+    pub(crate) sockets: ArrayVec<SocketData, 2>,
+}
+
+/// Since this struct can own a `Channel`, it must not be dropped while a lock is held.
+pub(crate) struct OpenChannel {
+    /// If this is a channel for a recv doc, it will be initialized to `0`. This means that the app
+    /// layer has not yet been passed a channel object because the recv doc is not completed or has
+    /// not yet been received by its parent channel.
+    pub(crate) ref_count: usize,
+    /// These wakers are waiting for this channel to recv a new doc in `ready_docs` or
+    /// they are waiting for this channel to close.
+    pub(crate) ready_wakers: SmallVec<[Waker; 1]>,
+    pub(crate) ready_docs: SmallVec<[UnfinishedRecvDoc; 1]>,
+    /// TODO: Give this more capabilities. At least ensure that the protocol can handle extended
+    /// capabilities.
+    pub(crate) reply_buffer: SpecialReplyState,
+}
+
+#[derive(Default)]
+pub(crate) enum RecvDocState {
+    /// This state is reached when a new document is being received but the receiving thread has not
+    /// yet fully initialized a `RecvDoc`. That thread will notify this slot's condvar when it is
+    /// done. Threads which need to access the RecvDoc should wait on the condvar if they encounter
+    /// this state. This state must be considered an "active" state.
+    ///
+    /// A reserved `RecvDocState` must only be overwritten by the thread which set it to reserved.
+    ActiveReserved,
+    Active {
+        parent_no: DocNo,
+        desegmenter: Desegmenter<DocMem>,
+    },
+    /// This document has been completed and a fin will eventually be sent, though
+    /// that may take a while if this doc has an unknown parent (aka is an orphan).
+    /// This state will transition to `FinAck` when our fin is acked.
+    ///
+    /// A misbehaving peer may successfully insert a new recv doc in this slot while the current
+    /// doc is not yet finished. This requires that this doc's channel is closed.
+    /// This implementation is structured to tolerate such misbehavior.
+    ///
+    /// While in this state a channel may be created and passed to the app layer, this channel
+    /// may then attempt to "flush" this doc by adding a waker to this state.
+    /// These wakers are awoken when our fin is acked, or if the remote peer uses a
+    /// document number that would use this slot (this is considered an implicit ack).
+    /// We don't want a delayed ack to prevent receiving a valid document.
+    /// The remote peer must only reuse this document slot after it receives our fin.
+    Finishing(Flushers),
+    FinAck,
+    #[default]
+    FinParentClose,
+}
+
+pub(crate) struct RecvDocMutable {
+    pub(crate) doc_no: DocNo,
+    pub(crate) doc: RecvDocState,
+    /// The channel of a recv slot can be in one of two states: open or closed. When a channel is
+    /// open, it can be closed locally or remotely at any time. If it is closed remotely, the local
+    /// channel will be open for a short time until an explicit or implicit close is received.
+    /// Implicit closes are when a new, valid doc is received and claims this recv slot. The remote
+    /// peer may only do this if it has closed the previous channel in this recv slot.
+    ///
+    /// We choose to represent the open state as `Some(..)` and the closed state as `None`.
+    pub(crate) channel: Option<OpenChannel>,
+    /// Each orphan "owns" a slot in the recv table. If this orphan is dropped because an open
+    /// parent was not received, that slot must be freed and a fin-parent-closed for the orphan doc
+    /// no must be sent.
+    ///
+    /// TODO: We need a rule to handle peers who incorrectly send us permanently orphaned documents.
+    pub(crate) adoptable_orphans: SmallVec<[UnfinishedRecvDoc; 1]>,
+    pub(crate) orphans_expected_parent_no: Option<DocNo>,
+    /// This may only be set to true once at the same time `channel` is set to `None` or when `doc`
+    /// is set to `Fin`.
+    pub(crate) needs_send_control: bool,
+}
+
+pub(crate) struct RecvDocEntry {
+    pub(crate) lock: Mutex<RecvDocMutable>,
+    pub(crate) condvar: Condvar,
+}
+
+/// It is recommended to not drop this while holding a lock to reduce contention from wakers.
+pub(crate) struct SendDoc {
+    pub(crate) parent_no: DocNo,
+    pub(crate) has_special_parent: bool,
+    pub(crate) has_been_acked: bool,
+    pub(crate) next_seg_off: usize,
+    pub(crate) data: Bytes,
+    /// These wakers are waiting for a fin on this doc, which will also drop this `SendDoc`.
+    /// Right now they are only awoken on drop.
+    pub(crate) flush_wakers: SmallVec<[Waker; 1]>,
+}
+
+pub(crate) struct SendDocMutable {
+    pub(crate) doc_no: DocNo,
+    /// This may only be set to true once at the same time `channel` is set to `Close`.
+    pub(crate) needs_send_close: bool,
+    /// Sending docs can only have two states, active and free, so `Some(..)` is the active state
+    /// and `None` is the free state.
+    pub(crate) doc: Option<SendDoc>,
+    /// The channel of a recv slot can be in one of two states: open or closed. When a channel is
+    /// open, it can be closed locally or remotely at any time. If it is closed remotely, the local
+    /// channel will be open for a short time until an explicit close is received. There is no way
+    /// for the remote peer to send an implicit close. The app layer determines if and when a local
+    /// close occurs. Local closes start as explicit but can become implicit if a sending doc claims
+    /// this send slot.
+    ///
+    /// We choose to represent the open state as `Some(..)` and the closed state as `None`.
+    pub(crate) channel: Option<OpenChannel>,
+}
+
+pub(crate) struct SendDocEntry {
+    pub(crate) lock: Mutex<SendDocMutable>,
 }
 
 pub struct SessionInner<R: Route> {
@@ -74,44 +170,30 @@ pub struct SessionInner<R: Route> {
     pub(crate) route: R,
 }
 
-pub(crate) struct OpenSockets {
-    pub(crate) cur_idx: bool,
-    pub(crate) sockets: ArrayVec<SocketData, 2>,
-}
+pub struct Session<R: Route>(pub Arc<SessionInner<R>>);
 
-pub(crate) struct SocketData {
-    /// Ack numbers must be added in sorted order from smallest to largest.
-    pub(crate) acks: Mutex<Vec<u32>>,
-    pub(crate) socket: Sock,
-}
+impl<R: Route> std::ops::Deref for Session<R> {
+    type Target = Arc<SessionInner<R>>;
 
-/// TODO: remove this.
-pub struct Sock {
-    pub local_id: u32,
-    pub uid: u32,
-}
-
-impl Sock {
-    pub fn encrypt_in_place(&self, buf: &mut [u8]) -> u32 {
-        todo!()
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
-pub(crate) struct RecvDocEntry {
-    pub(crate) lock: Mutex<RecvDocInner>,
-    pub(crate) condvar: Condvar,
+impl<R: Route> Clone for Session<R> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
 }
 
 pub(crate) struct UnreleasedChannel {
     pub(crate) doc_no: DocNo,
-    pub(crate) has_special_parent: bool,
     pub(crate) is_closed: bool,
 }
 
 pub(crate) struct UnfinishedRecvDoc {
     pub(crate) buf: Box<[u8]>,
     pub(crate) doc_no: DocNo,
-    pub(crate) has_special_parent: bool,
     pub(crate) is_closed: bool,
 }
 
@@ -124,6 +206,9 @@ pub(crate) enum SpecialReplyState {
     #[default]
     None,
 }
+
+#[derive(Default)]
+pub struct Flushers(pub(crate) SmallVec<[Waker; 1]>);
 
 impl SpecialReplyState {
     /// If there is a reply buffer awaiting data, this function removes it and returns it.
@@ -143,46 +228,6 @@ impl SpecialReplyState {
     }
 }
 
-/// Since this struct can own a `Channel`, it must not be dropped while a lock is held.
-pub(crate) struct OpenChannel {
-    /// If this is a channel for a recv doc, it will be initialized to `0`. This means that the app
-    /// layer has not yet been passed a channel object because the recv doc is not completed or has
-    /// not yet been received by its parent channel.
-    pub(crate) ref_count: usize,
-    /// These wakers are waiting for this channel to recv a new doc in `ready_docs` or
-    /// they are waiting for this channel to close.
-    pub(crate) ready_wakers: SmallVec<[Waker; 1]>,
-    pub(crate) ready_docs: SmallVec<[UnfinishedRecvDoc; 1]>,
-    /// TODO: Give this more capabilities. At least ensure that the protocol can handle extended
-    /// capabilities.
-    pub(crate) reply_buffer: SpecialReplyState,
-}
-
-pub(crate) struct RecvDocInner {
-    pub(crate) doc_no: DocNo,
-    pub(crate) doc: RecvDocState,
-    /// The channel of a recv slot can be in one of two states: open or closed. When a channel is
-    /// open, it can be closed locally or remotely at any time. If it is closed remotely, the local
-    /// channel will be open for a short time until an explicit or implicit close is received.
-    /// Implicit closes are when a new, valid doc is received and claims this recv slot. The remote
-    /// peer may only do this if it has closed the previous channel in this recv slot.
-    ///
-    /// We choose to represent the open state as `Some(..)` and the closed state as `None`.
-    pub(crate) channel: Option<OpenChannel>,
-    /// Each orphan "owns" a slot in the recv table. If this orphan is dropped because an open
-    /// parent was not received, that slot must be freed and a fin-parent-closed for the orphan doc
-    /// no must be sent.
-    ///
-    /// TODO: We need a rule to handle peers who incorrectly send us permanently orphaned documents.
-    pub(crate) adoptable_orphans: SmallVec<[UnfinishedRecvDoc; 1]>,
-    pub(crate) orphans_expected_parent_no: Option<DocNo>,
-    /// This may only be set to true once at the same time `channel` is set to `None` or when `doc`
-    /// is set to `Fin`.
-    pub(crate) needs_send_control: bool,
-}
-
-#[derive(Default)]
-pub struct Flushers(pub(crate) SmallVec<[Waker; 1]>);
 
 impl Drop for Flushers {
     fn drop(&mut self) {
@@ -192,113 +237,10 @@ impl Drop for Flushers {
     }
 }
 
-#[derive(Default)]
-pub(crate) enum RecvDocState {
-    /// This state is reached when a new document is being received but the receiving thread has not
-    /// yet fully initialized a `RecvDoc`. That thread will notify this slot's condvar when it is
-    /// done. Threads which need to access the RecvDoc should wait on the condvar if they encounter
-    /// this state. This state must be considered an "active" state.
-    ///
-    /// A reserved `RecvDocState` must only be overwritten by the thread which set it to reserved.
-    ActiveReserved,
-    Active(RecvDoc),
-    /// This document has been completed and a fin will eventually be sent, though
-    /// that may take a while if this doc has an unknown parent (aka is an orphan).
-    /// This state will transition to `FinAck` when our fin is acked.
-    ///
-    /// A misbehaving peer may successfully insert a new recv doc in this slot while the current
-    /// doc is not yet finished. This requires that this doc's channel is closed.
-    /// This implementation is structured to tolerate such misbehavior.
-    ///
-    /// While in this state a channel may be created and passed to the app layer, this channel
-    /// may then attempt to "flush" this doc by adding a waker to this state.
-    /// These wakers are awoken when our fin is acked, or if the remote peer uses a
-    /// document number that would use this slot (this is considered an implicit ack).
-    /// We don't want a delayed ack to prevent receiving a valid document.
-    /// The remote peer must only reuse this document slot after it receives our fin.
-    Finishing(Flushers),
-    FinAck,
-    #[default]
-    FinParentClose,
-}
-
 impl RecvDocState {
     pub fn slot_is_fin(&self) -> bool {
         matches!(self, RecvDocState::Finishing(..) | RecvDocState::FinAck)
     }
-}
-
-pub(crate) struct RecvDoc {
-    pub(crate) has_special_parent: bool,
-    pub(crate) parent_no: Option<DocNo>,
-    pub(crate) mem: DocMem,
-    pub(crate) total_recv: usize,
-    pub(crate) set_segs: Vec<usize>,
-}
-
-pub(crate) enum DocMem {
-    Simple(Box<[MaybeUninit<u8>]>),
-    ReplyBuf(Range<*mut u8>),
-}
-
-impl DocMem {
-    pub fn len(&self) -> usize {
-        match self {
-            Self::Simple(m) => m.len(),
-            Self::ReplyBuf(m) => m.end as usize - m.start as usize,
-        }
-    }
-
-    pub fn write(&mut self, seg_off: usize, seg: &[u8]) {
-        match self {
-            Self::Simple(m) => {
-                UninitSlice::uninit(&mut m[seg_off..seg_off + seg.len()]).copy_from_slice(seg);
-            }
-            Self::ReplyBuf(m) => {
-                assert!(
-                    seg.len() < m.end as usize - m.start as usize,
-                    "document buffer overflow"
-                );
-                unsafe {
-                    copy_nonoverlapping(seg.as_ptr(), m.start, seg.len());
-                }
-            }
-        }
-    }
-}
-
-pub(crate) struct SendDocEntry {
-    pub(crate) lock: Mutex<SendDocInner>,
-}
-
-pub(crate) struct SendDocInner {
-    pub(crate) doc_no: DocNo,
-    /// This may only be set to true once at the same time `channel` is set to `Close`.
-    pub(crate) needs_send_close: bool,
-    /// Sending docs can only have two states, active and free, so `Some(..)` is the active state
-    /// and `None` is the free state.
-    pub(crate) doc: Option<SendDoc>,
-    /// The channel of a recv slot can be in one of two states: open or closed. When a channel is
-    /// open, it can be closed locally or remotely at any time. If it is closed remotely, the local
-    /// channel will be open for a short time until an explicit close is received. There is no way
-    /// for the remote peer to send an implicit close. The app layer determines if and when a local
-    /// close occurs. Local closes start as explicit but can become implicit if a sending doc claims
-    /// this send slot.
-    ///
-    /// We choose to represent the open state as `Some(..)` and the closed state as `None`.
-    pub(crate) channel: Option<OpenChannel>,
-}
-
-/// It is recommended to not drop this while holding a lock to reduce contention from wakers.
-pub(crate) struct SendDoc {
-    pub(crate) parent_no: DocNo,
-    pub(crate) has_special_parent: bool,
-    pub(crate) has_been_acked: bool,
-    pub(crate) next_seg_off: usize,
-    pub(crate) data: Bytes,
-    /// These wakers are waiting for a fin on this doc, which will also drop this `SendDoc`.
-    /// Right now they are only awoken on drop.
-    pub(crate) flush_wakers: SmallVec<[Waker; 1]>,
 }
 
 impl Drop for SendDoc {
@@ -307,18 +249,6 @@ impl Drop for SendDoc {
             waker.wake();
         }
     }
-}
-
-pub enum RecvError {
-    Inauthentic,
-    Invalid,
-}
-
-pub struct Work(pub(crate) WorkInner);
-
-pub enum WorkInner {
-    Send(PacketBuilder),
-    SendOn(PacketBuilder, bool, u32),
 }
 
 impl<R: Route> Session<R> {

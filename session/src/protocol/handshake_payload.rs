@@ -26,5 +26,5 @@ fn test_max_len() {
         minor_version: u32::MAX,
         socket_id: SocketId::MAX,
     };
-    cbor4ii::serde::to_writer(&mut mem, &p);
+    cbor4ii::serde::to_writer(&mut mem, &p).unwrap();
 }

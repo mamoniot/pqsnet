@@ -212,10 +212,13 @@ impl<R: Route> Context<R> {
                 Entry::Occupied(mut entry) => {
                     let mut _message_mem = None;
                     let message = match entry.get_mut() {
+                        // Entries are set to cooldown so resent messages do not trigger a handshake
+                        // twice.
                         HandshakeEntry::CoolDown => {
                             debug!(handshake_no, "ignored handshake fragment while on cooldown");
                             return None;
                         }
+                        // 
                         HandshakeEntry::ResponderRecv(desegmenter)
                         | HandshakeEntry::InitiatorSent { desegmenter: Some(desegmenter), .. }
                         | HandshakeEntry::ResponderSent { desegmenter: Some(desegmenter), .. } => {

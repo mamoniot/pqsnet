@@ -9,11 +9,11 @@ impl DecapsulationKey for Mlkem1024Key {
 
     fn encapsulate(
         encapsulation_key: &[u8; ENCAPSULATION_KEY_LEN],
-    ) -> Option<([u8; SHARED_SECRET_KEY_LEN], [u8; CIPHERTEXT_LEN])> {
+    ) -> Option<(SharedSecret, [u8; CIPHERTEXT_LEN])> {
         todo!()
     }
 
-    fn decapsulate(&mut self, ciphertext: &[u8; CIPHERTEXT_LEN]) -> Option<[u8; SHARED_SECRET_KEY_LEN]> {
+    fn decapsulate(&mut self, ciphertext: &[u8; CIPHERTEXT_LEN]) -> Option<SharedSecret> {
         todo!()
     }
 }

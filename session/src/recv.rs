@@ -10,7 +10,7 @@ use crate::{
     application_layer::Route,
     protocol::*,
     session::{
-        DocMem, DocNo, OpenChannel, RecvDoc, RecvDocInner, RecvDocState, RecvError, Session, SpecialReplyState,
+        DocMem, DocNo, OpenChannel, RecvDocMutable, RecvDocState, Session, SpecialReplyState,
         UnfinishedRecvDoc, UnreleasedChannel,
     },
     varint::*,
@@ -63,7 +63,7 @@ impl<R: Route> Session<R> {
 
     /// It is the caller's responsibility to guarantee that every portion of the document
     /// has been written to by all of the sender's segments.
-    fn fin_doc(&self, doc_no: DocNo, mut entry: MutexGuard<RecvDocInner>) -> Result<(), RecvError> {
+    fn fin_doc(&self, doc_no: DocNo, mut entry: MutexGuard<RecvDocMutable>) -> Result<(), RecvError> {
         // The document is completed and needs to be finished now.
         let doc_state = std::mem::replace(&mut entry.doc, RecvDocState::Finishing(Default::default()));
         // The mutex is held so this state cannot change.

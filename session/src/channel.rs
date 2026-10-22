@@ -13,10 +13,6 @@ use crate::{
     session::{DocNo, OpenChannel, RecvDocState, SendDoc, Session, SpecialReplyState},
 };
 
-const FLAG_IS_CLOSED: u64 = 1u64.reverse_bits();
-const FLAG_HAS_SPECIAL_PARENT: u64 = 2u64.reverse_bits();
-const DOC_NO_MASK: u64 = u64::MAX >> 2;
-
 pub struct Channel<R: Route> {
     pub(crate) session: Session<R>,
     doc_no_tagged: u64,
@@ -30,6 +26,7 @@ pub struct ChannelStatus {
 
 pub enum RecvDocData<R: Route> {
     Doc(Box<[u8]>, Channel<R>),
+    DocUnbound(Box<[u8]>, Channel<R>),
     Datagram(Box<[u8]>),
 }
 

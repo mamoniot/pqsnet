@@ -6,4 +6,6 @@ pub mod mlkem;
 
 pub mod mldsa;
 
+pub mod mem;
+
 pub mod transport;
