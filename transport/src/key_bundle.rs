@@ -3,12 +3,12 @@ use core::ops::Deref;
 use crate::{
     crypto::{mldsa87::*, prelude::*},
     error::AuthError,
-    protocol::{domain, key_bundle::*},
+    protocol::{domain, public_keys::*},
 };
 use constant_time_eq::constant_time_eq_64;
 
 pub mod constants {
-    pub use crate::protocol::key_bundle::*;
+    pub use crate::protocol::public_keys::*;
 }
 
 pub type OfflineHash = [u8; OFFLINE_HASH_LEN];
@@ -120,7 +120,7 @@ impl<C: CryptoAndMem> SecretBundle<C> {
 impl<C: CryptoAndMem> AuthenticBundle<C> {
     pub fn authenticate(
         buf: &[u8],
-        secs_since_unix_epoch: u64,
+        secs_since_unix_epoch: Option<u64>,
         alloc: <C::BundleMem as Mem>::Alloc,
     ) -> Result<Self, AuthError> {
         if buf[VERSION_IDX] != VERSION_VALUE {
@@ -135,10 +135,12 @@ impl<C: CryptoAndMem> AuthenticBundle<C> {
         let offline_sign_start = EXTENSIONS_START + extensions_len;
         let offline_sign_end = offline_sign_start + OFFLINE_SIGN_LEN;
 
-        if secs_since_unix_epoch < not_before {
-            return Err(AuthError::PostdatedKey);
-        } else if secs_since_unix_epoch > not_after {
-            return Err(AuthError::ExpiredKey);
+        if let Some(secs_since_unix_epoch) = secs_since_unix_epoch {
+            if secs_since_unix_epoch < not_before {
+                return Err(AuthError::PostdatedKey);
+            } else if secs_since_unix_epoch > not_after {
+                return Err(AuthError::ExpiredKey);
+            }
         }
 
         let offline_key =
@@ -173,20 +175,22 @@ impl<C: CryptoAndMem> AuthenticBundle<C> {
         })
     }
 
-    /// `secs_since_unix_epoch` must be clamped to zero in the event that this system reports a
-    /// time which is earlier than unix epoch.
     pub fn verify(
         &self,
         ctx: &[u8],
         data: &[u8],
         signature: &[u8; SIGN_LEN],
-        secs_since_unix_epoch: u64,
+        secs_since_unix_epoch: Option<u64>,
     ) -> Result<(), AuthError> {
-        if secs_since_unix_epoch < self.not_before {
-            Err(AuthError::PostdatedKey)
-        } else if secs_since_unix_epoch > self.not_after {
-            Err(AuthError::ExpiredKey)
-        } else if !self.online_key.verify(ctx, data, signature) {
+        if let Some(secs_since_unix_epoch) = secs_since_unix_epoch {
+            if secs_since_unix_epoch < self.not_before {
+                return Err(AuthError::PostdatedKey);
+            } else if secs_since_unix_epoch > self.not_after {
+                return Err(AuthError::ExpiredKey);
+            }
+        }
+
+        if !self.online_key.verify(ctx, data, signature) {
             Err(AuthError::Inauthentic)
         } else {
             Ok(())

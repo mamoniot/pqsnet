@@ -3,7 +3,7 @@ use zeroize::Zeroizing;
 use crate::{
     crypto::{CryptoAndMem, aes256::KEY_LEN},
     key_bundle::AuthenticBundle,
-    protocol::symmetric_state::*,
+    protocol::derivation::*,
 };
 
 pub type ResumptionToken = [u8; RESUMPTION_TOKEN_LEN];

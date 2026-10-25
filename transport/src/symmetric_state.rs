@@ -7,7 +7,7 @@ use crate::{
     crypto::{aes256::TAG_LEN, prelude::*},
     error::{AuthError, Error},
     key_bundle::{AuthenticBundle, SecretBundle},
-    protocol::{domain, symmetric_state::*},
+    protocol::{domain, derivation::*},
 };
 
 pub struct SymmetricState<C: CryptoAndMem> {
@@ -100,7 +100,7 @@ impl<C: CryptoAndMem> SymmetricState<C> {
         step_no: u8,
         remote_key_bundle: Option<&AuthenticBundle<C>>,
         ciphertext_and_tag: &mut [u8],
-        secs_since_unix_epoch: u64,
+        secs_since_unix_epoch: Option<u64>,
     ) -> Result<(), AuthError> {
         debug_assert!(step_no == 12 || remote_key_bundle.is_some());
         let ciphertext_end = ciphertext_and_tag.len() - TAG_LEN;

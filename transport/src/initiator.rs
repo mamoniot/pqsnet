@@ -24,8 +24,9 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
         aad: &[u8],
         secret_key_bundle: S,
         resumption: Option<Resumption<C>>,
+        secs_since_unix_epoch: Option<u64>,
         payload: C::PayloadMem,
-        alloc: <C::MessageMem as Mem>::Alloc,
+        message_alloc: <C::MessageMem as Mem>::Alloc,
     ) -> Option<(C::MessageMem, InitState<C, S>)> {
         /* INITIALIZE MESSAGE ENCODING */
 
@@ -35,10 +36,10 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
 
         let mut init_message = if resumption.is_some() {
             // In this case, we want to use the resumption key to resume this socket with 1-rtt.
-            C::MessageMem::malloc(alloc, PAYLOAD_START + payload.len() + PAYLOAD_REV_START)?
+            C::MessageMem::malloc(message_alloc, PAYLOAD_START + payload.len() + PAYLOAD_REV_START)?
         } else {
             // In this case, we have no resumption key and want to start from scratch with 2-rtt.
-            C::MessageMem::malloc(alloc, EPHEMERAL_ENC_KEY_END)?
+            C::MessageMem::malloc(message_alloc, EPHEMERAL_ENC_KEY_END)?
         };
 
         /* MLKEM1024 EPHEMERAL ENCAPSULATION KEY HANDLING */
@@ -53,7 +54,14 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
         let mut symmetric = SymmetricState::new(aad);
 
         if let Some(resumption) = resumption {
+            let payload_end = init_message.len() - PAYLOAD_REV_START;
+            let payload_tag_end = init_message.len() - PAYLOAD_TAG_REV_START;
+            let online_sign_start = init_message.len() - ONLINE_SIGN_REV_END;
+            let online_sign_tag_end = init_message.len() - ONLINE_SIGN_TAG_REV_END;
+
             init_message[RESUMPTION_TOKEN_RANGE].copy_from_slice(&resumption.token[..]);
+
+            /* RESUMPTION HANDLING */
 
             symmetric.mix(9, &init_message[..RESUMPTION_TOKEN_END]);
 
@@ -63,14 +71,9 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
 
             symmetric.mix(10, &resumption.key[..]);
 
-            /* RESUMPTION HANDLING */
-
-            let payload_end = init_message.len() - PAYLOAD_REV_START;
-            let payload_tag_end = init_message.len() - PAYLOAD_TAG_REV_START;
-            let online_sign_start = init_message.len() - ONLINE_SIGN_REV_END;
-            let online_sign_tag_end = init_message.len() - ONLINE_SIGN_TAG_REV_END;
-
             /* PAYLOAD HANDLING */
+
+            init_message[ISSUED_AT_RANGE].copy_from_slice(&secs_since_unix_epoch.unwrap_or_default().to_be_bytes());
 
             symmetric.checksum(
                 secret_key_bundle.bundle_hash(),
@@ -80,15 +83,12 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
 
             init_message[PAYLOAD_START..payload_end].copy_from_slice(&payload[..]);
 
-            symmetric.encrypt_and_mix(11, &mut init_message[KEY_BUNDLE_CHECKSUM_START..payload_tag_end]);
+            symmetric.encrypt_and_mix(11, &mut init_message[RESUMPTION_TOKEN_END..payload_tag_end]);
 
             /* ONLINE SIGNATURE HANDLING */
 
-            symmetric.sign(
-                12,
-                &secret_key_bundle,
-                &mut init_message[online_sign_start..online_sign_tag_end],
-            );
+            let sign = &mut init_message[online_sign_start..online_sign_tag_end];
+            symmetric.sign(12, &secret_key_bundle, sign);
 
             if let Some(fallback) = &mut fallback {
                 // A fallback handshake must still authenticate the entire init message.
@@ -118,7 +118,7 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
     pub fn process_reply<'a>(
         mut self,
         reply_message: &'a mut [u8],
-        secs_since_unix_epoch: u64,
+        secs_since_unix_epoch: Option<u64>,
         bundle_alloc: <C::BundleMem as Mem>::Alloc,
         message_alloc: <C::MessageMem as Mem>::Alloc,
     ) -> Result<HandshakeComplete<'a, C>, Error> {
@@ -179,7 +179,7 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
 
                 if handshake_type == HANDSHAKE_TYPE_FALLBACK
                     && ((remote_key_bundle.flags() & self.secret_key_bundle.flags())
-                        & key_bundle::FLAG_RELIABLE_STORAGE)
+                        & public_keys::FLAG_RELIABLE_STORAGE)
                         > 0
                 {
                     return Err(Error::Inauthentic);
@@ -246,11 +246,8 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
 
             /* ONLINE SIGNATURE HANDLING */
 
-            symmetric.sign(
-                7,
-                &self.secret_key_bundle,
-                &mut confirm_message[online_sign_start..online_sign_tag_end],
-            );
+            let sign = &mut confirm_message[online_sign_start..online_sign_tag_end];
+            symmetric.sign(7, &self.secret_key_bundle, sign);
 
             Ok(HandshakeComplete {
                 message_to_send: Some(confirm_message),

@@ -1,8 +1,8 @@
 pub(crate) mod domain;
 
-pub(crate) mod key_bundle;
+pub(crate) mod public_keys;
 
-pub(crate) mod symmetric_state;
+pub(crate) mod derivation;
 
 pub(crate) mod initialize;
 

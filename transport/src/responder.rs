@@ -37,7 +37,7 @@ impl<C: CryptoAndMem> ReplyState<C> {
         init_message: &'a mut [u8],
         secret_key_bundle: &SecretBundle<C>,
         resumption: Option<Resumption<C>>,
-        secs_since_unix_epoch: u64,
+        secs_since_unix_epoch: Option<u64>,
         alloc: <C::MessageMem as Mem>::Alloc,
         create_payload: impl FnOnce() -> C::PayloadMem,
     ) -> Result<InitOk<'a, C>, ReplyError> {
@@ -82,12 +82,6 @@ impl<C: CryptoAndMem> ReplyState<C> {
             }
 
             if let Some(resumption) = resumption {
-                remote_offline_hash = Some(*resumption.remote_key_bundle.offline_hash());
-
-                symmetric.mix(10, &resumption.key[..]);
-
-                /* RESUMPTION HANDLING */
-
                 if init_message.len() < PAYLOAD_START + PAYLOAD_REV_START {
                     return Err(ReplyError::Invalid);
                 }
@@ -96,7 +90,23 @@ impl<C: CryptoAndMem> ReplyState<C> {
                 let online_sign_start = init_message.len() - ONLINE_SIGN_REV_END;
                 let online_sign_tag_end = init_message.len() - ONLINE_SIGN_TAG_REV_START;
 
+                /* RESUMPTION HANDLING */
+
+                remote_offline_hash = Some(*resumption.remote_key_bundle.offline_hash());
+
+                symmetric.mix(10, &resumption.key[..]);
+
                 /* PAYLOAD HANDLING */
+
+                let issued_at = u64::from_be_bytes(init_message[ISSUED_AT_RANGE].try_into().unwrap());
+
+                if issued_at != 0
+                    && let Some(secs_since_unix_epoch) = secs_since_unix_epoch
+                    && !(secs_since_unix_epoch.saturating_sub(ISSUED_NOT_BEFORE) < issued_at
+                        && issued_at < secs_since_unix_epoch.saturating_add(ISSUED_NOT_AFTER))
+                {
+                    return Err(ReplyError::Invalid);
+                }
 
                 let mut local_checksum = [0; KEY_BUNDLE_CHECKSUM_LEN];
                 symmetric.checksum(
@@ -190,11 +200,8 @@ impl<C: CryptoAndMem> ReplyState<C> {
 
             /* ONLINE SIGNATURE HANDLING */
 
-            symmetric.sign(
-                5,
-                secret_key_bundle,
-                &mut reply_message[online_sign_start..online_sign_tag_end],
-            );
+            let sign = &mut reply_message[online_sign_start..online_sign_tag_end];
+            symmetric.sign(5, secret_key_bundle, sign);
 
             if let Some((remote_key_bundle, recv_payload_range)) = resume {
                 Ok(InitOk::Complete(HandshakeComplete {
@@ -210,7 +217,7 @@ impl<C: CryptoAndMem> ReplyState<C> {
                         symmetric,
                         remote_offline_hash,
                         reject_if_remote_has_reliable_storage: handshake_type == HANDSHAKE_TYPE_FALLBACK
-                            && (secret_key_bundle.flags() & key_bundle::FLAG_RELIABLE_STORAGE) > 0,
+                            && (secret_key_bundle.flags() & public_keys::FLAG_RELIABLE_STORAGE) > 0,
                     },
                 ))
             }
@@ -220,7 +227,7 @@ impl<C: CryptoAndMem> ReplyState<C> {
     pub fn process_confirm<'a>(
         self,
         confirm_message: &'a mut [u8],
-        secs_since_unix_epoch: u64,
+        secs_since_unix_epoch: Option<u64>,
         alloc: <C::BundleMem as Mem>::Alloc,
     ) -> Result<HandshakeComplete<'a, C>, Error> {
         /* CONFIRM MESSAGE DECODING */
@@ -256,7 +263,7 @@ impl<C: CryptoAndMem> ReplyState<C> {
         }
 
         if self.reject_if_remote_has_reliable_storage
-            && (remote_key_bundle.flags() & key_bundle::FLAG_RELIABLE_STORAGE) > 0
+            && (remote_key_bundle.flags() & public_keys::FLAG_RELIABLE_STORAGE) > 0
         {
             return Err(Error::Inauthentic);
         }
