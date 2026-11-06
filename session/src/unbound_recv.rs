@@ -9,7 +9,10 @@ use psqnet_transport::crypto::mem::Mem;
 use smallvec::SmallVec;
 
 use crate::{
-    application_layer::Route, channel::Channel, protocol::*, session::{DocNo, OpenChannel, RecvDocState, SendDoc, Session, SpecialReplyState},
+    application_layer::Route,
+    channel::Channel,
+    protocol::*,
+    session::{DocNo, OpenChannel, RecvDocState, SendDoc, Session, SpecialReplyState},
 };
 
 const FLAG_IS_CLOSED: u64 = 1u64.reverse_bits();

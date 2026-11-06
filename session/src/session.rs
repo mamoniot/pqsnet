@@ -1,8 +1,12 @@
 use std::{
-    collections::VecDeque, ops::{Deref, DerefMut, Range}, ptr::{NonNull, copy_nonoverlapping}, sync::{
+    collections::VecDeque,
+    ops::{Deref, DerefMut, Range},
+    ptr::{NonNull, copy_nonoverlapping},
+    sync::{
         Arc, Condvar, Mutex, RwLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
-    }, task::Waker,
+    },
+    task::Waker,
 };
 
 use arrayvec::ArrayVec;
@@ -11,7 +15,8 @@ use psqnet_transport::crypto::mem::Mem;
 use smallvec::SmallVec;
 
 use crate::{
-    application_layer::Route, congestion::CongestionControl, desegmenter::Desegmenter, doc_no::DocNo, protocol::*, send::TransmissionQueue, stats::Stats,
+    application_layer::Route, congestion::CongestionControl, desegmenter::Desegmenter, doc_no::DocNo, protocol::*,
+    send::TransmissionQueue, stats::Stats,
 };
 
 pub(crate) struct SocketData {
@@ -227,7 +232,6 @@ impl SpecialReplyState {
         }
     }
 }
-
 
 impl Drop for Flushers {
     fn drop(&mut self) {

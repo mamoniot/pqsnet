@@ -10,8 +10,8 @@ use crate::{
     application_layer::Route,
     protocol::*,
     session::{
-        DocMem, DocNo, OpenChannel, RecvDocMutable, RecvDocState, Session, SpecialReplyState,
-        UnfinishedRecvDoc, UnreleasedChannel,
+        DocMem, DocNo, OpenChannel, RecvDocMutable, RecvDocState, Session, SpecialReplyState, UnfinishedRecvDoc,
+        UnreleasedChannel,
     },
     varint::*,
 };

@@ -73,7 +73,7 @@ impl DocNo {
             ChannelVariants::FORWARD => ChannelVariants::Forward,
             ChannelVariants::BACKWARD => ChannelVariants::Backward,
             ChannelVariants::UNBOUND => ChannelVariants::Unbound,
-            _ => unreachable!()
+            _ => unreachable!(),
         }
     }
 }

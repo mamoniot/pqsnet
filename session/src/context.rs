@@ -50,8 +50,8 @@ pub struct Context<R: Route> {
     secret_bundle: Arc<SecretBundle<Crypto>>,
 }
 
-pub fn secs_since_unix_epoch() -> u64 {
-    std::time::SystemTime::UNIX_EPOCH.elapsed().expect("todo").as_secs()
+pub fn secs_since_unix_epoch() -> Option<u64> {
+    std::time::SystemTime::UNIX_EPOCH.elapsed().ok().map(|ts| ts.as_secs())
 }
 
 impl<R: Route> Context<R> {
@@ -105,6 +105,7 @@ impl<R: Route> Context<R> {
             &handshake_no.to_be_bytes(),
             self.secret_bundle.clone(),
             None,
+            secs_since_unix_epoch(),
             payload,
             (),
         )
@@ -121,11 +122,11 @@ impl<R: Route> Context<R> {
 
     pub fn drive(&self, packet: &mut [u8], route: R) {}
 
-    fn handshake_complete(&self, new_socket_id: SocketId, complete: HandshakeComplete<Crypto>) -> Option<Channel<R>> {
+    fn handshake_complete(&self, new_socket_id: SocketId, complete: HandshakeComplete<Crypto>) -> Option<Receiver<R>> {
         None
     }
 
-    fn recv_init_message(&self, handshake_no: u128, message: &mut [u8]) -> Option<Channel<R>> {
+    fn recv_init_message(&self, handshake_no: u128, message: &mut [u8]) -> Option<Receiver<R>> {
         trace!(handshake_no, "recv initial message");
         // If `reserved_socket_id` is `Some` then it is a key in `socket_table`
         // and needs to eventually be removed from it.
@@ -185,7 +186,7 @@ impl<R: Route> Context<R> {
         None
     }
 
-    pub fn recv(&self, packet: &mut [u8], route: R) -> Option<Channel<R>> {
+    pub fn recv(&self, packet: &mut [u8], route: R) -> Option<Session<R>> {
         let mut packet_idx = 0;
         let idx = &mut packet_idx;
 
@@ -218,7 +219,7 @@ impl<R: Route> Context<R> {
                             debug!(handshake_no, "ignored handshake fragment while on cooldown");
                             return None;
                         }
-                        // 
+                        //
                         HandshakeEntry::ResponderRecv(desegmenter)
                         | HandshakeEntry::InitiatorSent { desegmenter: Some(desegmenter), .. }
                         | HandshakeEntry::ResponderSent { desegmenter: Some(desegmenter), .. } => {

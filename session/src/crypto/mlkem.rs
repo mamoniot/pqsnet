@@ -7,9 +7,7 @@ impl DecapsulationKey for Mlkem1024Key {
         todo!()
     }
 
-    fn encapsulate(
-        encapsulation_key: &[u8; ENCAPSULATION_KEY_LEN],
-    ) -> Option<(SharedSecret, [u8; CIPHERTEXT_LEN])> {
+    fn encapsulate(encapsulation_key: &[u8; ENCAPSULATION_KEY_LEN]) -> Option<(SharedSecret, [u8; CIPHERTEXT_LEN])> {
         todo!()
     }
 
