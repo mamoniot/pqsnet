@@ -98,27 +98,22 @@ impl<C: CryptoAndMem> SymmetricState<C> {
     pub fn verify(
         &mut self,
         step_no: u8,
-        remote_key_bundle: Option<&AuthenticBundle<C>>,
+        remote_key_bundle: &AuthenticBundle<C>,
         ciphertext_and_tag: &mut [u8],
         secs_since_unix_epoch: Option<u64>,
     ) -> Result<(), AuthError> {
-        debug_assert!(step_no == 12 || remote_key_bundle.is_some());
         let ciphertext_end = ciphertext_and_tag.len() - TAG_LEN;
 
         let sign_channel_binding = self.channel_binding();
 
         self.decrypt_and_mix(step_no, ciphertext_and_tag)?;
 
-        if let Some(remote_key_bundle) = remote_key_bundle {
-            remote_key_bundle.verify(
-                &[step_no],
-                &sign_channel_binding,
-                &ciphertext_and_tag[..ciphertext_end].try_into().unwrap(),
-                secs_since_unix_epoch,
-            )
-        } else {
-            Ok(())
-        }
+        remote_key_bundle.verify(
+            &[step_no],
+            &sign_channel_binding,
+            &ciphertext_and_tag[..ciphertext_end].try_into().unwrap(),
+            secs_since_unix_epoch,
+        )
     }
 
     pub fn split(self, step_no: u8) -> SymmetricKeys {

@@ -26,6 +26,11 @@ pub struct AuthenticBundle<C: CryptoAndMem> {
     public_bytes: C::BundleMem,
 }
 
+pub enum BundleIdentifier<C: CryptoAndMem> {
+    Full(AuthenticBundle<C>),
+    Partial(OfflineHash),
+}
+
 pub struct SecretBundle<C: CryptoAndMem> {
     online_secret_key: C::SecretKey,
     public_bundle: AuthenticBundle<C>,
@@ -54,6 +59,22 @@ impl<C: CryptoAndMem> Deref for SecretBundle<C> {
 
     fn deref(&self) -> &Self::Target {
         &self.public_bundle
+    }
+}
+
+impl<C: CryptoAndMem> BundleIdentifier<C> {
+    pub fn offline_hash(&self) -> &OfflineHash {
+        match self {
+            BundleIdentifier::Full(bundle) => bundle.offline_hash(),
+            BundleIdentifier::Partial(hash) => hash,
+        }
+    }
+
+    pub fn bundle(&self) -> Option<&AuthenticBundle<C>> {
+        match self {
+            BundleIdentifier::Full(bundle) => Some(bundle),
+            BundleIdentifier::Partial(_) => None,
+        }
     }
 }
 
