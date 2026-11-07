@@ -1,7 +1,13 @@
 use constant_time_eq::constant_time_eq_32;
 
 use crate::{
-    HandshakeComplete, api::{Resumption, ResumptionToken}, crypto::prelude::*, error::{Error, ReplyError}, key_bundle::{AuthenticBundle, OfflineHash, SecretBundle}, protocol::*, symmetric_state::SymmetricState,
+    HandshakeComplete,
+    api::{Resumption, ResumptionToken},
+    crypto::prelude::*,
+    error::{Error, ReplyError},
+    key_bundle::{AuthenticBundle, OfflineHash, SecretBundle},
+    protocol::*,
+    symmetric_state::SymmetricState,
 };
 
 pub struct ReplyState<C: CryptoAndMem> {

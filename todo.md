@@ -9,6 +9,8 @@
 - Document API
 - Whitepaper full protocol
 - Improve handshake fallback rejection logic
+- Improve key bundle API
+- Finalize key bundle fields
 ### Extraneous
 - Come up with a better name
 - Update protocol full name with new name
@@ -32,7 +34,7 @@ Secure, flow controlled, asynchronous, hierarchical document transfer protocol
 - Add async scheduling of transmission
 - Test protocol versioning for backwards compatibility
 ### Extraneous
-- Utalize received ICMP messages (Destination Unreachable, Time Exceeded, Parameter Problem)
+- Utilize received ICMP messages (Destination Unreachable, Time Exceeded, Parameter Problem)
 - Ensure correct handling of asymmetric routes (https://www.rfc-editor.org/info/rfc3449)
 - Implement the nagle algorithm or a variant (https://datatracker.ietf.org/doc/html/draft-minshall-nagle-01)
 - Implement delayed acks
@@ -45,4 +47,3 @@ Secure, flow controlled, asynchronous, hierarchical document transfer protocol
 - Congestion window recovery on spurious congestion event.
 - Metrics
 - Tracing
-- Reduce and compress repeative code (Until the architecture is settled this is not worth doing

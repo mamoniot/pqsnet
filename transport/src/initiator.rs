@@ -1,7 +1,13 @@
 use core::ops::Deref;
 
 use crate::{
-    HandshakeComplete, api::Resumption, crypto::prelude::*, error::Error, key_bundle::{AuthenticBundle, SecretBundle}, protocol::*, symmetric_state::SymmetricState,
+    HandshakeComplete,
+    api::Resumption,
+    crypto::prelude::*,
+    error::Error,
+    key_bundle::{AuthenticBundle, SecretBundle},
+    protocol::*,
+    symmetric_state::SymmetricState,
 };
 
 pub struct InitState<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> {

@@ -3,7 +3,11 @@ use core::marker::PhantomData;
 use zeroize::Zeroizing;
 
 use crate::{
-    SymmetricKeys, crypto::{aes256::TAG_LEN, prelude::*}, error::{AuthError, Error}, key_bundle::{AuthenticBundle, BundleHash, SecretBundle}, protocol::{derivation::*, domain},
+    SymmetricKeys,
+    crypto::{aes256::TAG_LEN, prelude::*},
+    error::{AuthError, Error},
+    key_bundle::{AuthenticBundle, BundleHash, SecretBundle},
+    protocol::{derivation::*, domain},
 };
 
 pub struct SymmetricState<C: CryptoAndMem> {
