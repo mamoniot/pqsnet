@@ -69,7 +69,7 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
 
             init_message[ISSUED_AT_RANGE].copy_from_slice(&secs_since_unix_epoch.unwrap_or_default().to_be_bytes());
 
-            symmetric.checksum(
+            symmetric.bundle_checksum(
                 secret_key_bundle.bundle_hash(),
                 resumption.remote_key_bundle.bundle_hash(),
                 &mut init_message[KEY_BUNDLE_CHECKSUM_RANGE],

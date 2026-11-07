@@ -6,15 +6,13 @@
 
 ## Transport
 ### Core
-- Add session-level approval or rejection of offline key
-- Resumption API
-- Handshake and socket expiration
+- Document API
+- Whitepaper full protocol
+- Improve handshake fallback rejection logic
 ### Extraneous
 - Come up with a better name
 - Update protocol full name with new name
 - Zeroize stack
-- Improve desegmentation API
-- API for determining maximum allowable payload length
 - Implement Debug for all public types
 - Improve key bundle timestamp handling
 - Add improved timestamp checking API for key bundles

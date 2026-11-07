@@ -101,7 +101,7 @@ impl<C: CryptoAndMem> ReplyState<C> {
                 }
 
                 let mut local_checksum = [0; KEY_BUNDLE_CHECKSUM_LEN];
-                symmetric.checksum(
+                symmetric.bundle_checksum(
                     resumption.remote_key_bundle.bundle_hash(),
                     secret_key_bundle.bundle_hash(),
                     &mut local_checksum,
