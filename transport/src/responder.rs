@@ -1,7 +1,7 @@
 use constant_time_eq::constant_time_eq_32;
 
 use crate::{
-    HandshakeComplete, api::{Resumption, ResumptionToken}, crypto::prelude::*, error::{Error, ReplyError}, key_bundle::{AuthenticBundle, BundleIdentifier, OfflineHash, SecretBundle}, protocol::*, symmetric_state::SymmetricState,
+    HandshakeComplete, api::{Resumption, ResumptionToken}, crypto::prelude::*, error::{Error, ReplyError}, key_bundle::{AuthenticBundle, OfflineHash, SecretBundle}, protocol::*, symmetric_state::SymmetricState,
 };
 
 pub struct ReplyState<C: CryptoAndMem> {
@@ -40,8 +40,7 @@ impl<C: CryptoAndMem> ReplyState<C> {
         let shared_secret;
         let ciphertext;
         let handshake_type;
-        let mut payload_range = None;
-        let mut correct_remote_bundle = None;
+        let mut resumption_data = None;
         let mut remote_offline_hash = None;
         let mut symmetric;
         {
@@ -101,52 +100,43 @@ impl<C: CryptoAndMem> ReplyState<C> {
                     return Err(ReplyError::Invalid);
                 }
 
-                match resumption.remote_identifier {
-                    BundleIdentifier::Full(remote_key_bundle) => {
-                        let mut local_checksum = [0; KEY_BUNDLE_CHECKSUM_LEN];
-                        symmetric.checksum(
-                            remote_key_bundle.bundle_hash(),
-                            secret_key_bundle.bundle_hash(),
-                            &mut local_checksum,
-                        );
+                let mut local_checksum = [0; KEY_BUNDLE_CHECKSUM_LEN];
+                symmetric.checksum(
+                    resumption.remote_key_bundle.bundle_hash(),
+                    secret_key_bundle.bundle_hash(),
+                    &mut local_checksum,
+                );
 
-                        symmetric.decrypt_and_mix(11, &mut init_message[KEY_BUNDLE_CHECKSUM_START..payload_tag_end])?;
+                symmetric.decrypt_and_mix(11, &mut init_message[KEY_BUNDLE_CHECKSUM_START..payload_tag_end])?;
 
-                        let remote_checksum = &init_message[KEY_BUNDLE_CHECKSUM_RANGE].try_into().unwrap();
-                        /* An incorrect bundle checksum indicates one party currently has an
-                        outdated or incorrect public key of the other party. So we need to do a
-                        full handshake to re-exchange public keys. */
-                        if constant_time_eq_32(&local_checksum, remote_checksum) {
-                            correct_remote_bundle = Some(remote_key_bundle)
-                        } else {
-                            remote_offline_hash = Some(*remote_key_bundle.offline_hash());
-                        }
-                    },
-                    BundleIdentifier::Partial(offline_hash) => {
-                        remote_offline_hash = Some(offline_hash);
-                    }
-                }
+                let remote_checksum = &init_message[KEY_BUNDLE_CHECKSUM_RANGE].try_into().unwrap();
+                /* An incorrect bundle checksum indicates one party currently has an
+                outdated or incorrect public key of the other party. So we need to do a
+                full handshake to re-exchange public keys. */
+                if constant_time_eq_32(&local_checksum, remote_checksum) {
+                    /* ONLINE SIGNATURE HANDLING */
 
-                /* ONLINE SIGNATURE HANDLING */
-
-                /* Authentication of the initiator's signature is skipped when doing a
-                full handshake if the initiator has the incorrect keys. A full handshake
-                will force the initiator to send a second, better signature later. */
-                if let Some(remote_key_bundle) = &correct_remote_bundle {
                     symmetric.verify(
                         12,
-                        remote_key_bundle,
+                        &resumption.remote_key_bundle,
                         &mut init_message[online_sign_start..online_sign_tag_end],
                         secs_since_unix_epoch,
                     )?;
 
                     handshake_type = reply::HANDSHAKE_TYPE_RESUME;
 
-                    payload_range = Some(PAYLOAD_START..payload_end);
+                    resumption_data = Some((resumption.remote_key_bundle, PAYLOAD_START..payload_end));
                 } else {
+                    /* Authentication of the initiator's signature is skipped when doing a
+                    full handshake if the initiator has the incorrect keys. A full handshake
+                    will force the initiator to send a second, better signature later. */
                     symmetric.decrypt_and_mix(12, &mut init_message[online_sign_start..online_sign_tag_end])?;
 
                     handshake_type = reply::HANDSHAKE_TYPE_FULL;
+
+                    // The remote peer must send us a new key bundle, but it's offline hash must
+                    // match the incorrect one we just rejected.
+                    remote_offline_hash = Some(*resumption.remote_key_bundle.offline_hash());
                 }
             } else if has_resumption_token {
                 // The remote peer attempted resumption but for some reason we don't know the
@@ -213,12 +203,12 @@ impl<C: CryptoAndMem> ReplyState<C> {
             let sign = &mut reply_message[online_sign_start..online_sign_tag_end];
             symmetric.sign(5, secret_key_bundle, sign);
 
-            if let Some(remote_key_bundle) = correct_remote_bundle {
+            if let Some((remote_key_bundle, payload_range)) = resumption_data {
                 Ok(InitOk::Complete(HandshakeComplete {
                     message_to_send: Some(reply_message),
                     keys: symmetric.split(13),
                     remote_key_bundle,
-                    recv_payload: &mut init_message[payload_range.unwrap()],
+                    recv_payload: &mut init_message[payload_range],
                 }))
             } else {
                 Ok(InitOk::Incomplete(

@@ -1,7 +1,7 @@
 use zeroize::Zeroizing;
 
 use crate::{
-    crypto::{CryptoAndMem, aes256::KEY_LEN}, key_bundle::{AuthenticBundle, BundleIdentifier}, protocol::derivation::*,
+    crypto::{CryptoAndMem, aes256::KEY_LEN}, key_bundle::AuthenticBundle, protocol::derivation::*,
 };
 
 pub type ResumptionToken = [u8; RESUMPTION_TOKEN_LEN];
@@ -14,7 +14,7 @@ pub struct SymmetricKeys(pub(crate) Zeroizing<[u8; SHAKE256_SPLIT_OUTPUT_LEN]>);
 pub struct Resumption<C: CryptoAndMem> {
     pub token: ResumptionToken,
     pub key: Zeroizing<ResumptionKey>,
-    pub remote_identifier: BundleIdentifier<C>,
+    pub remote_key_bundle: AuthenticBundle<C>,
 }
 
 pub struct HandshakeComplete<'a, C: CryptoAndMem> {

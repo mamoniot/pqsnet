@@ -1,7 +1,7 @@
 use core::ops::Deref;
 
 use crate::{
-    HandshakeComplete, api::Resumption, crypto::prelude::*, error::Error, key_bundle::{AuthenticBundle, BundleIdentifier, SecretBundle}, protocol::*, symmetric_state::SymmetricState,
+    HandshakeComplete, api::Resumption, crypto::prelude::*, error::Error, key_bundle::{AuthenticBundle, SecretBundle}, protocol::*, symmetric_state::SymmetricState,
 };
 
 pub struct InitState<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> {
@@ -10,7 +10,7 @@ pub struct InitState<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> {
     decapsulation_key: C::DecapsulationKey,
     payload: C::PayloadMem,
     secret_key_bundle: S,
-    remote_identifier: Option<BundleIdentifier<C>>,
+    remote_key_bundle: Option<AuthenticBundle<C>>,
 }
 
 impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
@@ -44,7 +44,7 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
         /* RESUMPTION TOKEN HANDLING */
 
         let mut fallback = None;
-        let mut remote_identifier = None;
+        let mut remote_key_bundle = None;
         let mut symmetric = SymmetricState::new(aad);
 
         if let Some(resumption) = resumption {
@@ -69,15 +69,11 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
 
             init_message[ISSUED_AT_RANGE].copy_from_slice(&secs_since_unix_epoch.unwrap_or_default().to_be_bytes());
 
-            if let Some(bundle) = resumption.remote_identifier.bundle() {
-                symmetric.checksum(
-                    secret_key_bundle.bundle_hash(),
-                    bundle.bundle_hash(),
-                    &mut init_message[KEY_BUNDLE_CHECKSUM_RANGE],
-                );
-            } else {
-                init_message[KEY_BUNDLE_CHECKSUM_RANGE].fill(0);
-            }
+            symmetric.checksum(
+                secret_key_bundle.bundle_hash(),
+                resumption.remote_key_bundle.bundle_hash(),
+                &mut init_message[KEY_BUNDLE_CHECKSUM_RANGE],
+            );
 
             init_message[PAYLOAD_START..payload_end].copy_from_slice(&payload[..]);
 
@@ -93,7 +89,7 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
                 fallback.mix(14, &init_message[RESUMPTION_TOKEN_END..]);
             }
 
-            remote_identifier = Some(resumption.remote_identifier);
+            remote_key_bundle = Some(resumption.remote_key_bundle);
         } else {
             /* FULL HANDSHAKE HANDLING */
 
@@ -108,7 +104,7 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
                 decapsulation_key,
                 payload,
                 secret_key_bundle,
-                remote_identifier,
+                remote_key_bundle,
             },
         ))
     }
@@ -185,14 +181,14 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
                     return Err(Error::Inauthentic);
                 }
 
-                if let Some(expected_identifier) = self.remote_identifier {
+                if let Some(expected_bundle) = self.remote_key_bundle {
                     /* If the offline hashes are not equal then we are not connecting with the party we
                     intended to connect to. A party's offline key is their id and it must never change. */
-                    if !remote_key_bundle.offline_eq_raw(expected_identifier.offline_hash()) {
+                    if !remote_key_bundle.offline_eq_raw(expected_bundle.offline_hash()) {
                         return Err(Error::Inauthentic);
                     }
                 }
-            } else if let Some(BundleIdentifier::Full(bundle)) = self.remote_identifier {
+            } else if let Some(bundle) = self.remote_key_bundle {
                 // It is possible to resume in 1 round trip.
                 remote_key_bundle = bundle;
                 key_bundle_end = PAYLOAD_START;
