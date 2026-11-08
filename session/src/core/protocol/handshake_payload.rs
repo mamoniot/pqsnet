@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::context::SocketId;
+use crate::core::protocol::SocketId;
 
 pub const HANDSHAKE_PAYLOAD_LEN_MAX: usize = 16;
 pub const CUR_MAJOR_VERSION: u32 = 0;

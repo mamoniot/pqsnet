@@ -1,8 +1,13 @@
+use crate::core::varint::*;
+
+
+pub type SocketId = u32;
+pub type DocNo = u64;
+
 /* HANDSHAKE PAYLOAD */
 
-use crate::{context::SocketId, varint::VARINT_U8_MAX};
-
 mod handshake_payload;
+
 pub(crate) use handshake_payload::*;
 
 pub const HANDSHAKE_PAYLOAD_LEN_MAX: usize = 64;

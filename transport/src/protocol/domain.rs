@@ -20,7 +20,7 @@ pub fn to_data_nonce(counter: u32) -> [u8; NONCE_LEN] {
     nonce
 }
 
-pub fn to_handshake_nonce(step_no: u8) -> [u8; NONCE_LEN] {
+pub fn to_handshake_idnce(step_no: u8) -> [u8; NONCE_LEN] {
     let mut nonce = AES_GCM_FIXED_FIELD_HANDSHAKE;
     nonce[NONCE_LEN - 1] = step_no;
     nonce

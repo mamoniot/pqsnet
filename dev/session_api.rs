@@ -62,9 +62,11 @@ pub struct UnreliableSender<R: Runtime> {}
 pub struct UnreliableReceiver<R: Runtime, H: PacketHandler> {}
 
 impl Context<R: Runtime> {
-    pub fn new(runtime: R, secret_key_bundle: SecretBundle) {}
+    pub fn new(runtime: R, secret_key_bundle: SecretBundle, conn: Connection) -> Self {}
 
-    pub fn update_secret_key(secret_key_bundle: SecretBundle) {}
+    pub fn current_secret_key(&self) -> SecretBundle {}
+
+    pub fn replace_secret_key(&self, secret_key_bundle: SecretBundle) {}
 
     pub async fn open(&self, remote_offline_hash: Option<OfflineHash>, route: R::Route) -> Result<UnopenedSession<R>, Error> {}
 

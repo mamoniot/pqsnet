@@ -48,7 +48,7 @@ impl<C: CryptoAndMem> SymmetricState<C> {
 
         let tag = C::Cipher::encrypt_in_place(
             (&self.key_buffer[AES_KEY_RANGE]).try_into().unwrap(),
-            domain::to_handshake_nonce(step_no),
+            domain::to_handshake_idnce(step_no),
             plaintext,
         );
         pad.copy_from_slice(&tag);
@@ -63,7 +63,7 @@ impl<C: CryptoAndMem> SymmetricState<C> {
 
         let auth = C::Cipher::decrypt_in_place(
             (&self.key_buffer[AES_KEY_RANGE]).try_into().unwrap(),
-            domain::to_handshake_nonce(step_no),
+            domain::to_handshake_idnce(step_no),
             ciphertext,
             tag.try_into().unwrap(),
         );

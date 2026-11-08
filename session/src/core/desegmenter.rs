@@ -6,7 +6,7 @@ use std::{
 
 use psqnet_transport::crypto::mem::Mem;
 
-use crate::varint::*;
+use crate::core::varint::*;
 
 const WIDTH: usize = usize::BITS as usize;
 

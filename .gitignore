@@ -1,3 +1,6 @@
+*.temp
+**/temp
+
 # BUILD
 target
 
