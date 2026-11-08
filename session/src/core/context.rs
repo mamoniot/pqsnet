@@ -1,4 +1,6 @@
 
+use std::{sync::Weak, task::{Poll, Waker}};
+
 use arc_swap::ArcSwapAny;
 use cbor4ii::serde::to_vec;
 use dashmap::{DashMap, Entry};
@@ -8,26 +10,35 @@ use psqnet_transport::{
 use rand::RngExt;
 use tracing::*;
 
-use crate::core::{channel::Receiver, crypto::{SecretBundle, random::OpenSSLRand, transport::Crypto}, desegmenter::*, error::OpenError, protocol::*, runtime::{Runtime, Work}, session::{UnacceptedSession, UnopenedSession}, varint::*};
+use crate::core::{crypto::{SecretBundle, aes::HotAesGcmDecryptor, random::OpenSSLRand, transport::Crypto}, desegmenter::*, error::OpenError, protocol::*, runtime::{Runtime, Work}, session::{SessionInner, UnacceptedReceiver, UnacceptedSender}, varint::*, work::WorkInner};
+
+pub(crate) struct  InitiatorSent {
+    reserved_socket_id: SocketId,
+    desegmenter: Option<Desegmenter<Box<[u8]>>>,
+    segments: Segmenter,
+    state: InitState<Crypto, SecretBundle>,
+}
 
 pub(crate) enum HandshakeEntry {
     CoolDown,
     ResponderRecv(Desegmenter<Box<[u8]>>),
-    InitiatorSent {
-        reserved_socket_id: SocketId,
-        desegmenter: Option<Desegmenter<Box<[u8]>>>,
-        cur_message: Vec<u8>,
-        state: InitState<Crypto, SecretBundle>,
-    },
+    InitiatorSent(InitiatorSent, Waker),
     ResponderSent {
         reserved_socket_id: SocketId,
         desegmenter: Option<Desegmenter<Box<[u8]>>>,
         cur_message: Vec<u8>,
+        state: ReplyState<Crypto>
     },
+    Open(HandshakeComplete<'static, Crypto>, HandshakePayload),
+}
+
+pub(crate) struct Socket<R: Runtime> {
+    pub(crate) decryptor: HotAesGcmDecryptor,
+    pub(crate) session: Weak<SessionInner<R>>
 }
 
 pub struct Context<R: Runtime> {
-    pub runtime: R,
+    runtime: R,
     secret_key_bundle: ArcSwapAny<SecretBundle>,
     socket_table: DashMap<SocketId, Option<Socket<R>>>,
     hanshake_table: DashMap<u128, HandshakeEntry>,
@@ -51,7 +62,7 @@ impl<R: Runtime> Context<R> {
         self.secret_key_bundle.swap(secret_key_bundle)
     }
 
-    pub async fn open(&self, remote_offline_hash: Option<OfflineHash>, route: R) -> Result<UnopenedSession, OpenError> {
+    pub async fn open(&self, remote_offline_hash: Option<OfflineHash>, route: R::Route) -> Result<UnacceptedSender<R>, OpenError> {
         let handshake_id = OpenSSLRand.random::<u128>() >> 8;
         debug_assert_eq!(SOCKET_ID_INIT_MESSAGE, 0);
 
@@ -59,7 +70,7 @@ impl<R: Runtime> Context<R> {
 
         let (payload, reserved_socket_id) = self.create_payload();
 
-        let (cur_message, state) = InitState::initialize(
+        let (message, state) = InitState::initialize(
             &handshake_id.to_be_bytes(),
             self.current_secret_key(),
             None,
@@ -69,18 +80,54 @@ impl<R: Runtime> Context<R> {
         )
         .expect("infallible memory allocation failed");
 
-        let pre_entry = self.hanshake_table.insert(
+        let mtu = self.runtime.get_conservative_mtu(&route);
+        assert!(mtu >= MIN_MTU);
+
+        struct HandshakeFuture<'a, R: Runtime> {
+            ctx: &'a Context<R>,
+            reply_no: u128,
+            entry: Option<InitiatorSent>,
+        }
+
+        impl<'a, R: Runtime> Future for HandshakeFuture<'a, R> {
+            type Output = Result<UnacceptedSender<R>, OpenError>;
+
+            fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+                if let Some(entry) = self.entry.take() {
+                    self.ctx.hanshake_table.insert(
+                        self.reply_no,
+                        HandshakeEntry::InitiatorSent(entry, cx.waker().clone()),
+                    );
+
+                    self.ctx.runtime.spawn(Work(WorkInner::Handshake(self.reply_no)));
+                    Poll::Pending
+                } else {
+                    let mut ret = Poll::Pending;
+                    self.ctx.hanshake_table.alter(&self.reply_no, |_, entry| {
+                        match entry {
+                            HandshakeEntry::Open(handshake_complete, handshake_payload) => {
+                                todo!();
+                                ret = Poll::Ready(Ok(UnacceptedSender {
+
+                                }));
+                                HandshakeEntry::CoolDown
+                            }
+                            _ => entry
+                        }
+                    });
+                    ret
+                }
+            }
+        }
+
+        HandshakeFuture {
+            ctx: self,
             reply_no,
-            HandshakeEntry::InitiatorSent { reserved_socket_id, desegmenter: None, cur_message, state },
-        );
-        debug_assert!(pre_entry.is_none());
-
-        self.runtime.send(&route, data);
-
-        todo!()
+            entry: Some(InitiatorSent { reserved_socket_id, desegmenter: None, segments: Segmenter::new_handshake(message, handshake_id, mtu), state })
+        }.await
     }
 
-    pub fn recv(&self, packet: &mut [u8], route: R::Route) -> Option<UnacceptedSession> {
+    pub fn recv(&self, packet: &mut [u8], route: R::Route) -> Option<UnacceptedReceiver<R>> {
         let mut packet_idx = 0;
         let idx = &mut packet_idx;
 
@@ -129,7 +176,7 @@ impl<R: Runtime> Context<R> {
                             );
                             return None;
                         }
-                        NewResult::MissingLen | NewResult::AllocFailure => unreachable!(),
+                        NewResult::MissingLen | NewResult::AllocFailure => todo!(),
                     }
                 }
                 Entry::Occupied(mut entry) => {
@@ -287,11 +334,16 @@ impl<R: Runtime> Context<R> {
         }
     }
 
-    fn handshake_complete(&self, new_socket_id: SocketId, complete: HandshakeComplete<Crypto>) -> Option<Receiver> {
-        None
+    fn handshake_complete(&self, new_socket_id: SocketId, complete: HandshakeComplete<Crypto>) -> Option<UnacceptedReceiver<R>> {
+        let decryptor = HotAesGcmDecryptor::new(complete.keys.recv_key());
+
+        self.socket_table.insert(new_socket_id, Some(Socket {
+            decryptor,
+        }));
+        todo!()
     }
 
-    fn recv_init_message(&self, handshake_id: u128, message: &mut [u8]) -> Option<Receiver> {
+    fn recv_init_message(&self, handshake_id: u128, message: &mut [u8]) -> Option<UnacceptedReceiver<R>> {
         trace!(handshake_id, "recv initial message");
         // If `reserved_socket_id` is `Some` then it is a key in `socket_table`
         // and needs to eventually be removed from it.
@@ -305,40 +357,42 @@ impl<R: Runtime> Context<R> {
         match ReplyState::process_initialize(
             &handshake_id.to_be_bytes(),
             message,
-            &self.secret_bundle,
+            &self.current_secret_key(),
             None,
-            secs_since_unix_epoch(),
+            self.runtime.secs_since_unix_epoch(),
             (),
             create_payload,
         ) {
             Ok(InitOk::Complete(complete)) => {
                 let reserved_socket_id = reserved_socket_id.expect("reserved socket id was absent");
 
-                return self.handshake_complete(reserved_socket_id, complete);
+                self.handshake_complete(reserved_socket_id, complete)
             }
             Ok(InitOk::Incomplete(cur_message, state)) => {
                 let reserved_socket_id = reserved_socket_id.expect("reserved socket id was absent");
 
-                let reply_no = handshake_id + HANDSHAKE_NO_SOCKET_ID_INC;
-                let confirm_no = reply_no + HANDSHAKE_NO_SOCKET_ID_INC;
+                let reply_id = handshake_id + HANDSHAKE_NO_SOCKET_ID_INC;
+                let confirm_id = reply_id + HANDSHAKE_NO_SOCKET_ID_INC;
 
                 let responder_sent =
                     HandshakeEntry::ResponderSent { desegmenter: None, reserved_socket_id, cur_message, state };
 
-                match self.hanshake_table.entry(confirm_no) {
+                match self.hanshake_table.entry(confirm_id) {
                     Entry::Occupied(_) => {
                         // Cancel this handshake due to lack of unique `handshake_id`. This should
                         // never happen with a well behaved peer since the `handshake_id` is
                         // supposed to be randomized.
                         let _e = self.socket_table.remove(&reserved_socket_id);
                         debug_assert!(matches!(_e, Some((_, None))));
-                        warn!(handshake_id, "handshake failed due to handshake no collision")
+                        warn!(handshake_id, "handshake failed due to handshake id collision");
                     }
                     Entry::Vacant(entry) => {
                         entry.insert(responder_sent);
+
+                        self.submit_work(Work(WorkInner::Handshake(confirm_id)));
                     }
                 }
-                // TODO: send reply message and queue it to be resent.
+                None
             }
             Err(error) => {
                 if let Some(socket_id) = reserved_socket_id {
@@ -348,6 +402,5 @@ impl<R: Runtime> Context<R> {
                 todo!();
             }
         }
-        None
     }
 }

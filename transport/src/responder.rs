@@ -212,7 +212,7 @@ impl<C: CryptoAndMem> ReplyState<C> {
             if let Some((remote_key_bundle, payload_range)) = resumption_data {
                 Ok(InitOk::Complete(HandshakeComplete {
                     message_to_send: Some(reply_message),
-                    keys: symmetric.split(13),
+                    keys: symmetric.split(13, false),
                     remote_key_bundle,
                     recv_payload: &mut init_message[payload_range],
                 }))
@@ -287,7 +287,7 @@ impl<C: CryptoAndMem> ReplyState<C> {
 
         Ok(HandshakeComplete {
             message_to_send: None,
-            keys: symmetric.split(8),
+            keys: symmetric.split(8, false),
             remote_key_bundle,
             recv_payload,
         })

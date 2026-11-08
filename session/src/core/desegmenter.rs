@@ -301,3 +301,84 @@ impl<M: Mem> Desegmenter<M> {
         }
     }
 }
+
+pub struct Segmenter {
+    message: Vec<u8>,
+    mtu: usize,
+}
+
+pub struct SegmentIter<'a> {
+    seg: &'a Segmenter,
+    i: usize,
+}
+
+impl Segmenter {
+    /// Creates a `Segmenter` that iterates over the given `message` broken up into packets that at most
+    /// `mtu` in length. Each of these packets contains a header and a segment of
+    /// `message`. This segmentation scheme is deterministic and allows a `Desegmenter` to
+    /// reconstruct the original message after receiving all packets from the return value `Segmenter`
+    pub fn new_handshake(mut message: Vec<u8>, handshake_id: u128, mtu: usize) -> Self {
+        let message_len = message.len();
+        debug_assert!(message_len > 0);
+
+        let header_len = 16 + varusize_len(message_len);
+        let mut header_mem = [0; 24];
+
+        header_mem[..16].copy_from_slice(&handshake_id.to_be_bytes());
+        varusize_write(&mut header_mem[16..], message_len);
+        let header = &header_mem[..header_len];
+
+        let mut i = 0;
+        let mut j = 0;
+        while j < message_len {
+            let cur_header_len = header_len + varusize_len(j);
+
+            let cur_message_len = message.len();
+            message.resize(cur_message_len + cur_header_len, 0);
+            message.copy_within(i..cur_message_len, i + cur_header_len);
+
+            message[i..i + header_len].copy_from_slice(header);
+            varusize_write(&mut message[i + header_len..], j);
+
+            j += mtu - cur_header_len;
+            i += mtu;
+        }
+
+        Self {
+            message,
+            mtu,
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a Segmenter {
+    type Item = &'a [u8];
+
+    type IntoIter = SegmentIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        SegmentIter { seg: &self, i: 0 }
+    }
+}
+
+impl<'a> Iterator for SegmentIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let message_len = self.seg.message.len();
+        if self.i >= message_len {
+            None
+        } else {
+            let j = self.i + self.seg.mtu;
+            let ret = &self.seg.message[self.i..j.min(message_len)];
+            self.i = j;
+            Some(ret)
+        }
+    }
+}
+
+impl<'a> ExactSizeIterator for SegmentIter<'a> {
+    fn len(&self) -> usize {
+        self.seg.message.len().div_ceil(self.seg.mtu)
+    }
+}

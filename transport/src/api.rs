@@ -11,7 +11,10 @@ pub type ResumptionKey = [u8; RESUMPTION_KEY_LEN];
 pub type SocketKey = [u8; KEY_LEN];
 
 #[derive(Clone)]
-pub struct SymmetricKeys(pub(crate) Zeroizing<[u8; SHAKE256_SPLIT_OUTPUT_LEN]>);
+pub struct SymmetricKeys{
+    is_init: bool,
+    buf: Zeroizing<[u8; SHAKE256_SPLIT_OUTPUT_LEN]>
+}
 
 pub struct Resumption<C: CryptoAndMem> {
     pub token: ResumptionToken,
@@ -33,19 +36,50 @@ pub struct HandshakeComplete<'a, C: CryptoAndMem> {
 }
 
 impl SymmetricKeys {
+    pub(crate) fn new(is_init: bool, buf: Zeroizing<[u8; SHAKE256_SPLIT_OUTPUT_LEN]>) -> Self {
+        Self {
+            is_init,
+            buf,
+        }
+    }
+
     pub fn resumption_key(&self) -> &ResumptionKey {
-        (&self.0[RESUMPTION_KEY_RANGE]).try_into().unwrap()
+        (&self.buf[RESUMPTION_KEY_RANGE]).try_into().unwrap()
     }
-    pub fn initiator_resumption_token(&self) -> &ResumptionToken {
-        (&self.0[INITIATOR_RESUMPTION_TOKEN_RANGE]).try_into().unwrap()
+
+    pub fn send_resumption_token(&self) -> &ResumptionToken {
+        let range = if self.is_init {
+            INITIATOR_RESUMPTION_TOKEN_RANGE
+        } else {
+            RESPONDER_RESUMPTION_TOKEN_RANGE
+        };
+        (&self.buf[range]).try_into().unwrap()
     }
-    pub fn responder_resumption_token(&self) -> &ResumptionToken {
-        (&self.0[RESPONDER_RESUMPTION_TOKEN_RANGE]).try_into().unwrap()
+
+    pub fn recv_resumption_token(&self) -> &ResumptionToken {
+        let range = if self.is_init {
+            RESPONDER_RESUMPTION_TOKEN_RANGE
+        } else {
+            INITIATOR_RESUMPTION_TOKEN_RANGE
+        };
+        (&self.buf[range]).try_into().unwrap()
     }
-    pub fn initiator_key(&self) -> &SocketKey {
-        (&self.0[INITIATOR_KEY_RANGE]).try_into().unwrap()
+
+    pub fn send_key(&self) -> &SocketKey {
+        let range = if self.is_init {
+            INITIATOR_KEY_RANGE
+        } else {
+            RESPONDER_KEY_RANGE
+        };
+        (&self.buf[range]).try_into().unwrap()
     }
-    pub fn responder_key(&self) -> &SocketKey {
-        (&self.0[RESPONDER_KEY_RANGE]).try_into().unwrap()
+
+    pub fn recv_key(&self) -> &SocketKey {
+        let range = if self.is_init {
+            RESPONDER_KEY_RANGE
+        } else {
+            INITIATOR_KEY_RANGE
+        };
+        (&self.buf[range]).try_into().unwrap()
     }
 }

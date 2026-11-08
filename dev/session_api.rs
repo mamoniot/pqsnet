@@ -18,7 +18,7 @@ pub type TimestampUnix = u64;
 pub trait Runtime {
     type Route: PartialEq;
 
-    type Scheduler;
+    type Timer;
 
     fn send(&self, route: &Self::Route, data: &[u8]) -> Result<(), RouteError>;
 
@@ -28,11 +28,11 @@ pub trait Runtime {
 
     fn secs_since_unix_epoch(&self) -> Option<TimestampUnix>;
 
-    fn schedule(&self, ts_us: TimestampUs, work: Work) -> Self::Scheduler;
+    fn schedule(&self, ts_us: TimestampUs, work: Work) -> Self::Timer;
 
-    fn reschedule(&self, scheduler: &Self::Scheduler, ts_us: TimestampUs);
+    fn reschedule(&self, timer: &Self::Timer, ts_us: TimestampUs);
 
-    fn unschedule(&self, scheduler: Self::Scheduler);
+    fn unschedule(&self, timer: Self::Timer);
 }
 
 pub type SecretBundle = Arc<transport::SecretBundle<C>>;
@@ -68,33 +68,35 @@ impl Context<R: Runtime> {
 
     pub fn replace_secret_key(&self, secret_key_bundle: SecretBundle) {}
 
-    pub async fn open(&self, remote_offline_hash: Option<OfflineHash>, route: R::Route) -> Result<UnopenedSession<R>, Error> {}
+    pub async fn open(&self, remote_offline_hash: Option<OfflineHash>, route: R::Route) -> Result<UnacceptedSender<R>, Error> {}
 
-    pub fn recv(&self, packet: &mut [u8], route: R::Route) -> Option<UnacceptedSession<R>> {}
+    pub fn recv(&self, packet: &mut [u8], route: R::Route) -> Option<UnacceptedReceiver<R>> {}
 
     pub fn submit_work(&self, work: Work) {}
 
     pub fn close_all(&self) {}
 }
 
-impl UnopenedSession<R: Runtime> {
+impl UnacceptedSender<R: Runtime> {
     pub fn remote_key_bundle(&self) -> RemoteBundle {}
 
-    pub fn authenticate(self) -> (Session<R>, Sender<R>) {}
+    pub fn authenticate(self) -> Sender<R> {}
 }
 
-impl UnacceptedSession<R: Runtime> {
+impl UnacceptedReceiver<R: Runtime> {
     pub fn remote_key_bundle(&self) -> RemoteBundle {}
 
-    pub fn authenticate(self) -> (Session<R>, Receiver<R>) {}
+    pub fn authenticate(self) -> Receiver<R> {}
 }
 
-impl Session<R: Runtime> {
-    pub fn remote_key_bundle(&self) -> RemoteBundle {}
+pub trait Session<R: Runtime> {
+    fn remote_key_bundle(&self) -> RemoteBundle;
 
-    pub fn increase_data_limit(&self, increment: usize) {}
+    fn increase_data_limit(&self, todo: usize);
 
-    pub fn close(&self) {}
+    fn add_route(&self, route: R::Route);
+
+    fn end_session(&self);
 }
 
 impl Sender<R: Runtime> {
@@ -131,6 +133,8 @@ impl Sender<R: Runtime> {
     pub fn len(&self) -> usize {}
 }
 
+impl<R: Runtime> Session<R> for Sender<R> {}
+
 pub enum RecvData {
     Doc(Bytes),
     Receiver(Bytes, Receiver),
@@ -157,6 +161,8 @@ impl<R: Runtime> Receiver<R> {
     pub fn len(&self) -> usize {}
 }
 
+impl<R: Runtime> Receiver<R> for Sender<R> {}
+
 impl<R: Runtime> UnboundSender<R> {
     pub fn no(&self) -> u64 {}
 
@@ -172,6 +178,8 @@ impl<R: Runtime> UnboundSender<R> {
 
     pub fn len(&self) -> usize {}
 }
+
+impl<R: Runtime> Receiver<R> for UnboundSender<R> {}
 
 impl<R: Runtime, A: Allocator> UnboundReceiver<R, A> {
     pub fn no(&self) -> u64 {}
@@ -189,6 +197,8 @@ impl<R: Runtime, A: Allocator> UnboundReceiver<R, A> {
     pub fn len(&self) -> usize {}
 }
 
+impl<R: Runtime> Receiver<R> for UnboundReceiver<R> {}
+
 impl<R: Runtime> UnreliableSender<R> {
     pub fn no(&self) -> u64 {}
 
@@ -201,6 +211,8 @@ impl<R: Runtime> UnreliableSender<R> {
     pub fn plpmtu(&self) -> usize {}
 }
 
+impl<R: Runtime> Receiver<R> for UnreliableSender<R> {}
+
 impl<R: Runtime, H: PacketHandler> UnreliableReceiver<R, H> {
     pub fn no(&self) -> u64 {}
 
@@ -208,3 +220,5 @@ impl<R: Runtime, H: PacketHandler> UnreliableReceiver<R, H> {
 
     pub fn is_closed(&self) -> bool {}
 }
+
+impl<R: Runtime> Receiver<R> for UnreliableReceiver<R> {}

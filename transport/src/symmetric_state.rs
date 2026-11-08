@@ -118,11 +118,11 @@ impl<C: CryptoAndMem> SymmetricState<C> {
         hasher.finish(output);
     }
 
-    pub fn split(self, step_no: u8) -> SymmetricKeys {
+    pub fn split(self, step_no: u8, is_init: bool) -> SymmetricKeys {
         let mut key_buffer = Zeroizing::new([0u8; _]);
 
         self.hash3(step_no, &[]).finish(&mut key_buffer[..]);
 
-        SymmetricKeys(key_buffer)
+        SymmetricKeys::new(is_init, key_buffer)
     }
 }

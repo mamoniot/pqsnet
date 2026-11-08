@@ -217,7 +217,7 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
 
                 return Ok(HandshakeComplete {
                     message_to_send: None,
-                    keys: symmetric.split(13),
+                    keys: symmetric.split(13, true),
                     remote_key_bundle,
                     recv_payload,
                 });
@@ -254,7 +254,7 @@ impl<C: CryptoAndMem, S: Deref<Target = SecretBundle<C>>> InitState<C, S> {
 
             Ok(HandshakeComplete {
                 message_to_send: Some(confirm_message),
-                keys: symmetric.split(8),
+                keys: symmetric.split(8, true),
                 remote_key_bundle,
                 recv_payload,
             })

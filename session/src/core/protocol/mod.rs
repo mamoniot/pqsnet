@@ -82,6 +82,11 @@ pub const MIN_MTU: usize = MAX_SEG_HEADER_LEN + MIN_SEG_DATA_LEN;
 pub const HEADER_LEN: usize = 8;
 pub const FOOTER_LEN: usize = 16;
 
+pub const MILLISEC_US: u64 = 1000;
+pub const SECOND_US: u64 = MILLISEC_US * 1000;
+pub const MINUTE_US: u64 = SECOND_US * 60;
+pub const HOUR_US: u64 = MINUTE_US * 60;
+
 pub const fn resend_ratio(mtu: u32) -> u32 {
     mtu * 2 / 3
 }
